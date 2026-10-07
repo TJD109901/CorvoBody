@@ -1,0 +1,6 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create
+    BlinkBootstrap_Register
+    CorvoBody_SetCharacter
+    CorvoBody_GetCharacter

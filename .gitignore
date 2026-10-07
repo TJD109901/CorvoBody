@@ -1,0 +1,4 @@
+# Fetched by build.ps1
+external/
+# Build output
+build/

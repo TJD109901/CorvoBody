@@ -1,0 +1,6 @@
+LIBRARY BodySwap
+EXPORTS
+    Plg_Init
+    Plg_Query
+    Plg_QueryMenu
+    Plg_SetEnabled

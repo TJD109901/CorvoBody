@@ -1,0 +1,63 @@
+diff --git a/sdk/include/defs.hpp b/sdk/include/defs.hpp
+index c2f0d59..4d340b2 100644
+--- a/sdk/include/defs.hpp
++++ b/sdk/include/defs.hpp
+@@ -754,13 +754,13 @@ public:
+ 
+ public:
+ 	class TArray<ElementType> Elements;								// 0x0000 (0x000C)
+-	struct FPointer IndirectData;									// 0x000C (0x0004)
++	void* IndirectData; /* patched for clang */									// 0x000C (0x0004)
+ 	int32_t InlineData[0x4];										// 0x0010 (0x0010)
+ 	int32_t NumBits;												// 0x0020 (0x0004)
+ 	int32_t MaxBits;												// 0x0024 (0x0004)
+ 	int32_t FirstFreeIndex;											// 0x0028 (0x0004)
+ 	int32_t NumFreeIndices;											// 0x002C (0x0004)
+-	struct FPointer Hash;											// 0x0030 (0x0004)
++	void* Hash; /* patched for clang */											// 0x0030 (0x0004)
+ 	int32_t InlineHash;												// 0x0034 (0x0004)
+ 	int32_t HashSize;												// 0x0038 (0x0004)
+ 
+@@ -1045,9 +1045,11 @@ public:
+ 
+ 	std::string ToString() const
+ 	{
++		// Patched (CorvoBody): read the name in place. Dishonored packs FNameEntry records tightly, so the
++		// original by-value copy of a 0x410-byte FNameEntry read past the end of the name pool and crashed.
+ 		if (IsValid())
+ 		{
+-			return GetDisplayNameEntry().ToString();
++			return std::string(Names()->at(FNameEntryId)->Name);
+ 		}
+ 
+ 		return "UnknownName";
+@@ -1055,12 +1057,13 @@ public:
+ 
+ 	bool IsValid() const
+ 	{
+-		if ((FNameEntryId < 0 || FNameEntryId > Names()->size()))
++		// Patched (CorvoBody): was `> size()` (off by one) and did not check for empty slots.
++		if (FNameEntryId < 0 || FNameEntryId >= Names()->size())
+ 		{
+ 			return false;
+ 		}
+ 
+-		return true;
++		return Names()->at(FNameEntryId) != nullptr;
+ 	}
+ 
+ public:
+diff --git a/sdk/src/Core_classes.cpp b/sdk/src/Core_classes.cpp
+index 1db136b..55b6d2e 100644
+--- a/sdk/src/Core_classes.cpp
++++ b/sdk/src/Core_classes.cpp
+@@ -76,7 +76,8 @@ std::string UObject::GetFullName()
+ 		fullName = (uOuter->GetName() + "." + fullName);
+ 	}
+ 
+-	fullName = (this->Class->GetName() + " " + fullName);
++	// Patched (CorvoBody): objects that are still being loaded can have no class yet.
++	fullName = ((this->Class ? this->Class->GetName() : std::string("NoClass")) + " " + fullName);
+ 	return fullName;
+ }
+ 
