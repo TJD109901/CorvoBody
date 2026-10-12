@@ -1,5 +1,7 @@
 // Body Swap - Dishonored Mod Loader plugin for CorvoBody.
-// Adds "Choose Body" to Pause > Mods: pick Corvo or Daud for the first-person body and for the first-person arms.
+// Adds "Choose Body" to Pause > Mods: pick Corvo, Daud or the Overseer disguise for the first-person body; the
+// first-person arms follow the body (user 2026-10-11: the separate Arms row is no longer needed - the body draws the
+// high-quality arms itself).
 // The loader remembers the choices and calls SetValue with them at startup; each one is forwarded to CorvoBody
 // (dinput8.dll next to Dishonored.exe) through its CorvoBody_SetCharacter export.
 //
@@ -58,20 +60,23 @@ const wchar_t* const kChars3It[] = { L"Corvo", L"Daud", L"Supervisore" };
 const wchar_t* const kGroupsEn[] = { L"Character" };
 const wchar_t* const kGroupsIt[] = { L"Personaggio" };
 
-PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body, arms and blade, and Corvo's or Daud's powers and crossbow (needs CorvoBody)", L"Choose Body", 1 };
+PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body (with its arms) and blade, and Corvo's or Daud's powers, crossbow and jump (needs CorvoBody)", L"Choose Body", 1 };
 
 MenuItem g_items[6] = {
     { 2, L"Status", 2, kStatusEn, 0, 0, 1, 0, -1 },
     { 1, L"Body",   3, kChars3En, 0, 0, 1, 0,  0 },
-    { 1, L"Arms",   3, kChars3En, 0, 0, 1, 0,  0 },
     { 1, L"Blade",  3, kChars3En, 0, 0, 1, 0,  0 },
     { 1, L"Powers", 2, kChars,    0, 0, 1, 0,  0 },
     { 1, L"Crossbow", 2, kChars,  0, 0, 1, 0,  0 },
+    { 1, L"Jump", 2, kChars,      0, 0, 1, 0,  0 },   // Agility: Corvo's double jump / Daud's one continuous jump
 };
 
-volatile LONG g_value[6] = { 0, 0, 0, 0, 0, 0 };   // [1] body, [2] arms, [3] blade, [4] power set, [5] crossbow (0 Corvo, 1 Daud, 2 Overseer for 1-3)
+// Menu rows: [1] body, [2] blade, [3] power set, [4] crossbow, [5] jump (0 Corvo, 1 Daud, 2 Overseer for 1-2).
+// CorvoBody parts: 0 body, 1 arms (= body), 2 blade, 3 powers, 4 crossbow, 5 jump.
+volatile LONG g_value[6] = { 0, 0, 0, 0, 0, 0 };
+const int kPartOfRow[6] = { -1, 0, 2, 3, 4, 5 };
 
-int MaxValue(int idx) { return idx >= 1 && idx <= 3 ? 2 : 1; }
+int MaxValue(int idx) { return idx >= 1 && idx <= 2 ? 2 : 1; }
 volatile LONG g_enabled = 1;
 bool g_italian = false;
 
@@ -100,10 +105,11 @@ void Push() {
     if (!ResolveCorvoBody()) return;
     bool on = g_enabled != 0;
     g_set(0, on ? g_value[1] : 0);
-    g_set(1, on ? g_value[2] : 0);
-    g_set(2, on ? g_value[3] : 0);
-    g_set(3, on ? g_value[4] : 0);
-    g_set(4, on ? g_value[5] : 0);
+    g_set(1, on ? g_value[1] : 0);   // the first-person arms follow the body
+    g_set(2, on ? g_value[2] : 0);
+    g_set(3, on ? g_value[3] : 0);
+    g_set(4, on ? g_value[4] : 0);
+    g_set(5, on ? g_value[5] : 0);
 }
 
 int __cdecl GetValue(int idx) {
@@ -128,22 +134,22 @@ extern "C" {
 __declspec(dllexport) void __cdecl Plg_Init(const char* lang) {
     g_italian = lang && lang[0] == 'I' && lang[1] == 'T' && lang[2] == 'A';
     if (g_italian) {
-        g_info.description = L"Scegli corpo, braccia e lama di Corvo, di Daud o del travestimento da Supervisore, e poteri e balestra di Corvo o di Daud (richiede CorvoBody)";
+        g_info.description = L"Scegli corpo (con le sue braccia) e lama di Corvo, di Daud o del travestimento da Supervisore, e poteri e balestra di Corvo o di Daud (richiede CorvoBody)";
         g_info.title = L"Scegli corpo";
         g_items[0].label = L"Stato";
         g_items[0].choices = kStatusIt;
         g_items[1].label = L"Corpo";
-        g_items[2].label = L"Braccia";
-        g_items[3].label = L"Lama";
-        g_items[4].label = L"Poteri";
-        g_items[5].label = L"Balestra";
-        for (int i = 1; i <= 3; ++i) g_items[i].choices = kChars3It;
+        g_items[2].label = L"Lama";
+        g_items[3].label = L"Poteri";
+        g_items[4].label = L"Balestra";
+        g_items[5].label = L"Salto";
+        for (int i = 1; i <= 2; ++i) g_items[i].choices = kChars3It;
         g_menu.groupNames = kGroupsIt;
     }
     // Start from what CorvoBody already uses (its ini); the loader then applies the saved menu values.
     if (ResolveCorvoBody() && g_get) {
         for (int i = 1; i <= 5; ++i) {
-            int v = g_get(i - 1);
+            int v = g_get(kPartOfRow[i]);
             g_value[i] = (v >= 0 && v <= MaxValue(i)) ? v : 0;
         }
     }

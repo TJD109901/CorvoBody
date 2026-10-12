@@ -7,11 +7,13 @@
 // No hotkeys and no ini (build 201): the settings are fixed (baked_settings.h); Body Swap is chosen in Pause > Mods.
 
 #include <windows.h>
+#include <d3d9.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <cmath>
+#include <algorithm>
 #include <string>
 
 #include "sdk.hpp"
@@ -58,7 +60,7 @@ using LoadPackageAsync_t = void(__cdecl*)(const FString&, void(__cdecl*)(UObject
 
 static ProcessEvent_t g_origProcessEvent = nullptr;
 static auto StaticConstructObject = reinterpret_cast<StaticConstructObject_t>(addr::StaticConstructObject);
-static LoadPackageAsync_t LoadPackageAsync = nullptr;
+static LoadPackageAsync_t RawLoadPackageAsync = nullptr;
 
 // ---------------------------------------------------------------------------------------------
 // Pattern scan (".text" of Dishonored.exe)
@@ -129,6 +131,13 @@ struct Settings {
     float cameraFollowDown = 1.0f; // visible body also dips when the camera is below eye height (stairs), 0..1
     float hideUpperDrop = 8.0f;   // hide the upper body when the camera is this far below the eyes, or airborne
     float hideUpperSpeed = 470.0f; // ...and above this speed (sprint: the collar edges into view)
+    bool quickTurn = true;         // Ultimate Back Turn: R3 / Left Alt: quick, smooth 180 degree turn
+    float quickTurnTime = 0.18f;   // ...taking this long (s)
+    int summonAssassinMax = 100;        // Summon Assassin: assassins allowed out at once (game: 1)
+    bool crossbowSwapInHand = true;   // Body Swap: choosing the other crossbow while holding one swaps it in the hand - put away at once, swapped, the new one drawn (user: "at the moment you have to go into the weapon wheel, select something else, then select crossbow again")
+    bool crossbowUpgradesCarryOver = true;   // Body Swap: the crossbow upgrades bought from Piero work on whichever bow is in use - Corvo's crossbow or Daud's wristbow (user 2026-10-12: "make it so the bow upgrades carry over to each other")
+    bool crossbowAlwaysLoaded = true;   // crossbow / wristbow reload instantly after each shot (while there's ammo)
+    float zoomHoldTime = 0.25f;    // R3 / Left Alt held this long (s): the game's Zoom instead, while held
     bool hideTorso = true;         // always hide the visible body's chest/collar (Torso_jnt) - not the shadow's
     bool hideUpperWhenClipping = false;  // hide the whole upper body (incl. arms) while airborne/sprinting/looking up/dipping
     bool hideShouldersUp = false;  // always hide spine_3 and everything above it (shoulders, arms, chest, neck) on the visible body
@@ -138,6 +147,8 @@ struct Settings {
     bool lowCrouchHideLegs = true;  // ...and (not sliding) fold the legs away into the hips, e.g. crouching under tables
     bool takedownHideTorso = true;  // hide the visible torso during choke / assassination takedowns (the camera leans in)
     float hitCameraScale = 0.3f;    // how far the camera is thrown when hit (1 = the game's own, 0.3 = 70% less)
+    float strafeHideTorsoSpeed = 40.0f;   // moving sideways faster than this (uu/s): hide the visible torso from the waist (20:12 clip: strafing, the collar rim round the collapsed neck bobbed into the bottom edge of the view every step); 0 = off
+    float strafeHideTorsoPitch = -30.0f;  // ...only while looking above this pitch (looking further down, the chest is in view and the collar is behind the camera)
     float lookUpHideTorsoDeg = 45.0f; // looking up more than this: hide the visible torso from the waist (0 = off)
     bool lookUpSteady = true;       // looking up (30-60 deg and beyond): camera held steady at the eyes, no walking bob sway
     bool hitHideTorso = true;       // also hide the visible torso when hit / stunned (build 195: the smaller kick alone left a little)
@@ -159,6 +170,31 @@ struct Settings {
     float slideFrontTwist = 60.0f;  // slide: twist the extended right leg (degrees) so the foot turns over; flip the sign if it turns the wrong way
     float slideFrontInward = 15.0f; // slide: swing the extended right leg in toward the middle (degrees; flip if it goes outward)
     float slideGetUpTuck = 0.0f;    // 0 = legs blend straight from the slide into the crouch, 1 = draw them in first
+    bool slideArms = true;          // slide (hand free): a bracing pose - elbows down/back/out, forearms up and forward (00:35 clip: "arms straight out")
+    // (user 01:20: right hand over the chest, left arm down to the floor pointing a little left)
+    // (07:30 log: the hand-on-chest forearm sat 24 uu from the camera - the near guard hid that arm - and the floor hand was
+    // under the bottom edge; user 07:35 "arms in view when holstered": both hands ahead of the camera, lower-left / lower-right)
+    // (user 07:55: right arm raised a bit, left arm further out to the left)
+    // (user 08:20: left hand open, flat on the ground as if keeping balance; right arm up a bit more - it clipped the chest)
+    float slideElbowL[3] = { 0.30f, 0.55f, -0.78f };   // ...left elbow direction from the shoulder: forward, out, up (normalised) - down, out and a little forward (09:15: "couldn't see it")
+    float slideForearmL[3] = { 0.35f, 0.45f, -0.82f }; // ...left forearm direction from the elbow: on down to the floor, out and forward
+    bool slideLeftHandFlat = true;  // ...and that hand flat on the ground: palm down, fingers forward
+    float slideLeftHandPalmSign = -1.0f;   // ...the bind-derived "palm" side goes down with +1; on Daud's 1P hand the thumb joints sit on the BACK side of the knuckle plane (09:55 log: thumb side +0.63, palm showed), so -1
+    float handFlatCurl[4] = { -14.0f, -18.0f, -18.0f, -14.0f };   // braced flat hand: curl beyond the bind (negative = extend; the 1P bind is a slightly curled hand) at index/middle/ring/pinky
+    float handFlatThumb = -12.0f;   // ...thumb joints (10:48 clip: the thumb tip sank into the floor; was -6)
+    float slideLeftHandThumbUpDeg = 8.0f;   // ...and the braced hand rolls about its fingers so the thumb edge lifts off the floor (rests more on its outer edge)
+    bool slideShowUpperArms = false; // slide: the body's own upper arms show (tried 08:55 for the forearm floating over the chest; 09:30 clip: read as "old arms without hands" - off)
+    float slideElbowR[3] = { 0.78f, 0.40f, -0.36f };   // ...right elbow: forward, well OUT to the right, down - less down and more forward (11:05 clip: the thumb clipped the chest; "lift the arm up and move it forward")
+    float slideForearmR[3] = { 0.64f, -0.50f, 0.64f }; // ...right forearm: in across to the chest, raised and forward (hand ~5 uu up, ~4 forward, 3 less across vs 09:55)
+    bool slideHideFirstPersonArms = true;   // slide, both hands free: the game's own 1P arms are hidden (09:15 clip: a second, darker pair of hands under the view)
+    float slideArmNearScale = 0.6f; // slide: the arm skin's near-camera limits scaled by this (the bracing hands are close by design)
+    float slideCamSettle = 0.4f;    // slide -> crouch: the view height eases up into the crouch view over this long (s; user 10:30: "the camera jolts")
+    float slideReclineLow = 32.0f;  // slide: extra lean-back at the base of the spine (spine_0), so the stomach and chest lie lower (user 07:35; 08:40 "a bit lower": 20 -> 32)
+    float slideFootPoint = 35.0f;   // slide: the extended right foot's toes pointed (deg, as HoverToe; user 01:20)
+    float slideBackTwist = 0.0f;    // slide: twist of the other (left, knee-up) leg about its length, as SlideFrontTwist
+    float slideBackInward = -20.0f; // ...and its swing toward the middle (negative = out: user 01:20 "lean the left leg left a bit more")
+    float slideTurnLag = 6.0f;      // slide: the body turns after the view, catching up at this rate (1/s; 0 = rigid) - Dishonored 2 style (user 00:52)
+    float slideTurnLagMax = 45.0f;  // ...never more than this far behind (deg)
     float slideGetUpTime = 0.6f;    // seconds for the legs to draw in from the slide pose into the crouch
     float slideRecoverSpeed = 90.0f; // uu/s the body rises from the slide height back to the crouch
     float slideRecoverDown = 0.0f;  // as the slide ends: body tucked this much down...
@@ -170,6 +206,26 @@ struct Settings {
     float slideRecline = 45.0f;    // ...upper body leans back this many degrees (and is hidden from view)
     float hideUpperPitch = 20.0f;  // ...and when looking up more than this (degrees): the camera pivots back into the neck
     bool climbDangle = true;        // ladders/chains: legs dangle (simulated pendulum) instead of stepping
+    float armSkinJumpBack = 10.0f;  // ...the new arms eased back (uu) in the air (their shoulders clipped the camera)
+    float armSkinJumpDown = 5.0f;   // ...and down
+    float armSkinJumpCentre = 1.0f;     // ...and moved across so they sit centred on the view (0 = off, 1 = fully; 17:32 clip)
+    float armSkinJumpCentreMax = 30.0f; // ...by at most this much (uu)
+    float armSkinShiftRight = 0.0f;     // ...moved sideways (uu, actor space). Was -6: the 20:03 "hands right of the model" gap was the
+                                        // skin inheriting the shadow body's transform (UpdateArmSkin) - -6 was drawn as 6 UP, not left
+    float armSkinSprintShiftRight = 0.0f;   // ...sprinting instead (was -2, same reason)
+    float armSkinSprintDown = 10.0f;    // ...and this much lower while sprinting (the swing passed through the camera; 6 -> 10 20:19)
+    float armSkinNearForearm = 24.0f;   // ...a forearm this close to the camera shrinks the arm too (20:03: bracer filled the view at 21)
+    float armSkinNearForearmSprint = 28.0f; // ...while sprinting (20:10/20:19 logs: left forearm dips to ~26-28 every stride, in the lens)
+    bool hideFirstPersonSprintHands = true;   // sprinting with a hand free: the game's own 1P forearm there hidden (19:58 clip)
+    bool armSkinAlign = false;          // ...moved each frame so its engine-read shoulders meet the body's (19:46 clip: the readings
+                                        // jump 40-60 uu frame to frame - the arms floated around; off, readings not used)
+    bool armSkinOriginFix = true;       // ...placed with the mesh origins in the engine's order (19:22 clip: 9.5 right/high without)
+    float armSkinSprintBack = 18.0f;    // ...eased back this much more than the body while sprinting (inside of the shoulders showed; 8 -> 12 -> 18)
+    float armSkinStairUpCut = 1.0f;     // ...share of the body's rise with a high camera (stairs down) the arms DON'T follow (20:19 clip)
+    bool fpArmSkin = true;          // Daud / Overseer bodies: forearms + hands drawn with the first-person arms model (user 2026-10-11)
+    float armSkinNear = 18.0f;      // ...an arm whose upper arm or forearm comes this close (uu) to the camera shrinks away (sprint swing)
+    float armSkinNearHold = 0.6f;   // ...and stays away until it has been clear this long (s), so it doesn't pulse per stride
+    bool climbArms = false;         // ladders/chains: the body's upper arms reach to the first-person forearms (built 2026-10-11, parked by the user for later)
     float dangleSwing = 1.0f;       // how much movement swings them
     float dangleStiffness = 30.0f;  // pull back to hanging (higher = quicker, tighter swing)
     float dangleDamping = 4.0f;     // how quickly the swinging dies down
@@ -182,6 +238,21 @@ struct Settings {
     float climbHipDeg = -60.0f;    // climbing: how far each leg lifts (same sign as the slide hips)
     float climbKneeDeg = 70.0f;    // climbing: knee bend on the raised leg
     float climbStride = 30.0f;     // uu climbed per step
+    bool climbHands = false;       // (OFF 19:2x: user reverted to the original climbing - grip legs, no climbing arms) ladders/chains: the first-person arms climb hand over hand (user 18:55: "the hands take turns pulling the player up the chain"). Each hand grips a point on the chain that stays put in the world - the climb carries it down past the face - lets go near the chest and reaches above the head while the other holds. Built procedurally: the game has no climbing animation for the body, its 1P hands sit still on a chain (log 18:54: 35 uu below the shoulder throughout)
+    float climbChainForward = 16.0f; // ...the chain this far in front of the pawn (the body is moved ClimbBodyLeft so the chain runs between its legs: the hands grip there too)
+    float climbGripTop = 4.0f;       // ...a hand takes a new grip this far above the eyes
+    float climbGripBottom = -28.0f;  // ...and lets go once the climb has carried it down to here (below the eyes)
+    float climbReachTime = 0.32f;    // ...seconds for a reach to the next grip (shorter when climbing fast)
+    float climbHandSpread = 2.0f;    // ...each hand this far to its side of the chain
+    float climbArmNearScale = 0.3f;  // ...the arm skin's near-camera guard limits scaled by this while climbing (the hands are at the face by design)
+    bool selfTestCapture = false;    // (OFF for the 3.0 release; 20:1x: Present is hooked on the game's OWN device, found from inside SetTexture) DEVELOPMENT: the mod saves its own frames (CorvoBody\captures\*.bmp, half size): 3 a second while climbing (45 per session) and a 10-frame burst on the Home key - so the author can see the result without a clip. TURN OFF FOR RELEASE
+    bool climbShadowArms = false;  // (OFF 19:2x: reverted) ladders/chains: the shadow's hands reach the game's own first-person climbing hands (hand over hand, fingers gripping) - the same reach as the weapon arms (user 18:45: "a chain climbing animation for the arms and legs"; the game has none for the body, only the 1P hands)
+    bool climbLegCycle = false;    // (OFF 19:2x: reverted, see ClimbHands) ...and the legs climb: crossed at the ankles (the grip), the knees drawn up and pushed down again once per ClimbLegStride climbed - a rope-climb foot lock; the still grip (with its sway) when not moving
+    float climbLegStride = 40.0f;  // uu climbed per leg cycle
+    float climbLegBendHip = -85.0f;   // knees drawn up: thighs
+    float climbLegBendKnee = 115.0f;  // ...knees
+    float climbLegPushHip = -30.0f;   // legs pushed down (standing on the foot lock): thighs
+    float climbLegPushKnee = 40.0f;   // ...knees
     float turnThreshold = 40.0f;  // deg/s of turning (while standing still) that starts the stepping animation
     float turnAnimDegPerSec = 90.0f;  // turn speed the step animation plays at rate 1
     float runBlendMax = 1.0f;      // most of the guard run mixed in at full sprint (user preferred the full run)
@@ -223,6 +294,29 @@ struct Settings {
     float shadowArmSteady = 1.0f;   // 0..1: how much a gear-holding shadow arm drops the walk/run swing
     bool itemShadows = true;       // held items (sword, pistol, crossbow, Heart...) cast a shadow from the shadow body's hands
     bool shadowWeaponArms = true;  // shadow arms raise when that hand holds a weapon/power
+    bool weaponArmShadow = true;   // a second casting body keeps the weapon-side arm in the shadow (13:05: with shadows on, the arm the skin hides vanished from the shadow); 0 = g_shadowBody casts (one-armed with a weapon out)
+    float castHoldAwayMs = 250.0f; // casting body: a busy hand whose 1P hand has been out of view this long (not looking up, not mid-draw) is treated as put away - its arm relaxes to the standing pose (14:45: blocking with the sword tucks the off-hand's item away)
+    bool castLightEnv = true;      // casting body / head / blobs / item copies get their own DynamicLightEnvironment with bCastShadows (the 1P arms' environment they borrowed casts none): indoor lamps cast the player's shadow too, as they do for NPCs (user 15:37: "only the sun casts a player shadow")
+    float castShoulderBlob = 0.0f;   // OFF (17:14 clip: at any size/orientation the blob read as a shoulder pad); kept for experiments.   // (17:07 clip: at 0.35 sunk into the joint the blob was entirely inside the silhouette - the notch is above and outside the joint)  // casting body: a shadow-only blob (the head mesh, this scale) at a raised arm's shoulder joint fills the notch the rig opens there (user 15:25, red marks); 0 = off
+    float castShoulderBlobUp = 6.0f;  // ...its centre's offset from the joint: up (the notch is at the top of the shoulder)
+    float castShoulderBlobOut = 5.0f; // ...out to the arm's side
+    float castShoulderBlobFwd = 0.0f; // ...forward
+    float castReachMax = 0.80f;    // (15:15 clip, front-lit wall: at 0.93 both upper arms still pointed at the wall and foreshortened into lumps - wide square shoulders; a properly bent elbow angles the upper arm down)    // casting body: the hand target is kept within this fraction of the arm's length from the shoulder, so the elbow always keeps a bend (15:00 clip: at full reach the IK locked the arm dead straight - a thin stick in the silhouette)
+    bool castHolsterShoulders = true;   // the holstered shoulders stay in the shadow with weapons out: a second, never-rendered casting body in the plain (holstered) pose, forearms + hands folded to the elbow, merged into the casting body's shadow
+    float castHolsterUpperArm = 0.8f;   // ...its upper arm's length/size on a raised side (1 = the whole holstered upper arm down to the elbow; smaller pulls it up into the shoulder)
+    bool itemMeshCastShadow = true;     // the held items' models cast shadows even where their mesh turns shadow casting off per section (18:3x, user: no crossbow or grenade shadow under any light - first-person weapon models ship with section shadow casting off). The real first-person item component is kept from casting at the same time
+    bool castOneShadow = true;          // the head shadow and the items-in-hand shadows are drawn as part of the casting body's own shadow (user 18:1x: under lamps the head and the items were darker where they overlapped the body - each cast its own shadow and the overlaps darkened twice; the sun draws everything into one shadow already)
+    bool castHolsterShadowParent = true; // ...rendered as part of the casting body's own shadow (one shadow, no darker overlap under indoor lights)
+    bool castArmRoll = true;         // casting body: the limb IK's hinge points the right way round (bInvertJointAxis per arm, learned off this body's own animated elbow while the IK is off, checked against the result). 17:28 log: the IK'd upper arm sat 167-180 deg from its rest rotation - a half turn about the arm's length: the skin between collar bone and upper arm collapses (the shoulder notch, the arm "floating below the shoulder"), and the wrist the same way
+    int castArmRollInvert = -1;      // override for both arms: 0 / 1 (-1 = learned)
+    float castClavicleFollow = 0.0f; // (off: 17:28 log "IK swing 0 deg" - the engine rewrites LocalAtoms after the controls, so the animated pose can't be read back; and the roll was the real fault) // casting body: the collar bone turns this fraction of the way toward the IK-raised upper arm, by the MEASURED rotation the IK added to the upper arm over the animation, in the collar bone's own frame (no guessed axis; settles at follow/(1+follow) = a third of the raise, the real shoulder's share); 0 = off
+    float castClavicleFollowMax = 25.0f; // ...and never more than this many degrees
+    float castClavicle = 0.0f;     // (off: even a trace added to the shoulder lump; the bent elbow is what makes the join natural)     // ...and its shoulder follows a raised arm: this fraction of the hand's elevation above hanging, as a forward shoulder roll (0 = off; 15:10 clip: 0.3 / 28 rolled the collar into a boxy hump seen from the front)
+    float castClavicleMax = 10.0f; // ...capped (deg)
+    float castElbowOut = 20.0f;    // ...its weapon arm's elbow pole: this far out to the side of the shoulder-hand midpoint (actor space; 14:34 clip: 55 stuck the elbow out like a wing)
+    float castElbowDown = 55.0f;   // ...and this far below it (the elbow hangs under the arm, as a real one does)
+    float castElbowBack = 40.0f;   // ...and this far behind it (was a fixed 10 until 18:2x: the pole then sat almost straight down-out from the shoulder, where the lowered sword hand bobs while walking - each time the hand crossed that line the bend plane flipped and the arm whipped half round, user: "the right arm's shadow looked like it was spinning"). Behind the shoulder no drawn 1P hand can reach it; with the hand out in front the elbow lands where it did
+    float castElbowTurnRate = 720.0f; // ...and the bend plane turns at most this many degrees per second (a backstop against any remaining flip)
     float shadowArmRaiseDeg = 100.0f; // percent of the per-item forward raise (ShadowArmPose)
     float shadowArmInDeg = 100.0f;  // percent of the per-item pull toward the middle (negative flips)
     float shadowElbowBendDeg = 100.0f; // percent of the per-item elbow bend (negative flips)
@@ -238,10 +332,54 @@ struct Settings {
     float jumpArmRaise = 60.0f;     // ...this far forward from the shoulder (degrees)
     float jumpArmIn = 10.0f;        // ...pulled in toward the middle
     float jumpArmElbow = 35.0f;     // ...elbow bend
+    bool jumpHands = true;          // ...hands up like claws (wrists back, fingers curled) and swaying with the body
+    float jumpWristDeg = -20.0f;    // ...wrist bend (negative = cocked back; flip the sign if they fold forward)
+    float jumpFingerCurlDeg = 1.0f; // ...finger bend: knuckles 80%, middle joints 140%, tips 80% (user: straighter than 18, then 9)
+    float jumpThumbDeg = 0.0f;     // ...thumb bend (negative = away from the palm; +12 tucked the thumbs under, user)
+    float jumpThumbSpreadDeg = -8.0f;// ...thumb swing (each step down brought it in: 25, 14, 7, -6; user: out more again, flatter hands)
+    float jumpPalmSign = -1.0f;     // ...which side of the hand faces the camera (user 22:3x: +1 showed the palms)
+    bool jumpHandsInView = true;    // ...hands held up in front of the view (arm IK), not hanging off the body
+    float jumpHandFwd = 14.0f;      // ...where: ahead of the eyes (uu; user: pulled back toward the camera from 34, then 24)
+    float jumpHandSide = 44.0f;     // ...out to each side (user: more apart than 38, 46; then closer than 54)
+    float jumpLeftHandDown = 6.0f;  // ...the left hand this much lower than the right (user)
+    bool armSkinHandoff = true;     // ...hand over to / take over from the game's 1P arm smoothly on draw / holster (user 22:57)
+    float armSkinHandoffHide = 0.95f;   // ...a busy arm hides once the reach for the 1P hand is this complete (0..1)
+    float armSkinLowerTime = 0.45f;     // ...after a holster the arm lowers from the 1P hand to the side over this long (s)
+    float armSkinReachMaxPitch = 10.0f; // ...no handover reach looking up past this (deg) - 23:40: sleeves swept the top of the view
+    float armSkinDrawWindow = 0.7f;     // ...a busy arm only takes over (1P hand off the bottom) this long into a draw (s)
+    bool handMatchSkin = true;      // ...free hands take the 1P arms' own hand skeleton (bind positions + rotations) - 22:35
+    float handFistCurl[4] = { 88.0f, 90.0f, 92.0f, 94.0f };   // ...sprint fist: curl (deg) at the knuckle (_0) on that bind,
+    float handFistMid = 1.05f, handFistTip = 0.6f;             //    middle joint (_1) and tip joint (_2) x these (user 22:52: the
+                                                               //    knuckles stayed straight - _0 is the first finger segment)
+    float handFistThumb0 = 0.0f, handFistThumb1 = 50.0f;       // ...sprint fist thumb root curl / thumb tip curl (over the fingers)
+    float handFistThumbTuck = -12.0f;                          // ...thumb root swung in across the fingers (local Z; -Z tucks)
+    bool handRelaxedPose = true;    // ...free hands standing/walking: a relaxed pose (user 22:18: the power pose looked tense there)
+    float handRelaxCurl[4] = { 3.0f, 5.0f, 7.0f, 9.0f };      // ...extra curl (deg) at the knuckle (_1) on the 1P arms' bind pose:
+                                                              //    index, middle, ring, pinky; the middle joint (_2) gets 1.3x
+                                                              //    (user 22:27: fingers can be straighter standing/walking)
+    float handRelaxThumb0 = 0.0f, handRelaxThumb1 = 4.0f;      // ...thumb root / thumb tip extra curl
+    bool jumpLeftPowerHand = true;  // ...the left hand takes the 1P "holding a power" finger pose (user 2026-10-11)
+    float jumpArmRollSign = -1.0f;  // ...arm roll vs the elbow bend (flip if the elbows look broken / palms face up)
+    float jumpHandUp = -80.0f;      // ...up (negative = below eye level; user: lower than -2, -10, -17, -22, then quite a bit lower than -38)
+    float jumpArmYawDeg[2] = { 0.0f, 30.0f };    // ...per arm (L, R): whole arm turned around the shoulder, + = to the right
+    float jumpForearmLift[2] = { 0.0f, 34.0f };  // ...per arm: hand raised (uu) so the forearm bends up at the elbow
+    float jumpHandIn[2] = { 0.0f, 18.0f };       // ...per arm: hand pulled in toward the chest's middle (uu, user: right arm closer)
+    float jumpHandBack[2] = { 0.0f, 4.0f };      // ...per arm: and back toward the body (uu)
+    float jumpHandOutDeg = 12.0f;   // ...hands turned outward at the wrist (left to the left, right to the right; user: slightly)
+    float jumpForearmRollDeg[2] = { 0.0f, 0.0f };      // (user: both hands like the unrolled left hand; mirrored rig - the left thumb side is bone +Y) // ...per arm: forearm + hand rolled about their length (R: thumb side to the camera)
+    float jumpElbowForward = 1.2f;  // ...T-pose arms: upper arms angled this far forward from straight out (user: arms in more than 0.08; 11:05: hands just out of view at 0.6 - log x 1.06..1.6 - so further in)
+    float jumpElbowDrop = 2.0f;     // ...upper arms angled down from level (~63 deg; 0.9 / ~42 deg read as a zombie pose, user)
+    float jumpHandOpenFrac = 0.6f;  // ...the captured power pose's fingers opened by blending each joint this far toward its open bind pose (0 = the half-closed power pose, 1 = fully the bind). 11:29 clip: "half closed" in jumps and the right hand in slides; the flat left slide hand is separate
+    float jumpCurlSignL = 1.0f;     // ...curl direction per hand (-1 if the fingers bend backwards)
+    float jumpCurlSignR = 1.0f;
+    float jumpSway = 0.0f;          // ...how much the arms move with falling, strafing and turning (0 = still; user: stationary)
     bool jumpHideTorso = true;      // hide the visible torso while airborne/vaulting/landing (camera clipped the coat)
     bool jumpPose = true;          // procedural jump/fall pose + landing squat
     float jumpHipDeg = -40.0f;      // lead hip in the air (same sign as the slide hips: negative = forward)
     float jumpKneeDeg = 60.0f;      // knee tuck in the air (trailing knee; the lead knee gets 70%)
+    float jumpLegSpread = 10.0f;    // ...both thighs swung this far out from the middle (deg) so the knees never cross (10:55 clip; negative flips)
+    bool jumpIdleLegs = false;      // ...the walk cycle gives way to the idle in the air (11:00; the user preferred the frozen stride's fluidity - off)
+    float jumpKneeMax = 105.0f;     // ...total knee bend cap in the air (deg): the tuck only adds what the frozen stride leaves room for (11:10; a shin folded through its thigh)
     bool hoverPose = true;          // floating legs while Daud's Transversal holds you in the air (toes down, knees up, drifting)
     float hoverHipDeg = -22.0f;     // ...hips (negative = knees forward/up)
     float hoverKneeDeg = 38.0f;     // ...knee bend
@@ -255,6 +393,8 @@ struct Settings {
     bool jumpHideUpper = true;      // hide the visible upper body mid-jump when moving fast and looking down
     float cornerLeanHips = 0.5f;   // share of the corner lean done by shifting the hips (rest = spine tilt)
     float armForwardDeg = 30.0f;   // holstered arms swing this far forward when looking down (visible body only)
+    float armForwardSprintCut = 0.6f;
+    float armStandSpreadDeg = -6.0f;  // standing / walking: the free arms rolled this far out from the body (user 10:15: the hands clipped the coat; +6 rolled them IN behind the coat - 10:20 screenshot)  // ...this share less while sprinting (20:03: 25 deg standing, ~10 sprinting - the swing clips)
     bool cornerLean = true;        // tilt the upper body sideways with the game's corner lean
     float leanSideSign = 1.0f;      // flip (-1) if the body tilts away from the lean
     float leanPivotHeight = 50.0f;  // uu from the spine pivot up to the shoulders (smaller = more tilt per uu of lean)
@@ -287,6 +427,7 @@ static volatile LONG g_armsChar = 0;
 static volatile LONG g_bladeChar = 0;
 static volatile LONG g_bowChar = 0;     // 1 = Daud's wristbow
 static volatile LONG g_powerChar = 0;   // 1 = Daud's power set
+static volatile LONG g_jumpChar = 0;    // Agility's power jump: 0 Corvo's double jump, 1 Daud's one continuous jump
 static volatile LONG g_charsSet = 0;   // 1 once the ini or the plugin has set them (the plugin may run first)
 
 static void LoadSettings() {
@@ -298,6 +439,7 @@ static void LoadSettings() {
         g_bladeChar = char3("BladeCharacter");
         g_bowChar = SettingInt("CrossbowCharacter", 0) == 1 ? 1 : 0;
         g_powerChar = SettingInt("PowerCharacter", 0) == 1 ? 1 : 0;
+        g_jumpChar = SettingInt("JumpCharacter", 0) == 1 ? 1 : 0;
     }
     auto readBool = [](const char* key, bool def) {
         return SettingInt(key, def ? 1 : 0) != 0;
@@ -308,6 +450,12 @@ static void LoadSettings() {
         return buf[0] ? static_cast<float>(atof(buf)) : def;
     };
     g_cfg.enabled = readBool("Enabled", g_cfg.enabled);
+    g_cfg.quickTurn = readBool("QuickTurn", g_cfg.quickTurn);
+    g_cfg.summonAssassinMax = std::min(std::max(SettingInt("SummonAssassinMax", g_cfg.summonAssassinMax), 1), 1000);
+    g_cfg.crossbowAlwaysLoaded = readBool("CrossbowAlwaysLoaded", g_cfg.crossbowAlwaysLoaded);
+    g_cfg.crossbowUpgradesCarryOver = readBool("CrossbowUpgradesCarryOver", g_cfg.crossbowUpgradesCarryOver);
+    g_cfg.zoomHoldTime = std::min(std::max(readFloat("ZoomHoldTime", g_cfg.zoomHoldTime), 0.1f), 2.0f);
+    g_cfg.quickTurnTime = std::min(std::max(readFloat("QuickTurnTime", g_cfg.quickTurnTime), 0.05f), 1.0f);
     g_cfg.hideArms = readBool("HideBodyArms", g_cfg.hideArms);
     g_cfg.attachMode = SettingInt("AttachMode", g_cfg.attachMode);
     g_cfg.offsetX = readFloat("OffsetX", g_cfg.offsetX);
@@ -367,6 +515,13 @@ static void LoadSettings() {
     g_cfg.jumpPose = readBool("JumpPose", g_cfg.jumpPose);
     g_cfg.jumpHideTorso = readBool("JumpHideTorso", g_cfg.jumpHideTorso);
     g_cfg.jumpArms = readBool("JumpArms", g_cfg.jumpArms);
+    g_cfg.jumpHands = readBool("JumpHands", g_cfg.jumpHands);
+    g_cfg.jumpWristDeg = readFloat("JumpWristDegrees", g_cfg.jumpWristDeg);
+    g_cfg.jumpFingerCurlDeg = readFloat("JumpFingerCurlDegrees", g_cfg.jumpFingerCurlDeg);
+    g_cfg.jumpThumbDeg = readFloat("JumpThumbDegrees", g_cfg.jumpThumbDeg);
+    g_cfg.jumpCurlSignL = readFloat("JumpCurlSignL", g_cfg.jumpCurlSignL);
+    g_cfg.jumpCurlSignR = readFloat("JumpCurlSignR", g_cfg.jumpCurlSignR);
+    g_cfg.jumpSway = readFloat("JumpSway", g_cfg.jumpSway);
     g_cfg.jumpArmRaise = readFloat("JumpArmRaise", g_cfg.jumpArmRaise);
     g_cfg.jumpArmIn = readFloat("JumpArmIn", g_cfg.jumpArmIn);
     g_cfg.jumpArmElbow = readFloat("JumpArmElbow", g_cfg.jumpArmElbow);
@@ -383,7 +538,18 @@ static void LoadSettings() {
     g_cfg.armIK = readBool("ShadowArmsFollowHands", g_cfg.armIK);
     g_cfg.fpArmShadow = readBool("FirstPersonArmShadow", g_cfg.fpArmShadow);
     g_cfg.playerShadows = readBool("PlayerShadows", g_cfg.playerShadows);
+    g_cfg.weaponArmShadow = readBool("WeaponArmShadow", g_cfg.weaponArmShadow);
+    g_cfg.castArmRoll = readBool("CastArmHinge", g_cfg.castArmRoll);
+    g_cfg.castArmRollInvert = static_cast<int>(readFloat("CastArmHingeInvert", static_cast<float>(g_cfg.castArmRollInvert)));
+    g_cfg.castHolsterShoulders = readBool("HolsteredShoulders", g_cfg.castHolsterShoulders);
+    g_cfg.castHolsterUpperArm = readFloat("HolsteredShoulderUpperArm", g_cfg.castHolsterUpperArm);
+    g_cfg.castHolsterShadowParent = readBool("HolsteredShoulderOneShadow", g_cfg.castHolsterShadowParent);
+    g_cfg.castOneShadow = readBool("OneShadow", g_cfg.castOneShadow);
+    g_cfg.itemMeshCastShadow = readBool("ItemModelsCastShadow", g_cfg.itemMeshCastShadow);
     if (!g_cfg.playerShadows) { g_cfg.shadowBody = false; g_cfg.headShadow = false; g_cfg.fpArmShadow = false; g_cfg.itemShadows = false; }
+    // The first-person arm skin copies the shadow body's pose (unshrunk arms), so it is built even with player shadows
+    // off - it just casts no shadow then (CreateShadowBody).
+    if (g_cfg.fpArmSkin) g_cfg.shadowBody = true;
     g_cfg.armShadowPitchFollow = readFloat("ArmShadowPitchFollow", g_cfg.armShadowPitchFollow);
     g_cfg.armIKEye = { readFloat("ShadowEyeForward", g_cfg.armIKEye.X), 0.0f, readFloat("ShadowEyeUp", g_cfg.armIKEye.Z) };
     g_cfg.armIKElbow = { readFloat("ShadowElbowBack", -g_cfg.armIKElbow.X) * -1.0f, readFloat("ShadowElbowOut", g_cfg.armIKElbow.Y),
@@ -435,6 +601,8 @@ static void LoadSettings() {
     g_cfg.takedownHideTorso = readBool("TakedownHideTorso", g_cfg.takedownHideTorso);
     g_cfg.hitCameraScale = readFloat("HitCameraScale", g_cfg.hitCameraScale);
     g_cfg.lookUpHideTorsoDeg = readFloat("LookUpHideTorsoDegrees", g_cfg.lookUpHideTorsoDeg);
+    g_cfg.strafeHideTorsoSpeed = readFloat("StrafeHideTorsoSpeed", g_cfg.strafeHideTorsoSpeed);
+    g_cfg.strafeHideTorsoPitch = readFloat("StrafeHideTorsoPitch", g_cfg.strafeHideTorsoPitch);
     g_cfg.lookUpSteady = readBool("LookUpSteadyCamera", g_cfg.lookUpSteady);
     g_cfg.hitHideTorso = readBool("HitHideTorso", g_cfg.hitHideTorso);
     g_cfg.hitHideMs = readFloat("HitHideMs", g_cfg.hitHideMs);
@@ -463,6 +631,21 @@ static void LoadSettings() {
     g_cfg.dangleStiffness = readFloat("DangleStiffness", g_cfg.dangleStiffness);
     g_cfg.dangleDamping = readFloat("DangleDamping", g_cfg.dangleDamping);
     g_cfg.climbGripKnee = readFloat("ClimbGripKnee", g_cfg.climbGripKnee);
+    g_cfg.climbShadowArms = readBool("ClimbShadowArms", g_cfg.climbShadowArms);
+    g_cfg.climbHands = readBool("ClimbHands", g_cfg.climbHands);
+    g_cfg.climbChainForward = readFloat("ClimbChainForward", g_cfg.climbChainForward);
+    g_cfg.climbGripTop = readFloat("ClimbGripTop", g_cfg.climbGripTop);
+    g_cfg.climbGripBottom = readFloat("ClimbGripBottom", g_cfg.climbGripBottom);
+    g_cfg.climbReachTime = readFloat("ClimbReachTime", g_cfg.climbReachTime);
+    g_cfg.climbHandSpread = readFloat("ClimbHandSpread", g_cfg.climbHandSpread);
+    g_cfg.climbArmNearScale = readFloat("ClimbArmNearScale", g_cfg.climbArmNearScale);
+    g_cfg.selfTestCapture = readBool("SelfTestCapture", g_cfg.selfTestCapture);
+    g_cfg.climbLegCycle = readBool("ClimbLegCycle", g_cfg.climbLegCycle);
+    g_cfg.climbLegStride = readFloat("ClimbLegStride", g_cfg.climbLegStride);
+    g_cfg.climbLegBendHip = readFloat("ClimbLegBendHip", g_cfg.climbLegBendHip);
+    g_cfg.climbLegBendKnee = readFloat("ClimbLegBendKnee", g_cfg.climbLegBendKnee);
+    g_cfg.climbLegPushHip = readFloat("ClimbLegPushHip", g_cfg.climbLegPushHip);
+    g_cfg.climbLegPushKnee = readFloat("ClimbLegPushKnee", g_cfg.climbLegPushKnee);
     g_cfg.turnAnimDegPerSec = readFloat("TurnStepSpeed", g_cfg.turnAnimDegPerSec);
     g_cfg.slideHipDeg = readFloat("SlideFrontHip", g_cfg.slideHipDeg);
     g_cfg.slideKneeDeg = readFloat("SlideFrontKnee", g_cfg.slideKneeDeg);
@@ -520,13 +703,24 @@ static bool g_hideUpperNow = false;  // SyncTransform: the upper body would clip
 static FVector g_camCorrection = { 0, 0, 0 };   // rigid camera: final view minus the game's view (SyncTransform uses it)
 static FVector g_camTarget = { 0, 0, 0 };       // rigid camera: world offset from the vanilla view to the fixed view
 static FVector g_bodyFollowTarget = { 0, 0, 0 }; // ...the part the visible body follows (capped at the level-look amount)
-static UObject* g_handItem[2] = { nullptr, nullptr };   // per hand (0 left, 1 right): the held inventory item (UDishonoredInventoryItem)
+static UObject* g_handItem[2] = { nullptr, nullptr };
+static DWORD g_handsChangedTick = 0;     // UpdateHands: when the held items / their 1P models last changed (a draw, holster or switch starts)
+static DWORD g_handSeqChangedTick = 0;   // ...when either held item's current animation last changed
+static bool g_handsAllIdle = true;       // ...both held items are on an idle animation (or have none)   // per hand (0 left, 1 right): the held inventory item (UDishonoredInventoryItem)
 static FVector g_shadowBodyT = { 0, 0, 0 };     // SyncTransform: the shadow body's Translation (actor space)
 static FVector g_armsShadowOffset = { 0, 0, 0 };   // world offset from the 1P arms to the arm shadow copy (shoulders onto the body)
 static USkeletalMeshComponent* g_armsShadow = nullptr;  // shadow-only copy of the first-person arms (pose copied from pawn->Mesh)
+static USkeletalMeshComponent* g_armSkin = nullptr;   // UpdateArmSkin: the 1P arms model drawn on Daud's / the Overseer's body
 static USkeletalMeshComponent* g_itemShadow[2] = { nullptr, nullptr };   // shadow-only copies of the held items' models
 static bool g_bodyVisible = false;             // UpdateVisibility: first-person view (not a cutscene)
 static int g_handKind[2] = { 0, 0 };          // per hand (0 left, 1 right): 0 empty, 1 sword, 2 pistol/crossbow, 3 power/other
+static bool g_onePHandOnScreen[2] = { false, false };   // the game's 1P hand is in view (UpdateOnePHandOnScreen; handover)
+static bool g_onePHandBelow[2] = { false, false };      // ...it is out of view under the bottom edge
+static DWORD g_onePHandOffMs[2] = { 0, 0 };             // ...how long it has been out of view (ms; 0 while in view)
+static DWORD g_handFreeMs[2] = { 0x7FFFFFFF, 0x7FFFFFFF };   // UpdateCoat: ms since that hand went busy -> free (0 while busy)
+static bool g_skinArmShown[2] = { false, false };       // UpdateArmSkin: that side of the arm skin is drawn this frame
+static bool g_handDrawing[2] = { false, false };        // UpdateHands: being drawn, its 1P model not shown yet (<= 600 ms)
+static FVector g_skinOffWorld = { 0, 0, 0 };            // where the arm skin draws the shadow pose: shadow + this (UpdateArmSkin)
 static float g_weaponRaise[2] = { 0, 0 };     // eased 0..1 per hand (0 left, 1 right): shadow arm raised for a weapon
 static float g_crouchSink = 0.0f;              // set by UpdatePosture: how far crouching sank the body (uu)
 static FVector g_viewLoc = { 0, 0, 0 };        // final view location from the GetPlayerViewPoint hook
@@ -536,6 +730,9 @@ static float g_viewFov = 90.0f;                // ...horizontal field of view (d
 static float g_viewGuardBack = 0.0f;           // view guard: uu the visible body is eased back so no upper-body part is in view
 static float g_landHold = 0.0f;                // 1 -> 0 over 0.4 s after landing (UpdateJump)
 static float g_slideLegW = 0.0f;              // UpdateSlide: weight of the slide leg pose (foot IK takes the rest)
+static float g_slideYawOffDeg = 0.0f;         // SyncTransform: how far the body's yaw lags the view in a slide (deg, + = left of it)
+static float g_slideCamW = 0.0f;              // UpdateSlide: weight of the slide camera raise (in/out at 6/s, matching the game's own camera move)
+static float g_slideCamSettleOff = 0.0f;      // view hook: how far the slide -> crouch settle holds the view below the computed height (<= 0); the 1P arms follow it
 static float g_upperAmount = 0.0f;            // eased 0..1: visible upper body (spine_3 up) hidden
 static float g_torsoAmount = 0.0f;            // eased 0..1: visible torso from the waist up hidden
 static float g_legHideAmount = 0.0f;          // eased 0..1: visible legs folded into the hips (crouching under tables)
@@ -544,14 +741,44 @@ static bool g_hitActive = false;              // UpdateHitState: just hit / stun
 static FVector g_clipDir = { -0.8f, 0.0f, -0.6f };   // clip guard push direction (player space, unit)
 static float g_clipPush = 0.0f;                // clip guard: uu the visible body is pushed back/down from the camera
 static float g_climbAmount = 0.0f;            // UpdateClimb: eased 0..1 on a chain/ladder
+// (14:33 log: "physics 0 -> 1" every frame, and the very first line too - the static starts at -1, so its memory is being
+// zeroed before and between frames by something. The value lives here now, and PhysProbe after each per-frame step
+// logs which step it changed under.)
+static int g_physLast = -1, g_physLastSet = -1;
+static float g_castS[2] = { 0.0f, 0.0f };
+static float g_climbHandUp[2] = { 0.0f, 0.0f };
+static float g_climbGrip[2] = { 0.0f, 0.0f };     // UpdateClimbHands: finger grip per hand (1 = closed round the chain), read by UpdateJumpHands
+static bool g_climbHandsOn = false;              // UpdateClimbHands posed the arms this frame
+static float g_climbVz = 0.0f;
+static float g_climbLegPhase = 0.0f, g_climbLegMove = 0.0f;   // UpdateClimb: the legs' climbing cycle (reset when the climb ends)                   // UpdateClimb: measured climbing speed (uu/s, from the pawn's height - on a chain Velocity.Z reads 0)
+static volatile LONG g_captureWant = 0;          // frame capture: 1 = save the next presented frame
+static volatile LONG g_captureCount = 0;         // ...frames saved this session
+static char g_captureTag[16] = "frame";   // UpdateCastingArmReach: how far each drawn 1P hand is above this body's shoulder (actor space), for the climb log      // UpdateCastingArmReach: this frame's casting-arm strength per hand (0 when its reach is off)
+static float g_castHold[2] = { 1.0f, 1.0f };   // UpdateCastingArmReach: 1 = the hand holds its item; eases to 0 while the game keeps the 1P hand away (a block)
+static void PhysProbe(const char* after) {
+    if (g_physLastSet == -1 || g_physLast == g_physLastSet) return;
+    static DWORD lastT = 0;
+    if (GetTickCount() - lastT < 1000) return;
+    lastT = GetTickCount();
+    Log("probe: physLast is %d (UpdateClimb stored %d) after %s", g_physLast, g_physLastSet, after);
+}
 static const char* g_lastHideWhy = nullptr;    // UpdateVisibility: reason of the current hide (log filter)
 static bool g_mantleWant = false;              // UpdateVisibility: camera pulled back by a mantle
 static float g_mantleAmount = 0.0f;            // eased 0..1: visible body shrunk away for the mantle
 static bool g_torsoHidden = false;             // UpdateLean: visible torso hidden from the waist up this frame
 static float g_swimAmount = 0.0f;             // 0..1 eased swimming pose weight (UpdateSwim)
 static float g_jumpAmount = 0.0f;             // 0..1 eased airborne pose weight (UpdateJump)
+static float g_jumpSwayRaise = 0.0f;          // jump hands: extra arm raise (deg) from falling speed + drift
+static float g_jumpSwayRoll = 0.0f;           // ...and sideways lag (deg) from strafing and turning
+static float g_jumpFlex = 0.0f;               // ...slow finger flex (-1..1)
+static bool g_armSkinOn = false;              // the first-person arm skin is drawn on the body (UpdateArmSkin)
+static float g_sprintBackAmount = 0.0f;       // 0..1 eased sprint weight (SyncTransform; the arm skin eases back with it)
 static float g_jumpBodyW = 0.0f;              // 0..1 weight of the jump's body back/down offset (held through the landing)
 static float g_landDip = 0.0f;                 // uu (<= 0) both bodies drop on landing; foot IK bends the knees
+static float g_zAbsorb = 0.0f;                 // SyncTransform: a pawn Z step after a slide, held back and released like the camera
+static float g_absorbLastZ = 0.0f, g_absorbLastCyl = 0.0f;   // ...the pawn Z / cylinder height it last saw (shared with the view hook, which takes a step out in the same frame)
+static DWORD g_absorbSlideEndAt = 0;           // ...GetTickCount at the slide's end (the absorb watches for a second after it)
+static LONGLONG g_absorbQpc = 0;               // ...when that snapshot was taken (the view hook's velocity term)
 static float g_viewPitchDeg = 0.0f;            // view pitch in degrees (+ up), set by UpdateLean
 static float g_cornerLeanRight = 0.0f;         // game's camera sideways offset from the pitch curve (corner lean), uu
 static float g_stairDz = 0.0f;                 // game's camera height minus the pitch curve's (stairs lag), uu
@@ -567,6 +794,8 @@ static float g_footLift = 0.0f;     // current (eased) foot lift; the coat follo
 static float g_smoothedSink = 0.0f; // body's eased crouch drop (SyncTransform); feet learn the standing gap only when settled
 static USkeletalMesh* g_headMesh = nullptr;        // DLC07_skm_Corvo_Mask (masked head), same package
 static USkeletalMeshComponent* g_head = nullptr;   // hidden head that only casts a shadow
+static USkeletalMeshComponent* g_shoulderBlob[2] = { nullptr, nullptr };
+static UDynamicLightEnvironmentComponent* g_castLightEnv = nullptr;   // the casters' own light environment: casts the composite shadow from the lights around the player, not just the sun (user 15:37)   // shadow-only "deltoid" at each shoulder joint of the casting body while that arm is raised (user 15:25: fill the gap)
 // Body Swap (Daud): same package as Corvo's body (L_DLC07_Endgame_Script); Daud's 1P arms come from his player package.
 static USkeletalMesh* g_daudBodyMesh = nullptr;   // skm_Daud_Body (same skeleton as Corvo's; coat panels named differently)
 static USkeletalMesh* g_daudHeadMesh = nullptr;   // skm_Daud_Head
@@ -578,9 +807,15 @@ static USkeletalMesh* g_daudArmsMesh = nullptr;   // DLC07_Skm_Player_Daud (same
 static USkeletalMesh* g_ovsBodyMesh = nullptr;
 static USkeletalMesh* g_ovsHeadMesh = nullptr;
 static USkeletalMesh* g_ovsArmsMesh = nullptr;
+// The Overseer 1P arms mesh has NO material of its own (package: Materials[0] = None) - the game supplies it at runtime in
+// the DLC. Ours: DLC07_Player_DaudOverseer_inst from the same package (22:01: the arms didn't look like the disguise).
+static UMaterialInterface* g_ovsArmsMat = nullptr;
 static USkeletalMesh* g_ovsSwordMesh = nullptr;
 static int g_builtChar = -1;                      // character the current body was built with
-static USkeletalMeshComponent* g_shadowBody = nullptr;   // hidden full body (coat + arms) that only casts the shadow
+static USkeletalMeshComponent* g_shadowBody = nullptr;   // hidden full body (coat + arms): the arm skin's pose source (casts only if no g_shadowArms)
+static USkeletalMeshComponent* ShadowCasterComp();
+static USkeletalMeshComponent* g_holsterCast = nullptr;   // hidden, shadow-only body that stays in the HOLSTERED pose with weapons out; its forearms and hands are folded away, so it adds only the holstered shoulders + upper arms to the shadow (user 17:38: "keep the shoulder shadows from the holstered arm shadows always on")
+static USkeletalMeshComponent* g_shadowArms = nullptr;   // hidden full body that is the SOLE shadow caster: same pose, but a weapon-side arm is posed to hold the weapon instead of shrunk (UpdateArmSkin shrinks g_shadowBody's so the visible skin arm hides)
 
 static thread_local int g_inHook = 0;
 
@@ -599,6 +834,31 @@ static std::string Narrow(const wchar_t* w) {
     return s;
 }
 
+// Async loading a package the engine's file cache doesn't know is a FATAL error: "Couldn't find file for package
+// L_DLC07_Endgame_Script requested by async loading code" (user, 2026-10-11 19:39: Dishonored.exe started from a
+// taskbar pin instead of through Steam - the DLC folders were never added, and every body/arms package is DLC).
+// So ask the cache first (GPackageFileCache 0x13B6014, vtable slot 2 = FMapPackageFileCache::FindPackageFile
+// 0x4940E0, checked against this exe); a package it can't find goes to the callback as a failed load instead.
+static bool PackageAvailable(const wchar_t* package) {
+    void* cache = *reinterpret_cast<void**>(0x013B6014);
+    if (!cache || !package) return true;   // no cache yet: let the engine decide, as before
+    struct RawString { wchar_t* data; int num, max; } out = { nullptr, 0, 0 };   // engine-allocated; left (a few bytes, rare)
+    using FindPackageFile_t = unsigned int(__thiscall*)(void*, const wchar_t*, const void*, RawString*, const wchar_t*);
+    auto find = reinterpret_cast<FindPackageFile_t>((*reinterpret_cast<void***>(cache))[2]);
+    return find(cache, package, nullptr, &out, nullptr) != 0;
+}
+
+static void LoadPackageAsync(const FString& name, void(__cdecl* done)(UObject*, void*), void* user, const void* guid) {
+    const wchar_t* pkg = *reinterpret_cast<const wchar_t* const*>(&name);   // FString: data pointer first (private in the SDK)
+    if (!RawLoadPackageAsync || !PackageAvailable(pkg)) {
+        Log("package %s not found by the engine - not loading it (DLC not mounted? start Dishonored through Steam)",
+            pkg ? Narrow(pkg).c_str() : "?");
+        done(nullptr, user);
+        return;
+    }
+    RawLoadPackageAsync(name, done, user, guid);
+}
+
 static void GrabAssetsNow();   // defined after the asset helpers
 
 static void __cdecl OnPackageLoaded(UObject* package, void* /*user*/) {
@@ -610,7 +870,7 @@ static void __cdecl OnPackageLoaded(UObject* package, void* /*user*/) {
 }
 
 static void StartLoad() {
-    if (!LoadPackageAsync || g_sourceIndex >= static_cast<int>(sizeof(kSources) / sizeof(kSources[0]))) {
+    if (!RawLoadPackageAsync || g_sourceIndex >= static_cast<int>(sizeof(kSources) / sizeof(kSources[0]))) {
         g_loadState = LoadState::Failed;
         Log("no more body sources to try");
         return;
@@ -709,7 +969,7 @@ static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ?
 
 // Every array buffer we hand to the engine, and the field it went into.
 struct OurArray { RawArray* field; void* data; };
-static OurArray g_ourArrays[256];
+static OurArray g_ourArrays[1024];   // (256 until 18:1x: four bodies' trees now)
 static int g_ourArrayCount = 0;
 
 static bool IsOurBuffer(void* p) {
@@ -724,8 +984,23 @@ static bool FillArray(void* arrayField, const void* items, int count, size_t str
     if (items) memcpy(data, items, stride * count);
     arr->Data = data;
     arr->Num = arr->Max = count;
-    if (g_ourArrayCount < 256) g_ourArrays[g_ourArrayCount++] = { arr, data };
+    if (g_ourArrayCount < 1024) g_ourArrays[g_ourArrayCount++] = { arr, data };
+    else {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("WARNING: array registry full (1024) - a buffer is untracked and a level change may crash"); }
+    }
     return true;
+}
+
+// A body whose setup failed half way: empty the fields that still hold the buffers registered since 'mark' (the engine
+// must never free our memory) and forget them, before the component is dropped (review 18:0x).
+static void ForgetArraysSince(int mark) {
+    if (mark < 0 || mark > g_ourArrayCount) return;
+    for (int i = mark; i < g_ourArrayCount; ++i) {
+        OurArray& a = g_ourArrays[i];
+        if (a.field && a.field->Data == a.data) { a.field->Data = nullptr; a.field->Num = a.field->Max = 0; }
+    }
+    g_ourArrayCount = mark;
 }
 
 // Before a level unload: empty every array that still points at one of our buffers, in our template nodes,
@@ -814,11 +1089,12 @@ static void AddFootIK(UAnimTree* tree, void* heads, int& count);
 static void AddCoatControls(UAnimTree* tree, void* heads, int& count);
 static void AddLeanControls(UAnimTree* tree, void* heads, int& count);
 static void AddArmIK(UAnimTree* tree, void* heads, int& count);
+static void AddJumpHandControls(UAnimTree* tree, void* heads, int& count);
 
 static void AddLegControls(UAnimTree* tree) {
     struct ListHead { int32_t nameIndex, nameNumber; USkelControlBase* head; int32_t drawY; };
     static_assert(sizeof(ListHead) == 16, "FSkelControlListHead is 16 bytes");
-    ListHead heads[32] = {};
+    ListHead heads[96] = {};   // legs, foot IK, coat, lean, arm IK, jump hands (fingers: 28)
     int count = 0;
     for (const char* bone : kLegBones) {
         FName name(bone);
@@ -838,6 +1114,7 @@ static void AddLegControls(UAnimTree* tree) {
     AddCoatControls(tree, heads, count);
     AddLeanControls(tree, heads, count);
     AddArmIK(tree, heads, count);
+    AddJumpHandControls(tree, heads, count);
     if (count) FillArray(&tree->SkelControlLists, heads, count, sizeof(ListHead));
     Log("skel controls: %d leg swing, %d foot IK", legCount, count - legCount);
 }
@@ -891,6 +1168,83 @@ static void AddFootIK(UAnimTree* tree, void* heads, int& count) {
 // hinges on Y, like the legs), plus a world-space rotation on Offset_hand_X (the item shadow hangs off that bone).
 static const char* kHandBones[2] = { "hand_L_jnt", "hand_R_jnt" };
 static const char* kHandOffsetBones[2] = { "Offset_hand_L_jnt", "Offset_hand_R_jnt" };
+static const char* kWristControlNames[2] = { "handHelperBone_L_jnt", "handHelperBone_R_jnt" };
+static const char* kHelperFixNames[2] = { "handAttachment_L_jnt", "handAttachment_R_jnt" };   // ControlName of the helper-bone fix
+// Corvo's coat cuffs (1P sleeve_X_jnt) ride the body's handAttachment_X bone, which a control places where the 1P sleeve
+// bone sits: off the FOREARM (BCS_OtherBoneSpace lower_arm), (22,0,0), no rotation. ControlName sleeve_X (free name).
+static const char* kCuffCarrierBones[2] = { "handAttachment_L_jnt", "handAttachment_R_jnt" };
+static const char* kCuffControlNames[2] = { "sleeve_L_jnt", "sleeve_R_jnt" };
+static const char* kLowerArmBones[2] = { "lower_arm_L_jnt", "lower_arm_R_jnt" };
+
+// Jump hands (2026-10-10, user reference photo: both hands up, wrists cocked back, fingers curled like claws):
+// additive bone-space bends on every finger and thumb joint. Finger joints run along local X and hinge on local Y
+// (their Y axis lies along the knuckle line in the rest pose), like the forearms - so the curl is a pitch.
+// [side][joint]: index/middle/ring/pinky 0-2, thumb 0-1.
+static const char* kFingerBones[2][14] = {
+    { "index_0_L_jnt", "index_1_L_jnt", "index_2_L_jnt", "middle_0_L_jnt", "middle_1_L_jnt", "middle_2_L_jnt",
+      "ring_0_L_jnt", "ring_1_L_jnt", "ring_2_L_jnt", "pinky_0_L_jnt", "pinky_1_L_jnt", "pinky_2_L_jnt",
+      "thumb_0_L_jnt", "thumb_1_L_jnt" },
+    { "index_0_R_jnt", "index_1_R_jnt", "index_2_R_jnt", "middle_0_R_jnt", "middle_1_R_jnt", "middle_2_R_jnt",
+      "ring_0_R_jnt", "ring_1_R_jnt", "ring_2_R_jnt", "pinky_0_R_jnt", "pinky_1_R_jnt", "pinky_2_R_jnt",
+      "thumb_0_R_jnt", "thumb_1_R_jnt" } };
+
+static const char* kUpperArmBones[2] = { "upper_arm_L_jnt", "upper_arm_R_jnt" };
+
+static void AddJumpHandControls(UAnimTree* tree, void* heads, int& count) {
+    struct ListHead { int32_t nameIndex, nameNumber; USkelControlBase* head; int32_t drawY; };
+    auto* list = static_cast<ListHead*>(heads);
+    int added = 0;
+    for (const char* bone : kUpperArmBones) {   // jump hands: the whole arm is placed from the view
+        FName name(bone);
+        if (name.FNameEntryId < 0 || count >= 96) continue;
+        auto* ctl = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree);
+        if (!ctl) continue;
+        ctl->ControlName = name;
+        ctl->ControlStrength = ctl->StrengthTarget = 0.0f;
+        ctl->bApplyRotation = 1;
+        ctl->bAddRotation = 0;
+        ctl->BoneRotationSpace = EBoneControlSpace::BCS_WorldSpace;
+        list[count++] = { name.FNameEntryId, 0, ctl, 0 };
+    }
+    for (int side = 0; side < 2; ++side)
+        for (const char* bone : kFingerBones[side]) {
+            if (count >= 96) break;
+            FName name(bone);
+            if (name.FNameEntryId < 0) continue;
+            auto* ctl = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree);
+            if (!ctl) continue;
+            ctl->ControlName = name;
+            ctl->ControlStrength = ctl->StrengthTarget = 0.0f;
+            ctl->bApplyRotation = 1;
+            ctl->bAddRotation = 1;
+            ctl->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;
+            list[count++] = { name.FNameEntryId, 0, ctl, 0 };
+            ++added;
+        }
+    // The wrist twist bone (handHelperBone): the bodies' bind rolls it 24 deg against the 1P arms' - its verts (wrist,
+    // Daud's wristbow) twisted. A control on that bone, named after handAttachment_X (FindSkelControl needs a free name).
+    for (int side = 0; side < 2; ++side) {
+        FName bone(kWristControlNames[side]), ctlName(kHelperFixNames[side]);
+        if (bone.FNameEntryId < 0 || ctlName.FNameEntryId < 0 || count >= 96) continue;
+        auto* ctl = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree);
+        if (!ctl) continue;
+        ctl->ControlName = ctlName;
+        ctl->ControlStrength = ctl->StrengthTarget = 0.0f;
+        list[count++] = { bone.FNameEntryId, 0, ctl, 0 };
+        ++added;
+    }
+    for (int side = 0; side < 2; ++side) {   // the cuff carrier (see kCuffCarrierBones)
+        FName bone(kCuffCarrierBones[side]), ctlName(kCuffControlNames[side]);
+        if (bone.FNameEntryId < 0 || ctlName.FNameEntryId < 0 || count >= 96) continue;
+        auto* ctl = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree);
+        if (!ctl) continue;
+        ctl->ControlName = ctlName;
+        ctl->ControlStrength = ctl->StrengthTarget = 0.0f;
+        list[count++] = { bone.FNameEntryId, 0, ctl, 0 };
+        ++added;
+    }
+    Log("jump hands: %d finger controls", added);
+}
 
 static void AddArmIK(UAnimTree* tree, void* heads, int& count) {
     struct ListHead { int32_t nameIndex, nameNumber; USkelControlBase* head; int32_t drawY; };
@@ -910,6 +1264,19 @@ static void AddArmIK(UAnimTree* tree, void* heads, int& count) {
         ik->JointTargetLocation = FVector{ -30.0f, i == 0 ? -60.0f : 60.0f, 0.0f };
         ik->bMaintainEffectorRelRot = 0;
         list[count++] = { hand.FNameEntryId, 0, ik, 0 };
+        // Jump hands: the wrist bend runs after the IK on the same bone. Its ControlName is the (sibling)
+        // handHelperBone's name so FindSkelControl can tell it from the IK; the list head decides the bone.
+        FName wristName(kWristControlNames[i]);
+        if (wristName.FNameEntryId >= 0) {
+            if (auto* wrist = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree)) {
+                wrist->ControlName = wristName;
+                wrist->ControlStrength = wrist->StrengthTarget = 0.0f;
+                wrist->bApplyRotation = 1;
+                wrist->bAddRotation = 1;
+                wrist->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;
+                ik->NextControl = wrist;
+            }
+        }
         if (offset.FNameEntryId < 0) continue;
         auto* rot = NewObject<USkelControlSingleBone>("Class Engine.SkelControlSingleBone", tree);
         if (!rot) continue;
@@ -980,7 +1347,7 @@ static void AddCoatControls(UAnimTree* tree, void* heads, int& count) {
 // view pitch like Dishonored 2 - back when looking up (the collar moves away from the camera instead of the
 // camera ending up at the back of the neck), slightly forward when looking down. Actor-space additive pitch on
 // spine_1 and spine_2 (half each; the second adds on top of the first), on both the visible and shadow body.
-static const char* kSpineBones[2] = { "spine_1_jnt", "spine_2_jnt" };
+static const char* kSpineBones[3] = { "spine_1_jnt", "spine_2_jnt", "spine_0_jnt" };   // (spine_0: slide low recline only)
 
 static void AddLeanControls(UAnimTree* tree, void* heads, int& count) {
     struct ListHead { int32_t nameIndex, nameNumber; USkelControlBase* head; int32_t drawY; };
@@ -1061,6 +1428,18 @@ static void UpdateHitState(ADishonoredPlayerPawn* pawn) {
     g_hitActive = stunned || (hitUntil && now < hitUntil);
 }
 
+// Frame delta from the performance counter (seconds, clamped 0..0.1). GetTickCount steps every ~15.6 ms, so at 130 fps
+// every other frame read dt = 0 and all the eases judder (slide get-up, user 01:20). Each caller keeps its own 'last'.
+static float QpcDt(LONGLONG& last) {
+    static LONGLONG freq = 0;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    float dt = last ? Clamp(static_cast<float>(static_cast<double>(c.QuadPart - last) / static_cast<double>(freq)), 0.0f, 0.1f) : 0.0f;
+    last = c.QuadPart;
+    return dt;
+}
+
 static void UpdateLean(ADishonoredPlayerPawn* pawn) {
     if (!g_body || !g_bodyAnimated || !pawn) return;
     ApplyHitCameraScale(pawn);
@@ -1080,8 +1459,23 @@ static void UpdateLean(ADishonoredPlayerPawn* pawn) {
         // (sheets then point at the belly, far below). Small hysteresis so the view bob doesn't flicker it.
         static bool lookUp = false;
         lookUp = g_cfg.lookUpHideTorsoDeg > 0.0f && g_viewPitchDeg > g_cfg.lookUpHideTorsoDeg - (lookUp ? 5.0f : 0.0f);
-        bool want = takedown || hit || lookUp || g_isSliding || g_slideAmount > 0.0f || g_swimAmount > 0.0f || g_climbAmount > 0.0f || g_smoothedSink > g_cfg.deepCrouchSink ||
-                    g_smoothedSink - g_crouchSink > 3.0f ||
+        // (slide work 00:35: the torso stays in slides - the camera is well above the chest now - so no slide clause, and
+        // the deep-sink clause skips slides; the rising-sink clause still hides it for the get-up, as for crouch -> stand)
+        bool slideNow = g_isSliding || g_slideAmount > 0.0f;
+        // Strafing (20:12 clip, user: "the neck clipping in front of the bottom of the camera" moving right): the collar rim
+        // round the collapsed neck bobs up into the bottom edge of the view with each sideways step. Facing forward the
+        // torso is below the view anyway, so it goes (from the waist, as for looking up); looking down it stays.
+        bool strafe = false;
+        if (g_cfg.strafeHideTorsoSpeed > 0.0f && phys == 1 && !slideNow) {
+            float yawR = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+            float lateral = -pawn->Velocity.X * sinf(yawR) + pawn->Velocity.Y * cosf(yawR);
+            static bool was = false;
+            strafe = fabsf(lateral) > g_cfg.strafeHideTorsoSpeed * (was ? 0.7f : 1.0f) && g_viewPitchDeg > g_cfg.strafeHideTorsoPitch - (was ? 5.0f : 0.0f);
+            if (strafe != was) { was = strafe; Log("strafe: torso %s (sideways %.0f uu/s, pitch %.0f)", strafe ? "hidden" : "back", lateral, g_viewPitchDeg); }
+        }
+        // (10:45: a weapon slide keeps the game's low camera, which sat in the chest - torso hidden there, legs stay)
+        bool want = takedown || hit || lookUp || strafe || g_swimAmount > 0.0f || g_climbAmount > 0.0f || (g_smoothedSink > g_cfg.deepCrouchSink && !slideNow) ||
+                    (g_smoothedSink - g_crouchSink > 3.0f && g_slideLegW <= 0.0f) ||   // (not the slide get-up: the torso shows in slides now)
                     (g_cfg.mantleFollow && phys != 1 && (-g_cornerLeanFwd > 15.0f || g_stairDz < -15.0f)) ||   // mantle: camera pulled back behind the body (user screenshot)
                     (g_cfg.jumpHideTorso && !g_cfg.jumpArms && (g_jumpAmount > 0.0f || g_landDip < -0.5f || phys == 0 || phys == 2));
         static DWORD lastWant = 0;
@@ -1104,7 +1498,8 @@ static void UpdateLean(ADishonoredPlayerPawn* pawn) {
     static float smoothed = 0.0f;
     static DWORD last = 0;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc1 = 0;
+    float dt = QpcDt(qpc1);   // (frame-accurate; was GetTickCount steps)
     last = now;
     smoothed += Clamp(lean - smoothed, -dt * 360.0f, dt * 360.0f);   // fast, but no pop when a slide ends
     int units = static_cast<int>(g_cfg.leanSign * smoothed * 0.5f * 65536.0f / 360.0f);
@@ -1119,12 +1514,22 @@ static void UpdateLean(ADishonoredPlayerPawn* pawn) {
     int rollUnits = static_cast<int>(g_cfg.leanSideSign * side * 0.5f * 65536.0f / 360.0f);
     float f = (allowed && g_cfg.cornerLean && !g_hitActive && g_cornerLeanFwd > 3.0f) ? g_cornerLeanFwd : 0.0f;
     units += static_cast<int>(-g_cfg.leanSign * Clamp(atan2f(f, g_cfg.leanPivotHeight) * 57.29578f, 0.0f, 30.0f) * 0.5f * 65536.0f / 360.0f);
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    // Slide: the whole trunk lies back from the base of the spine as well (user 07:35: "stomach to chest lower to the
+    // floor" - the spine_1/2 recline alone bent only the upper body back, the stomach stayed upright, log 07:26).
+    int lowUnits = static_cast<int>(g_cfg.leanSign * g_slideAmount * g_cfg.slideReclineLow * 65536.0f / 360.0f);
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         for (const char* bone : kSpineBones) {
             auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(bone)));
             if (!ctl) continue;
+            bool low = bone == kSpineBones[2];
+            if (low) {
+                ctl->BoneRotation = FRotator{ lowUnits, 0, 0 };
+                ctl->BoneScale = 1.0f;
+                ctl->ControlStrength = ctl->StrengthTarget = lowUnits ? 1.0f : 0.0f;
+                continue;
+            }
             ctl->BoneRotation = FRotator{ units, 0, rollUnits };
             // Sliding: hide the whole visible torso from the waist up (spine_1 and everything above). Hiding from
             // spine_3 left the lower chest/belly, which the camera clipped into (user).
@@ -1156,6 +1561,1379 @@ static float JumpArmAmount(int hand) {
     if (!g_cfg.jumpArms) return 0.0f;
     bool busy = hand == 0 ? g_leftHandBusy : g_rightHandBusy;
     return busy ? 0.0f : g_jumpAmount;
+}
+
+// 0..1 the slide bracing pose on a free hand's arm (the jump pose wins while airborne).
+static float SlideArmAmount(int hand) {
+    if (!g_cfg.slideArms) return 0.0f;
+    bool busy = hand == 0 ? g_leftHandBusy : g_rightHandBusy;
+    return busy ? 0.0f : g_slideAmount * (1.0f - g_jumpAmount);
+}
+
+struct Xf { float m[3][3]; float t[3]; };   // row i = axis i in world, t = origin
+static Xf g_skinFrame = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { 0, 0, 0 } };   // UpdateArmSkin: shadow pose -> where the skin draws it
+static bool g_skinFrameOk = false;                                                      // ...valid this frame
+static bool BoneXf(USkeletalMeshComponent* comp, const char* bone, Xf& out);
+
+// Jump hands, view-held: where each hand goes and how it should face. Fingers (bone X) forward, a little up and
+// out; the bone Z the user wants away from the camera is jumpPalmSign x (forward/down/in) - with +1 the palms faced
+// the camera, so the backs of the hands are bone -Z. Desired bone Y = Z x X.
+struct JumpHandFrame { FVector target, X, Y, Z, F, R, U; };
+
+static JumpHandFrame JumpHandAxes(int side, float yawOffDeg = 0.0f, bool bodyYaw = false) {
+    auto comb = [](const FVector& a, float wa, const FVector& b, float wb, const FVector& c, float wc) {
+        return FVector{ a.X * wa + b.X * wb + c.X * wc, a.Y * wa + b.Y * wb + c.Y * wc, a.Z * wa + b.Z * wb + c.Z * wc };
+    };
+    auto norm = [](FVector v) { float l = sqrtf(v.X * v.X + v.Y * v.Y + v.Z * v.Z); if (l > 1e-4f) { v.X /= l; v.Y /= l; v.Z /= l; } return v; };
+    const float k = 6.2831853f / 65536.0f;
+    // Level with the world, turned with the view's heading only (user: the arms keep their horizontal position while
+    // jumping - looking down they stay where they are). Pitch is left out of the frame.
+    float cp = 1.0f, sp = 0.0f;
+    // (10:25 clip: looking straight down in a slide the view rotator's yaw/roll split swung 135 deg in a frame - the
+    // slide arms belong to the body, so they take the pawn's heading (+ the turn lag), which is steady at any pitch)
+    int yawUnits = (bodyYaw && g_bodyPawn) ? g_bodyPawn->Rotation.Yaw : g_viewRot.Yaw;
+    float cy = cosf(yawUnits * k + yawOffDeg * 0.0174533f), sy = sinf(yawUnits * k + yawOffDeg * 0.0174533f);
+    JumpHandFrame h;
+    h.F = { cp * cy, cp * sy, sp }; h.R = { -sy, cy, 0.0f }; h.U = { -sp * cy, -sp * sy, cp };
+    float sideSign = side == 0 ? -1.0f : 1.0f;
+    float f = g_cfg.jumpHandFwd, r = sideSign * g_cfg.jumpHandSide + 0.8f * g_jumpSwayRoll;
+    float u = g_cfg.jumpHandUp + 0.6f * g_jumpSwayRaise - (side == 0 ? g_cfg.jumpLeftHandDown : 0.0f);
+    FVector off = comb(h.F, f, h.R, r, h.U, u);
+    h.target = { g_viewLoc.X + off.X, g_viewLoc.Y + off.Y, g_viewLoc.Z + off.Z };
+    // User photo (22:5x, own reference): forearms in from the sides almost level, hands just below eye level,
+    // fingers pointing in toward each other and a little forward, backs of the hands up. Bone Z is the back-of-hand
+    // side (22:35: palm sign -1 showed the backs), so Z ~ up and slightly toward the camera.
+    // (2026-10-11, user: like the arms in Mirror's Edge - fingers more forward, less in toward each other)
+    h.X = norm(comb(h.F, 0.85f, h.U, 0.1f, h.R, -0.45f * sideSign));
+    float ps = -g_cfg.jumpPalmSign;   // +1 with the default -1
+    FVector P = comb(h.F, -0.2f * ps, h.U, 1.0f * ps, h.R, 0.0f);
+    float d = P.X * h.X.X + P.Y * h.X.Y + P.Z * h.X.Z;
+    h.Z = norm(FVector{ P.X - h.X.X * d, P.Y - h.X.Y * d, P.Z - h.X.Z * d });
+    h.Y = FVector{ h.Z.Y * h.X.Z - h.Z.Z * h.X.Y, h.Z.Z * h.X.X - h.Z.X * h.X.Z, h.Z.X * h.X.Y - h.Z.Y * h.X.X };
+    return h;
+}
+
+// Jump hands: sway from the pawn's motion (eased) and the wrist / finger bends on both bodies.
+static void UpdateJumpSway(ADishonoredPlayerPawn* pawn) {
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    static LONGLONG qpc2 = 0;
+    float dt = QpcDt(qpc2);   // (frame-accurate; was GetTickCount steps)
+    last = now;
+    static int lastYaw = 0;
+    static float phase = 0.0f;
+    float raise = 0.0f, roll = 0.0f;
+    if (pawn && g_cfg.jumpHands && g_jumpAmount > 0.0f) {
+        const FVector& v = pawn->Velocity;
+        float yawR = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+        float lateral = -v.X * sinf(yawR) + v.Y * cosf(yawR);              // + = moving right
+        int dyaw = static_cast<int16_t>((pawn->Rotation.Yaw - lastYaw) & 0xFFFF);
+        float yawRate = dt > 0.0f ? dyaw * (360.0f / 65536.0f) / dt : 0.0f; // deg/s, + = turning right
+        phase += dt * 2.3f;
+        raise = Clamp(-v.Z * 0.015f, -12.0f, 20.0f) + 3.0f * sinf(phase);  // falling: arms lift
+        roll = Clamp(-lateral * 0.02f, -12.0f, 12.0f) + Clamp(-yawRate * 0.03f, -10.0f, 10.0f);
+        raise *= g_cfg.jumpSway;
+        roll *= g_cfg.jumpSway;
+    }
+    if (pawn) lastYaw = pawn->Rotation.Yaw;
+    float k = Clamp(dt * 6.0f, 0.0f, 1.0f);
+    g_jumpSwayRaise += (raise - g_jumpSwayRaise) * k;
+    g_jumpSwayRoll += (roll - g_jumpSwayRoll) * k;
+    g_jumpFlex = sinf(phase * 1.3f);
+}
+
+// Reference-pose local rotation of a bone (quat x, y, z, w) from SkeletalMesh.RefSkeleton (TArray<FMeshBone>, native:
+// FName, flags, then VJointPos = quat orientation + position). The element size isn't in the SDK, so it is found
+// once by checking which stride puts two known bones' names where MatchRefBone says they are.
+static int g_refStride = 0, g_refNameOff = 0, g_refQuatOff = 12;   // FMeshBone layout (found once, RefLocalQuat)
+
+static bool RefLocalQuat(USkeletalMeshComponent* comp, const char* bone, float q[4]) {
+    if (!comp || !comp->SkeletalMesh) return false;
+    int& stride = g_refStride;
+    auto* ref = reinterpret_cast<RawArray*>(&comp->SkeletalMesh->RefSkeleton);
+    if (!ref->Data || ref->Num <= 0) return false;
+    int& nameOff = g_refNameOff;
+    int& quatOff = g_refQuatOff;
+    if (!stride) {
+        // Find the layout from the data: where two known bones' names sit (their indices from MatchRefBone) gives
+        // the element size and the name's offset (23:06 log: none of the guessed sizes 40-64 matched).
+        FName a("index_1_L_jnt"), b("pinky_2_R_jnt");
+        int ia = comp->MatchRefBone(a), ib = comp->MatchRefBone(b);
+        if (ia < 0 || ib < 0 || ia == ib) return false;
+        auto* base = static_cast<uint8_t*>(ref->Data);
+        // (16:16 log: 'element 0 bytes' - the old scan read a fixed Num*160 block, which wasn't all readable.) Try each
+        // element size: bone ia's name at ia*st+off and bone ib's at ib*st+off, checking each read is safe first.
+        auto at = [&](size_t o, int32_t& v) {
+            if (IsBadReadPtr(base + o, 8)) return false;
+            v = *reinterpret_cast<int32_t*>(base + o);
+            return true;
+        };
+        for (int st = 24; st <= 200 && !stride; st += 4)
+            for (int off = 0; off < st && off <= 16; off += 4) {
+                int32_t va = 0, vb = 0;
+                if (!at(static_cast<size_t>(ia) * st + off, va) || va != a.FNameEntryId) continue;
+                if (!at(static_cast<size_t>(ib) * st + off, vb) || vb != b.FNameEntryId) continue;
+                stride = st; nameOff = off; break;
+            }
+        if (stride) {   // the orientation quat: the first spot after the name where both bones hold unit quats
+            auto unitAt = [&](int bone, int off) {
+                const float* f = reinterpret_cast<const float*>(base + bone * stride + nameOff + off);
+                float n = f[0] * f[0] + f[1] * f[1] + f[2] * f[2] + f[3] * f[3];
+                return n > 0.98f && n < 1.02f;
+            };
+            quatOff = 0;
+            for (int off : { 12, 8, 16, 20, 24 })
+                if (off + 16 <= stride - nameOff && unitAt(ia, off) && unitAt(ib, off)) { quatOff = off; break; }
+            if (!quatOff) stride = 0;
+        }
+        Log("jump hands: reference skeleton %d bones, element %d bytes, name at +%d, quat at +%d (bones %d/%d, names %d/%d)",
+            ref->Num, stride, nameOff, quatOff, ia, ib, a.FNameEntryId, b.FNameEntryId);
+        if (!stride && !IsBadReadPtr(base, 256)) {   // layout unknown: dump the start of the array for the next fix
+            const int32_t* w = reinterpret_cast<const int32_t*>(base);
+            Log("jump hands: RefSkeleton[0..] %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d", w[0], w[1],
+                w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15], w[16], w[17],
+                w[18], w[19], w[20], w[21], w[22], w[23]);
+        }
+        if (!stride) stride = -1;
+    }
+    if (stride <= 0) return false;
+    FName name(bone);
+    int i = comp->MatchRefBone(name);
+    if (i < 0 || i >= ref->Num) return false;
+    const float* o = reinterpret_cast<const float*>(static_cast<uint8_t*>(ref->Data) + i * stride + nameOff + quatOff);
+    for (int k = 0; k < 4; ++k) q[k] = o[k];
+    return true;
+}
+
+// Reference-pose local position of a bone (VJointPos.Position, right after the orientation quat).
+static bool RefLocalPos(USkeletalMeshComponent* comp, const char* bone, float pos[3]) {
+    float q[4];
+    if (!RefLocalQuat(comp, bone, q)) return false;   // also finds the layout
+    auto* ref = reinterpret_cast<RawArray*>(&comp->SkeletalMesh->RefSkeleton);
+    int i = comp->MatchRefBone(FName(bone));
+    if (i < 0 || i >= ref->Num || g_refStride <= 0 || g_refQuatOff + 28 > g_refStride - g_refNameOff) return false;
+    const float* o = reinterpret_cast<const float*>(static_cast<uint8_t*>(ref->Data) + i * g_refStride + g_refNameOff + g_refQuatOff + 16);
+    for (int k = 0; k < 3; ++k) pos[k] = o[k];
+    return true;
+}
+
+static void QuatMul(const float a[4], const float b[4], float out[4]) {   // a then b in the bone's frame: a * b
+    float x = a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1];
+    float y = a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0];
+    float z = a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3];
+    float w = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
+}
+
+static FRotator AxesToRotator(const FVector& X, const FVector& Y, const FVector& Z);
+
+static FRotator QuatToRotator(const float q[4]) {
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    FVector X{ 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y) };
+    FVector Y{ 2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x) };
+    FVector Z{ 2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y) };
+    return AxesToRotator(X, Y, Z);
+}
+
+static FRotator AxesToRotator(const FVector& X, const FVector& Y, const FVector& Z) {   // FMatrix::Rotator
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    float pitch = atan2f(X.Z, sqrtf(X.X * X.X + X.Y * X.Y)), yaw = atan2f(X.Y, X.X);
+    FVector sy0{ -sinf(yaw), cosf(yaw), 0.0f };   // Y of (pitch, yaw, 0)
+    float roll = atan2f(dot(Z, sy0), dot(Y, sy0));
+    const float toU = 32768.0f / 3.14159265f;
+    return FRotator{ static_cast<int>(pitch * toU), static_cast<int>(yaw * toU), static_cast<int>(roll * toU) };
+}
+
+// Jump hands on the visible body, whole arm (22:53 clip: the hands twisted as the view pitched - the game's limb
+// solver re-derives each forearm's roll every frame, and flipping its joint axis by measurement just oscillated).
+// Placed by hand instead, from the view: the hand at a fixed spot and orientation in view space; the elbow found
+// analytically (two-bone, bone lengths measured from the mesh) in the plane through shoulder and hand whose normal is
+// the hand's Y, on the down/out side; then upper arm, forearm and hand get absolute world rotations that all share
+// that Y - nothing twists, and the pose stays the same however the camera turns.
+static bool FlatHandAxesLocal(int side, FVector& fingers, FVector& palm, FVector* thumbSide = nullptr);   // (defined with the hand bind, below)
+static void PlaceJumpArm(USkeletalMeshComponent* comp, int side, float amount, float slideW = 0.0f) {
+    auto* upperCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kUpperArmBones[side])));
+    auto* lowerCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(side == 0 ? "lower_arm_L_jnt" : "lower_arm_R_jnt")));
+    auto* handCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kWristControlNames[side])));
+    auto* ik = static_cast<USkelControlLimb*>(comp->FindSkelControl(FName(kHandBones[side])));
+    if (ik) { ik->ControlStrength = ik->StrengthTarget = 0.0f; ik->bInvertJointAxis = 0; }
+    float w = g_cfg.jumpHandsInView ? amount : 0.0f;
+    // Slide (00:35): the same construction with the slide's elbow / forearm directions; blended by weight if both apply.
+    float sl = (w + slideW > 0.0f) ? slideW / (w + slideW) : 0.0f;
+    if (slideW > w) w = slideW;
+    if (upperCtl) upperCtl->ControlStrength = upperCtl->StrengthTarget = 0.0f;
+    if (w <= 0.0f || !upperCtl || !lowerCtl || !handCtl) return;
+
+    auto sub = [](const FVector& a, const FVector& b) { return FVector{ a.X - b.X, a.Y - b.Y, a.Z - b.Z }; };
+    auto add = [](const FVector& a, const FVector& b) { return FVector{ a.X + b.X, a.Y + b.Y, a.Z + b.Z }; };
+    auto mul = [](const FVector& a, float k) { return FVector{ a.X * k, a.Y * k, a.Z * k }; };
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    auto cross = [](const FVector& a, const FVector& b) { return FVector{ a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X }; };
+    auto len = [&](const FVector& a) { return sqrtf(dot(a, a)); };
+    auto norm = [&](const FVector& a) { float l = len(a); return l > 1e-4f ? mul(a, 1.0f / l) : a; };
+    auto orth = [&](const FVector& v, const FVector& x) { return norm(sub(v, mul(x, dot(v, x)))); };
+
+    JumpHandFrame h = JumpHandAxes(side, g_slideYawOffDeg * sl, sl > 0.5f);   // (slide: the arms belong to the lagging body - its heading, not the view's)
+    FVector S = comp->GetBoneLocation(FName(kUpperArmBones[side]), 0);
+    FVector Ecur = comp->GetBoneLocation(FName(side == 0 ? "lower_arm_L_jnt" : "lower_arm_R_jnt"), 0);
+    FVector Hcur = comp->GetBoneLocation(FName(kHandBones[side]), 0);
+    float L1 = len(sub(Ecur, S)), L2 = len(sub(Hcur, Ecur));
+    if (L1 < 5.0f || L2 < 5.0f) return;
+
+    FVector d = sub(h.target, S);
+    float D = len(d);
+    if (D < 1e-3f) return;
+    FVector dir = mul(d, 1.0f / D);
+
+    float sideSign = side == 0 ? -1.0f : 1.0f;
+    // Pose (user, 2026-10-11, clip 16:08): upper arms straight out to the sides, level - almost a T-pose - and the
+    // forearms bent 90 degrees at the elbows, pointing forward the way the camera faces. Built directly from the
+    // shoulder with the arm's own bone lengths; the hand ends wherever the forearm does. (The per-arm yaw / in / lift
+    // offsets of earlier requests don't apply to this pose.)
+    (void)dir;
+    FVector eJ = norm(add(mul(h.R, sideSign), mul(h.F, g_cfg.jumpElbowForward)));
+    FVector fJ = h.F;
+    const float* se = side == 0 ? g_cfg.slideElbowL : g_cfg.slideElbowR;
+    const float* sf = side == 0 ? g_cfg.slideForearmL : g_cfg.slideForearmR;
+    FVector eS = norm(add(add(mul(h.F, se[0]), mul(h.R, sideSign * se[1])), mul(h.U, se[2])));
+    FVector fS = norm(add(add(mul(h.F, sf[0]), mul(h.R, sideSign * sf[1])), mul(h.U, sf[2])));
+    FVector E = add(S, mul(norm(add(mul(eJ, 1.0f - sl), mul(eS, sl))), L1));
+    FVector T = add(E, mul(norm(add(mul(fJ, 1.0f - sl), mul(fS, sl))), L2));
+    dir = norm(sub(T, S));
+    // Roll: the elbow's own bend axis (cross of upper arm and forearm), signed as the earlier rule had it
+    // (JumpArmRollSign -1 -> Y = upper x fore), so the elbows fold naturally.
+    FVector bend = cross(norm(sub(E, S)), norm(sub(T, E)));
+    FVector Yarm = dot(bend, bend) > 1e-4f ? mul(norm(bend), -g_cfg.jumpArmRollSign) : mul(h.U, 1.0f);
+    FVector Xu = norm(sub(E, S)), Xl = norm(sub(T, E));
+    FVector Yu = orth(Yarm, Xu), Yl = orth(Yarm, Xl);
+    // Straight wrists (user): the hand carries on along the forearm. Raised elbows tilt the forearm's roll, so the
+    // hand turns part of the way (half) toward backs-up (bone Z = back of the hand) - a small turn, no bend.
+    FVector Xh = Xl, Yh = Yl;
+    {
+        FVector Ydown = norm(cross(h.Z, Xh));   // Y that would put bone Z (back of the hand) up
+        if (dot(Ydown, Yl) > 0.0f) Yh = orth(add(mul(Yl, 0.5f), mul(Ydown, 0.5f)), Xh);
+    }
+    // Slide, left hand (user 08:20): the open hand flat on the ground - fingers forward (a little out), back of the
+    // hand (bone Z) up, so the wrist bends 90 degrees off the vertical forearm.
+    // (09:50, user: "see the back of the hand as if flat on the floor, balancing") The hand bone's own axes are not
+    // guessed any more: its finger direction and palm normal come from the 1P hand's bind pose (FlatHandAxesLocal),
+    // and the rotation maps fingers -> forward (a little out), palm -> down.
+    FVector fL, pL, tL;
+    if (sl > 0.5f && side == 0 && g_cfg.slideLeftHandFlat && FlatHandAxesLocal(side, fL, pL, &tL)) {
+        FVector Fw = norm(add(mul(h.F, 0.9f), mul(h.R, sideSign * 0.3f)));
+        FVector Pw = orth(mul(h.U, -g_cfg.slideLeftHandPalmSign), Fw);   // palm down (PalmSign 1); -1 flips if the bind reads wrong
+        FVector Cw = cross(Fw, Pw);
+        pL = orth(pL, fL);
+        FVector cL = cross(fL, pL);
+        // (10:48 clip: the thumb tip sank into the floor) Roll the hand about its fingers so the thumb edge lifts a
+        // little and it rests more on its outer edge. The thumb side is the bind's index-minus-pinky direction mapped
+        // through the same rotation. Lifting that edge turns the hand's UP normal away from it (a plate lifted on its
+        // right edge faces up-left) - and Pw here is whichever bind side maps up (PalmSign -1 on this rig: it IS the up
+        // normal; 10:58 "clipping even more": the first cut tilted it the other way, as if it pointed down).
+        if (g_cfg.slideLeftHandThumbUpDeg != 0.0f) {
+            FVector tW = norm(add(add(mul(Fw, dot(fL, tL)), mul(Pw, dot(pL, tL))), mul(Cw, dot(cL, tL))));
+            float a = g_cfg.slideLeftHandThumbUpDeg * 0.0174533f;
+            float up = dot(Pw, h.U) >= 0.0f ? 1.0f : -1.0f;   // +1: Pw is the up normal (tilt away from the thumb); -1: the down normal (toward it)
+            Pw = orth(add(mul(Pw, cosf(a)), mul(tW, -up * sinf(a))), Fw);
+            Cw = cross(Fw, Pw);
+        }
+        // R = Fw (x) fL + Pw (x) pL + Cw (x) cL maps the local basis to the world one; bone X/Y in world = R e_x / R e_y
+        Xh = norm(add(add(mul(Fw, fL.X), mul(Pw, pL.X)), mul(Cw, cL.X)));
+        Yh = orth(add(add(mul(Fw, fL.Y), mul(Pw, pL.Y)), mul(Cw, cL.Y)), Xh);
+    }
+    // Per-arm forearm roll (user: right arm turned so the thumb side of the hand faces the camera): forearm and hand
+    // turn together about their own length (Y -> Z), so the wrist doesn't twist. Bone -Y is the thumb side (rest pose).
+    if (g_cfg.jumpForearmRollDeg[side] != 0.0f) {
+        float a = g_cfg.jumpForearmRollDeg[side] * 0.0174533f, c = cosf(a), sn = sinf(a);
+        Yl = norm(add(mul(Yl, c), mul(cross(Xl, Yl), sn)));
+        Yh = norm(add(mul(Yh, c), mul(cross(Xh, Yh), sn)));
+    }
+    // Hands turned outward a little at the wrist, about the vertical (U x F = R: + turns right).
+    if (g_cfg.jumpHandOutDeg != 0.0f) {
+        float a = sideSign * g_cfg.jumpHandOutDeg * 0.0174533f, c = cosf(a), sn = sinf(a);
+        auto turn = [&](const FVector& v) { return add(add(mul(v, c), mul(cross(h.U, v), sn)), mul(h.U, dot(h.U, v) * (1.0f - c))); };
+        Xh = norm(turn(Xh));
+        Yh = orth(turn(Yh), Xh);
+    }
+    upperCtl->BoneRotationSpace = lowerCtl->BoneRotationSpace = handCtl->BoneRotationSpace = EBoneControlSpace::BCS_WorldSpace;
+    upperCtl->bAddRotation = lowerCtl->bAddRotation = handCtl->bAddRotation = 0;
+    upperCtl->bApplyRotation = lowerCtl->bApplyRotation = handCtl->bApplyRotation = 1;
+    upperCtl->BoneScale = lowerCtl->BoneScale = 1.0f;
+    upperCtl->BoneRotation = AxesToRotator(Xu, Yu, cross(Xu, Yu));
+    lowerCtl->BoneRotation = AxesToRotator(Xl, Yl, cross(Xl, Yl));
+    handCtl->BoneRotation = AxesToRotator(Xh, Yh, cross(Xh, Yh));
+    upperCtl->ControlStrength = upperCtl->StrengthTarget = w;
+    lowerCtl->ControlStrength = lowerCtl->StrengthTarget = w;
+    handCtl->ControlStrength = handCtl->StrengthTarget = w;
+}
+
+// While the jump pose holds a free hand up, the game's own first-person arm for that side is hidden (16:49 clip: its
+// holstered jump animation brought a third, dark 1P right hand into view under ours). Back when the pose ends.
+// Sprinting too (19:58 clip + log: the model put the body's left hand off the bottom-left, but a glove sat over the
+// legs near the middle, fixed on screen - the game's holstered sprint animation brings its own 1P left hand up there;
+// with the arm skin it looks just like ours. That was the "both arms shifted right" and the left arm through the
+// camera). Only on the ground (PHYS_Walking), not climbing - mantles, ladders, pickups and doors keep their 1P hands.
+static void HideFirstPersonJumpHands(ADishonoredPlayerPawn* pawn) {
+    static USkeletalMeshComponent* arms = nullptr;
+    static int hid[2] = { 0, 0 };
+    USkeletalMeshComponent* now = pawn ? pawn->Mesh : nullptr;
+    if (now != arms) { arms = now; hid[0] = hid[1] = 0; }
+    if (!arms) return;
+    static DWORD busySince[2] = { 0, 0 };   // (17:10: after holstering the sword stayed out - hidden mid-holster)
+    bool busyNow[2] = { g_leftHandBusy, g_rightHandBusy };
+    for (int side = 0; side < 2; ++side) if (busyNow[side]) busySince[side] = GetTickCount();
+    for (int side = 0; side < 2; ++side) {
+        bool settled = GetTickCount() - busySince[side] > 1000;
+        bool jumping = g_cfg.jumpHands && g_cfg.jumpHandsInView && JumpArmAmount(side) > 0.05f;
+        FVector v = pawn ? pawn->Velocity : FVector{ 0, 0, 0 };
+        bool fast = g_sprintBackAmount > 0.3f || v.X * v.X + v.Y * v.Y > 450.0f * 450.0f;
+        bool sprinting = g_cfg.hideFirstPersonSprintHands && g_armSkinOn && !busyNow[side] && pawn &&
+                         static_cast<int>(pawn->Physics) == 1 && !g_isClimbing && fast;
+        bool want = (jumping || sprinting) && g_bodyVisible && settled;
+        // The whole 1P arm from the shoulder (20:12 clip: sprinting, a full sleeve + forearm + glove still swung up to
+        // the top of the view - Daud's 1P arms have sleeves to the shoulder; hiding from the elbow left them). Applied
+        // again every 0.25 s while wanted, in case the game resets bone visibility.
+        // (21:55: no bone calls on the game's 1P arms any more. HideBone never hides in this game, and UnHideBone 0x7b4250
+        // calls PhysicsAssetInstance::EnableCollisionBodiesBelow(true, bone) - it switched the 1P arm's collision on after
+        // every sprint/jump. Only the state is tracked and logged.)
+        if ((want ? 1 : 0) == hid[side]) continue;
+        // NOTE (20:50, retail disassembly): Dishonored's USkeletalMeshComponent::HideBone (0x7bcdc0) returns at once for
+        // PBO_None and otherwise only terms/disables the bone's physics body - it never hides anything visually. So
+        // these calls have no effect; kept (logged as "requested") until a working 1P hide is needed.
+        Log("1P %s arm hide %s (%s) - no visual effect in this game", side ? "right" : "left", want ? "requested" : "released",
+            want ? (jumping ? "jump" : "sprint") : "back");
+        hid[side] = want ? 1 : 0;
+    }
+}
+
+// Left hand "holding a power" pose (user, 2026-10-11: when jumping, the left hand should look like it does holding a
+// selected power). Taken from the game's own first-person arms while a power is held in the left hand, 1 s into the
+// hold (the draw has settled): each left finger/thumb joint's rotation relative to its parent bone, from the 1P
+// component-space pose (rows = axes, local = child x parent^T). The jump hands then set those outright on the
+// left hand. Built in from the 2026-10-11 17:31 capture (log, Skm_Player), so it holds from the first jump; a new
+// capture (each time a power is held) replaces it.
+static FRotator g_powerHandRot[14] = {
+    { 1548, -5751, 21508 }, { -5430, 0, 0 }, { -646, 0, 0 },     { 2614, -7714, 19587 }, { -6836, 0, 0 },
+    { -2571, 0, 0 },        { 3368, -10155, 18581 }, { -9509, 0, 0 }, { -343, 0, 0 },   { 3468, -12242, 17414 },
+    { -10889, 0, 0 },       { -6351, 0, 0 },  { -5731, -9320, -30206 }, { -6323, 0, 0 } };
+static bool g_powerHandHave = true;
+static unsigned g_powerHandVer = 1;   // bumped on each capture (the mirrored right hand is rebuilt from it)
+
+// The right hand's version of the left power pose (user, 22:02: both hands in the power-holding pose). The rig is mirrored
+// across the body: hand frames are reflected (Y), finger frames are reflected and turned 180 deg about Y (child offsets
+// -X/-Z on the right). In quaternions, with P(q) = (-x, y, -z, w) and F = 180 deg about Y: a bone hanging off the hand
+// (knuckles, thumb_0) maps as F*P(q) or P(q)*F^-1 depending on the storage convention, a bone off a finger bone as
+// F*P(q)*F^-1. Checked on the recon psk (index_0, middle_0, thumb_0, index_1); the convention is picked at runtime from
+// the body's own reference skeleton (index_0_L -> index_0_R).
+static FRotator g_powerHandRotR[14];
+static unsigned g_powerHandRVer = 0;
+static int g_powerMirrorMode = 0;     // 0 unknown, 1 F*P(q), 2 P(q)*F^-1, -1 no match (right hand keeps the open pose)
+
+static void RotatorToQuat(const FRotator& r, float q[4]) {   // inverse of QuatToRotator (rows = axes)
+    const float k = 6.2831853f / 65536.0f;
+    float sp = sinf(r.Pitch * k), cp = cosf(r.Pitch * k), sy = sinf(r.Yaw * k), cy = cosf(r.Yaw * k);
+    float sr = sinf(r.Roll * k), cr = cosf(r.Roll * k);
+    float M[3][3] = { { cp * cy, cp * sy, sp },
+                      { sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp },
+                      { -(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp } };
+    // column-convention matrix R[i][j] = M[j][i]
+    float R00 = M[0][0], R11 = M[1][1], R22 = M[2][2];
+    float R21 = M[1][2], R12 = M[2][1], R02 = M[2][0], R20 = M[0][2], R10 = M[0][1], R01 = M[1][0];
+    float tr = R00 + R11 + R22;
+    if (tr > 0.0f) {
+        float t = sqrtf(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * t; q[0] = (R21 - R12) / t; q[1] = (R02 - R20) / t; q[2] = (R10 - R01) / t;
+    } else if (R00 > R11 && R00 > R22) {
+        float t = sqrtf(1.0f + R00 - R11 - R22) * 2.0f;
+        q[3] = (R21 - R12) / t; q[0] = 0.25f * t; q[1] = (R01 + R10) / t; q[2] = (R02 + R20) / t;
+    } else if (R11 > R22) {
+        float t = sqrtf(1.0f + R11 - R00 - R22) * 2.0f;
+        q[3] = (R02 - R20) / t; q[0] = (R01 + R10) / t; q[1] = 0.25f * t; q[2] = (R12 + R21) / t;
+    } else {
+        float t = sqrtf(1.0f + R22 - R00 - R11) * 2.0f;
+        q[3] = (R10 - R01) / t; q[0] = (R02 + R20) / t; q[1] = (R12 + R21) / t; q[2] = 0.25f * t;
+    }
+}
+
+static void QuatMul(const float a[4], const float b[4], float out[4]);
+static FRotator QuatToRotator(const float q[4]);
+static bool RefLocalQuat(USkeletalMeshComponent* comp, const char* bone, float q[4]);
+
+static void MirrorFingerQuat(const float in[4], bool offHand, int mode, float out[4]) {
+    static const float F[4] = { 0, 1, 0, 0 }, Fi[4] = { 0, -1, 0, 0 };
+    float pq[4] = { -in[0], in[1], -in[2], in[3] }, t[4];
+    if (!offHand) { QuatMul(F, pq, t); QuatMul(t, Fi, out); return; }
+    if (mode == 1) QuatMul(F, pq, out);
+    else QuatMul(pq, Fi, out);
+}
+
+static const FRotator* PowerHandRight(USkeletalMeshComponent* comp) {
+    if (!g_powerHandHave) return nullptr;
+    if (g_powerMirrorMode == 0 && comp) {
+        float qL[4], qR[4], c[4];
+        if (RefLocalQuat(comp, "index_0_L_jnt", qL) && RefLocalQuat(comp, "index_0_R_jnt", qR)) {
+            float best = 0.0f;
+            for (int mode = 1; mode <= 2; ++mode) {
+                MirrorFingerQuat(qL, true, mode, c);
+                float d = fabsf(c[0] * qR[0] + c[1] * qR[1] + c[2] * qR[2] + c[3] * qR[3]);
+                if (d > best) { best = d; if (d > 0.99f) g_powerMirrorMode = mode; }
+            }
+            if (!g_powerMirrorMode) g_powerMirrorMode = -1;
+            float pL[4], pR[4];   // phalanx check
+            bool ph = RefLocalQuat(comp, "index_1_L_jnt", pL) && RefLocalQuat(comp, "index_1_R_jnt", pR);
+            float pd = 0.0f;
+            if (ph) { MirrorFingerQuat(pL, false, 1, c); pd = fabsf(c[0] * pR[0] + c[1] * pR[1] + c[2] * pR[2] + c[3] * pR[3]); }
+            Log("power hand: right-hand mirror %s (knuckle match %.3f, phalanx match %.3f)",
+                g_powerMirrorMode > 0 ? (g_powerMirrorMode == 1 ? "F*P(q)" : "P(q)*F^-1") : "NOT FOUND - right hand keeps the open pose", best, pd);
+        }
+    }
+    if (g_powerMirrorMode <= 0) return nullptr;
+    if (g_powerHandRVer != g_powerHandVer) {
+        for (int j = 0; j < 14; ++j) {
+            float q[4], m[4];
+            RotatorToQuat(g_powerHandRot[j], q);
+            bool offHand = (j < 12 && j % 3 == 0) || j == 12;   // index/middle/ring/pinky_0 and thumb_0 hang off the hand
+            MirrorFingerQuat(q, offHand, g_powerMirrorMode, m);
+            g_powerHandRotR[j] = QuatToRotator(m);
+        }
+        g_powerHandRVer = g_powerHandVer;
+    }
+    return g_powerHandRotR;
+}
+
+// Relaxed hand for standing/walking (user 22:18: the power pose there "looked very tense and a bit crippled"; fine in
+// jumps and sprints). The body's own bind pose is a relaxed hand (phalanges bent 12-22 deg, thumb tip 30): every joint
+// keeps it and curls a little more about its hinge (local Y), more toward the pinky - fingers stay together, loosely
+// curled. Same curl sign on both hands (mirrored rig).
+// 22:25 (user: the backs of the hands looked dipped in / concave): the _0 bones are the metacarpals - they run through
+// the back of the hand to the knuckle - and they were curled, and the rest pose came from the BODY's bind while the hand
+// drawn is the 1P arms mesh. The drawn finger stays undistorted only when its local rotation is the 1P mesh's own bind
+// (that's why the captured power pose looks right). So: rest = the arm skin mesh's bind; the metacarpals keep it; the
+// knuckle (_1) and middle joint (_2) curl.
+static bool RelaxedFingerQuat(USkeletalMeshComponent* comp, int side, int j, float out[4]) {
+    static const float kShare[3] = { 0.0f, 1.0f, 1.3f };   // metacarpal (_0, back of the hand), knuckle (_1), middle joint (_2)
+    float rest[4];
+    USkeletalMeshComponent* bindSrc = (g_armSkin && g_armSkin->SkeletalMesh) ? g_armSkin : comp;
+    if (!RefLocalQuat(bindSrc, kFingerBones[side][j], rest) && !RefLocalQuat(comp, kFingerBones[side][j], rest)) return false;
+    float deg = j < 12 ? g_cfg.handRelaxCurl[j / 3] * kShare[j % 3] : (j == 12 ? g_cfg.handRelaxThumb0 : g_cfg.handRelaxThumb1);
+    float sign = side == 0 ? g_cfg.jumpCurlSignL : g_cfg.jumpCurlSignR;
+    float h = sign * deg * 0.0087266f;   // half angle, radians
+    float cu[4] = { 0.0f, sinf(h), 0.0f, cosf(h) };
+    QuatMul(rest, cu, out);
+    return true;
+}
+
+// The 1P arms' (arm skin mesh's) own hand skeleton, cached per mesh: [side][0..13] the finger bones, [side][14] the
+// handHelperBone. The bodies' hand bones sit elsewhere (22:35, recon psk: metacarpals 4-5 uu and 10-28 deg off, finger
+// bones 1-3 uu shorter, helper rolled 24 deg) - the 1P hand drawn on them was stretched: the backs caved in.
+struct HandBind { USkeletalMesh* mesh = nullptr; bool ok[2][16]; float q[2][16][4]; float p[2][16][3]; };   // [15] sleeve_X
+static HandBind g_handBind;
+static const HandBind* SkinHandBind() {
+    if (!g_armSkin || !g_armSkin->SkeletalMesh) return nullptr;
+    if (g_handBind.mesh != g_armSkin->SkeletalMesh) {
+        g_handBind.mesh = g_armSkin->SkeletalMesh;
+        int good = 0;
+        for (int side = 0; side < 2; ++side)
+            for (int j = 0; j < 16; ++j) {
+                const char* bone = j < 14 ? kFingerBones[side][j] : j == 14 ? kWristControlNames[side] : kCuffControlNames[side];
+                float* q = g_handBind.q[side][j];
+                float* pp = g_handBind.p[side][j];
+                bool ok = RefLocalQuat(g_armSkin, bone, q) && RefLocalPos(g_armSkin, bone, pp);
+                float len = ok ? sqrtf(pp[0] * pp[0] + pp[1] * pp[1] + pp[2] * pp[2]) : 0.0f;
+                float qn = ok ? q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3] : 0.0f;
+                g_handBind.ok[side][j] = ok && len < 40.0f && qn > 0.98f && qn < 1.02f;   // (garbage guard)
+                if (g_handBind.ok[side][j]) ++good;
+            }
+        const float* a = g_handBind.p[0][0];
+        const float* b = g_handBind.p[0][9];
+        const float* c = g_handBind.p[0][15];
+        Log("hand bind: %s - %d/32 hand bones read; index_0_L at (%.2f %.2f %.2f), pinky_0_L at (%.2f %.2f %.2f), sleeve_L %s (%.2f %.2f %.2f)",
+            g_armSkin->SkeletalMesh->GetName().c_str(), good, a[0], a[1], a[2], b[0], b[1], b[2],
+            g_handBind.ok[0][15] ? "at" : "not found", c[0], c[1], c[2]);
+    }
+    return &g_handBind;
+}
+
+// rest (a bind local rotation) x curl about the hinge (local Y). The finger bones are the three segments: _0 starts AT
+// the knuckle (~10 uu out from the wrist; the back of the hand is the hand bone), _1 the middle segment, _2 the tip
+// (22:52: corrected - _0 had been taken for a metacarpal and never bent, so the fist's knuckles stayed straight).
+// share = { knuckle _0, middle _1, tip _2 } x curl[finger]; thumb root / tip their own.
+// The hand bone's finger direction and palm normal in its own frame, from the 1P hand's bind pose: fingers = toward the
+// mean of the four knuckle joints; the plane through index and pinky knuckles gives the normal; the thumb joints sit
+// on the palm side of that plane, which picks the sign. Logged once per mesh.
+static bool FlatHandAxesLocal(int side, FVector& fingers, FVector& palm, FVector* thumbSide) {
+    const HandBind* hb = SkinHandBind();
+    if (!hb) return false;
+    const int kn[4] = { 0, 3, 6, 9 };   // index_0, middle_0, ring_0, pinky_0
+    for (int k = 0; k < 4; ++k) if (!hb->ok[side][kn[k]]) return false;
+    if (!hb->ok[side][12] && !hb->ok[side][13]) return false;
+    auto P = [&](int j) { return FVector{ hb->p[side][j][0], hb->p[side][j][1], hb->p[side][j][2] }; };
+    auto sub = [](const FVector& a, const FVector& b) { return FVector{ a.X - b.X, a.Y - b.Y, a.Z - b.Z }; };
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    auto cross = [](const FVector& a, const FVector& b) { return FVector{ a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X }; };
+    auto norm = [&](const FVector& a) { float l = sqrtf(dot(a, a)); return l > 1e-4f ? FVector{ a.X / l, a.Y / l, a.Z / l } : a; };
+    FVector mean{ 0, 0, 0 };
+    for (int k = 0; k < 4; ++k) { FVector q = P(kn[k]); mean.X += q.X * 0.25f; mean.Y += q.Y * 0.25f; mean.Z += q.Z * 0.25f; }
+    fingers = norm(mean);
+    FVector across = norm(sub(P(0), P(9)));
+    FVector n = norm(cross(fingers, across));
+    float d = 0.0f;
+    int used = 0;
+    for (int j = 12; j <= 13; ++j) if (hb->ok[side][j]) { d += dot(sub(P(j), mean), n); ++used; }
+    if (!used || fabsf(d) < 0.05f) return false;
+    palm = d > 0.0f ? n : FVector{ -n.X, -n.Y, -n.Z };
+    if (thumbSide) { float k = dot(across, fingers); *thumbSide = norm(FVector{ across.X - fingers.X * k, across.Y - fingers.Y * k, across.Z - fingers.Z * k }); }
+    static USkeletalMesh* loggedFor[2] = { nullptr, nullptr };
+    if (loggedFor[side] != hb->mesh) {
+        loggedFor[side] = hb->mesh;
+        Log("flat hand (%s): bind fingers (%.2f %.2f %.2f) palm (%.2f %.2f %.2f) thumb side %.2f", side ? "right" : "left",
+            fingers.X, fingers.Y, fingers.Z, palm.X, palm.Y, palm.Z, d);
+    }
+    return true;
+}
+
+static void QuatSlerp(const float a[4], const float b[4], float t, float out[4]);
+
+// The power pose (captured from the game's 1P power hand) has the fingers half closed; open them by blending each
+// finger joint toward its OPEN bind pose (the mesh's reference skeleton) by openFrac. A guessed local-Y hinge rotation
+// only clenched them harder either way (12:18 and 12:26 clips: both signs tried), so blend toward a known-open pose
+// instead - robust to the bone's axis convention. Thumb (j >= 12) left as the power pose has it.
+static void OpenPowerFingers(float q[4], USkeletalMeshComponent* comp, int side, int j, float openFrac) {
+    if (j >= 12 || openFrac <= 0.0f) return;
+    float ref[4];
+    if (!RefLocalQuat(comp, kFingerBones[side][j], ref)) return;
+    float out[4];
+    QuatSlerp(q, ref, Clamp(openFrac, 0.0f, 1.0f), out);
+    for (int i = 0; i < 4; ++i) q[i] = out[i];
+}
+
+static void BindCurl(const float rest[4], int side, int j, const float curl[4], float thumb0, float thumb1, const float share[3],
+                     float out[4], float thumbTuck = 0.0f) {
+    float deg = j < 12 ? curl[j / 3] * share[j % 3] : (j == 12 ? thumb0 : thumb1);
+    float sign = side == 0 ? g_cfg.jumpCurlSignL : g_cfg.jumpCurlSignR;
+    float h = sign * deg * 0.0087266f;
+    float cu[4] = { 0.0f, sinf(h), 0.0f, cosf(h) };
+    if (j == 12 && thumbTuck != 0.0f) {   // thumb root: swing about local Z first (same sign on both hands - mirrored rig)
+        float hz = thumbTuck * 0.0087266f, sp[4] = { 0.0f, 0.0f, sinf(hz), cosf(hz) }, t[4];
+        QuatMul(rest, sp, t);
+        QuatMul(t, cu, out);
+        return;
+    }
+    QuatMul(rest, cu, out);
+}
+
+static void QuatSlerp(const float a[4], const float b[4], float t, float out[4]) {
+    float bb[4] = { b[0], b[1], b[2], b[3] };
+    float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+    if (d < 0.0f) { for (float& v : bb) v = -v; d = -d; }
+    float wa = 1.0f - t, wb = t;
+    if (d < 0.9995f) {
+        float th = acosf(d), sn = sinf(th);
+        wa = sinf((1.0f - t) * th) / sn;
+        wb = sinf(t * th) / sn;
+    }
+    float n = 0.0f;
+    for (int i = 0; i < 4; ++i) { out[i] = wa * a[i] + wb * bb[i]; n += out[i] * out[i]; }
+    n = sqrtf(n);
+    if (n > 1e-6f) for (int i = 0; i < 4; ++i) out[i] /= n;
+}
+
+static void CapturePowerHand(ADishonoredPlayerPawn* pawn) {
+    static DWORD heldSince = 0;
+    static bool taken = false;
+    UObject* item = g_handItem[0];
+    bool power = pawn && pawn->Mesh && pawn->Mesh->SkeletalMesh && item && item->Class &&
+                 item->Class->GetName().find("Powers") != std::string::npos;
+    DWORD now = GetTickCount();
+    if (!power) { heldSince = 0; taken = false; return; }
+    if (!heldSince) heldSince = now;
+    if (taken || now - heldSince < 1000) return;
+    taken = true;
+    USkeletalMeshComponent* m = pawn->Mesh;
+    auto* bases = reinterpret_cast<RawArray*>(&m->SpaceBases);
+    if (!bases->Data) return;
+    auto rows = [&](int idx, FVector r[3]) {
+        const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(bases->Data) + idx * 32);
+        float x = a[0], y = a[1], z = a[2], w = a[3];
+        r[0] = { 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y) };
+        r[1] = { 2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x) };
+        r[2] = { 2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y) };
+    };
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    FRotator got[14];
+    for (int j = 0; j < 14; ++j) {
+        FName name(kFingerBones[0][j]);
+        int idx = name.FNameEntryId >= 0 ? m->MatchRefBone(name) : -1;
+        int par = idx >= 0 ? m->MatchRefBone(m->GetParentBone(name)) : -1;
+        if (idx < 0 || par < 0 || idx >= bases->Num || par >= bases->Num) {
+            Log("power hand: %s not found on the 1P arms - not taken", kFingerBones[0][j]);
+            return;
+        }
+        FVector c[3], p[3], l[3];
+        rows(idx, c);
+        rows(par, p);
+        for (int i = 0; i < 3; ++i) l[i] = { dot(c[i], p[0]), dot(c[i], p[1]), dot(c[i], p[2]) };
+        got[j] = AxesToRotator(l[0], l[1], l[2]);
+    }
+    for (int j = 0; j < 14; ++j) g_powerHandRot[j] = got[j];
+    ++g_powerHandVer;
+    static bool logged = false;
+    if (!logged) {   // the numbers (the built-in default above came from this line)
+        logged = true;
+        std::string s;
+        char buf[48];
+        for (int j = 0; j < 14; ++j) { snprintf(buf, sizeof buf, " {%d,%d,%d}", got[j].Pitch, got[j].Yaw, got[j].Roll); s += buf; }
+        Log("power hand: left-hand pose taken from the 1P arms (%s):%s", m->SkeletalMesh->GetName().c_str(), s.c_str());
+    }
+    g_powerHandHave = true;
+}
+
+static void UpdateJumpHands() {
+    // Fingers and thumbs (both bodies): a gentle open claw, thumbs forward (user reference photos 2026-10-10).
+    static const float kJointShare[3] = { 0.8f, 1.4f, 0.8f };     // knuckle, middle, tip
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
+    auto units = [](float deg) { return static_cast<int>(deg * 65536.0f / 360.0f); };
+    for (USkeletalMeshComponent* comp : comps) {
+        if (!comp || comp == g_holsterCast) continue;   // (its forearms and hands are folded away: UpdateHolsterShoulders owns its arms)
+        for (int side = 0; side < 2; ++side) {
+            float amount = g_cfg.jumpHands ? JumpArmAmount(side) : 0.0f;
+            float slideW = SlideArmAmount(side);
+            float sign = side == 0 ? g_cfg.jumpCurlSignL : g_cfg.jumpCurlSignR;
+            if (comp == g_body || comp == g_shadowBody || comp == g_shadowArms || comp == g_holsterCast) {
+                // Both bodies: the shadow body carries the same pose (the 1P arm skin copies it, see UpdateArmSkin).
+                PlaceJumpArm(comp, side, amount, slideW);   // also sets the hand's rotation
+            } else if (auto* wrist = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kWristControlNames[side])))) {
+                wrist->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;   // shadow body: just the wrist bend
+                wrist->bAddRotation = 1;
+                wrist->BoneRotation = FRotator{ units(g_cfg.jumpWristDeg * amount), 0, 0 };
+                wrist->ControlStrength = wrist->StrengthTarget = amount;
+            }
+            if ((comp == g_body || comp == g_shadowBody || comp == g_shadowArms || comp == g_holsterCast) && !(g_cfg.jumpHandsInView && amount > 0.0f) && slideW <= 0.0f) {
+                if (auto* wrist = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kWristControlNames[side]))))
+                    wrist->ControlStrength = wrist->StrengthTarget = 0.0f;
+            }
+            const HandBind* hb = (g_cfg.handMatchSkin && g_armSkinOn) ? SkinHandBind() : nullptr;
+            bool handFree = !(side == 0 ? g_leftHandBusy : g_rightHandBusy);
+            for (int j = 0; j < 14; ++j) {
+                auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kFingerBones[side][j])));
+                if (!ctl) continue;
+                ctl->bApplyTranslation = 0;
+                // Arm skin on, hand free: the bone takes the 1P arms' own skeleton - bind position, and a rotation built on
+                // the 1P bind (relaxed standing/walking, a fist at a sprint, the captured power pose in the air; blended).
+                if (hb && hb->ok[side][j] && handFree) {
+                    const FRotator* pz = side == 0 ? (g_powerHandHave ? g_powerHandRot : nullptr) : PowerHandRight(comp);
+                    bool flatHand = side == 0 && g_cfg.slideLeftHandFlat;   // (the braced left hand lies open and flat: relaxed fingers)
+                    float wJ = (pz && g_cfg.jumpLeftPowerHand) ? (amount > slideW && !flatHand ? amount : flatHand ? amount : slideW) : 0.0f;   // (slide: fingers spread - user sketch)
+                    float sw = Clamp(g_sprintBackAmount > g_climbGrip[side] ? g_sprintBackAmount : g_climbGrip[side], 0.0f, 1.0f);   // (climbing: the fist closes round the chain)
+                    float wS = (1.0f - wJ) * sw, wR = (1.0f - wJ) * (1.0f - sw);
+                    float qR[4], qF[4], qP[4] = { 0, 0, 0, 1 }, acc[4] = { 0, 0, 0, 0 };
+                    // relaxed: knuckles straight, a little bend further out (as approved 22:45); fist: all three joints
+                    const float relaxShare[3] = { 0.0f, 1.0f, 1.3f };
+                    const float fistShare[3] = { 1.0f, g_cfg.handFistMid, g_cfg.handFistTip };
+                    // Braced flat hand: the relaxed curl gives way to a straight, open hand (the bind itself is a little curled,
+                    // so it extends past it - HandFlatCurl, negative) as the slide weight comes in.
+                    float fw = flatHand ? slideW : 0.0f, fc = 1.0f - fw;
+                    float rc[4];
+                    for (int c4 = 0; c4 < 4; ++c4) rc[c4] = g_cfg.handRelaxCurl[c4] * fc + g_cfg.handFlatCurl[c4] * fw;
+                    const float flatShare[3] = { 1.0f, 1.0f, 1.0f };   // (all three joints straighten)
+                    BindCurl(hb->q[side][j], side, j, rc, g_cfg.handRelaxThumb0 * fc + g_cfg.handFlatThumb * fw,
+                             g_cfg.handRelaxThumb1 * fc + g_cfg.handFlatThumb * fw, fw > 0.5f ? flatShare : relaxShare, qR);
+                    BindCurl(hb->q[side][j], side, j, g_cfg.handFistCurl, g_cfg.handFistThumb0, g_cfg.handFistThumb1, fistShare, qF,
+                             g_cfg.handFistThumbTuck);
+                    if (wJ > 0.0f) { RotatorToQuat(pz[j], qP); OpenPowerFingers(qP, comp, side, j, g_cfg.jumpHandOpenFrac); }
+                    auto addq = [&](const float* q, float w) {   // weighted sum, signs aligned to the relaxed pose
+                        if (w <= 0.0f) return;
+                        float d = q[0] * qR[0] + q[1] * qR[1] + q[2] * qR[2] + q[3] * qR[3];
+                        float sg = d < 0.0f ? -1.0f : 1.0f;
+                        for (int i = 0; i < 4; ++i) acc[i] += w * sg * q[i];
+                    };
+                    addq(qR, wR);
+                    addq(qF, wS);
+                    addq(qP, wJ);
+                    float n = sqrtf(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2] + acc[3] * acc[3]);
+                    if (n < 1e-4f) for (int i = 0; i < 4; ++i) acc[i] = qR[i]; else for (int i = 0; i < 4; ++i) acc[i] /= n;
+                    ctl->BoneRotationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    ctl->bAddRotation = 0;
+                    ctl->bApplyRotation = 1;
+                    ctl->BoneRotation = QuatToRotator(acc);
+                    ctl->bApplyTranslation = 1;
+                    ctl->bAddTranslation = 0;
+                    ctl->BoneTranslationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    ctl->BoneTranslation = FVector{ hb->p[side][j][0], hb->p[side][j][1], hb->p[side][j][2] };
+                    ctl->ControlStrength = ctl->StrengthTarget = 1.0f;
+                    continue;
+                }
+                // Free hands: the power-holding pose in the air (both hands, see above), a relaxed pose standing/walking
+                // (RelaxedFingerQuat), the run animation's fists at a sprint - slerped between, so landing doesn't pop.
+                const FRotator* pose = side == 0 ? (g_powerHandHave ? g_powerHandRot : nullptr) : PowerHandRight(comp);
+                bool freeHand = !(side == 0 ? g_leftHandBusy : g_rightHandBusy);
+                float jw = (pose && g_cfg.jumpLeftPowerHand) ? amount : 0.0f;
+                float rw = (freeHand && g_cfg.handRelaxedPose) ? Clamp(1.0f - g_sprintBackAmount, 0.0f, 1.0f) * (1.0f - amount) : 0.0f;
+                float qr[4], qp[4], qo[4];
+                bool haveRelax = rw > 0.001f && RelaxedFingerQuat(comp, side, j, qr);
+                if (!haveRelax) rw = 0.0f;
+                if (jw + rw > 0.001f) {
+                    if (jw > 0.001f) { RotatorToQuat(pose[j], qp); OpenPowerFingers(qp, comp, side, j, g_cfg.jumpHandOpenFrac); }
+                    if (jw > 0.001f && haveRelax) QuatSlerp(qp, qr, rw / (jw + rw), qo);
+                    else if (haveRelax) for (int i = 0; i < 4; ++i) qo[i] = qr[i];
+                    else for (int i = 0; i < 4; ++i) qo[i] = qp[i];
+                    ctl->BoneRotationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    ctl->bAddRotation = 0;
+                    ctl->BoneRotation = QuatToRotator(qo);
+                    ctl->ControlStrength = ctl->StrengthTarget = jw > rw ? jw : rw;
+                    continue;
+                }
+                float deg = j < 12 ? g_cfg.jumpFingerCurlDeg * kJointShare[j % 3] * (1.0f + 0.12f * g_jumpFlex * g_cfg.jumpSway)
+                                   : g_cfg.jumpThumbDeg;
+                // thumb root: yaw, the same sign on both hands (the rig is mirrored; rest-pose test: +Z swings the
+                // thumb tip out from the palm on both, -Z tucks it under - the right hand had -Z)
+                float spread = j == 12 ? g_cfg.jumpThumbSpreadDeg : 0.0f;
+                // Sprinting clenched the hands into fists (user): an added curl rides on the run animation's fist.
+                // Set each joint outright instead - reference pose (open hand) x spread (local Z) x curl (local Y),
+                // in parent-bone space, blended in with the jump.
+                float rest[4];
+                // 17:03 diag: skin and shadow match the body exactly - the hook is the bind pose itself (phalanges bent
+                // 12-22 deg each, thumb_1 30 deg). Middle and tip joints (and thumb_1) start straight; knuckles keep
+                // the bind (it sets each finger's direction off the hand).
+                bool straight = (j < 12 && j % 3 != 0) || j == 13;
+                if (straight ? true : RefLocalQuat(comp, kFingerBones[side][j], rest)) {
+                    if (straight) { rest[0] = rest[1] = rest[2] = 0.0f; rest[3] = 1.0f; }
+                    const float h2 = 0.0087266f;   // half a degree in radians
+                    float sp[4] = { 0, 0, sinf(spread * h2), cosf(spread * h2) };
+                    float cu[4] = { 0, sinf(sign * deg * h2), 0, cosf(sign * deg * h2) };
+                    float t[4], q[4];
+                    QuatMul(rest, sp, t);
+                    QuatMul(t, cu, q);
+                    ctl->BoneRotationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    ctl->bAddRotation = 0;
+                    ctl->BoneRotation = QuatToRotator(q);
+                    ctl->ControlStrength = ctl->StrengthTarget = amount;
+                } else {
+                    ctl->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;
+                    ctl->bAddRotation = 1;
+                    ctl->BoneRotation = FRotator{ units(sign * deg * amount), units(spread * amount), 0 };
+                    ctl->ControlStrength = ctl->StrengthTarget = amount > 0.0f ? 1.0f : 0.0f;
+                }
+            }
+            // Cuff carrier: the body's handAttachment bone placed where the 1P sleeve bone is, off the forearm (any time the
+            // skin is on - a busy arm is shrunk anyway). 22:45 user screenshot: mapped to the hand, Corvo's cuffs sat ~4 uu
+            // too far down, through the backs of the hands.
+            if (auto* cc = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kCuffControlNames[side])))) {
+                const HandBind* hbc = (g_cfg.handMatchSkin && g_armSkinOn) ? SkinHandBind() : nullptr;
+                bool on = hbc && hbc->ok[side][15];
+                if (on) {
+                    FName la(kLowerArmBones[side]);
+                    cc->bApplyTranslation = 1;
+                    cc->bAddTranslation = 0;
+                    cc->BoneTranslationSpace = EBoneControlSpace::BCS_OtherBoneSpace;
+                    cc->TranslationSpaceBoneName = la;
+                    cc->BoneTranslation = FVector{ hbc->p[side][15][0], hbc->p[side][15][1], hbc->p[side][15][2] };
+                    cc->bApplyRotation = 1;
+                    cc->bAddRotation = 0;
+                    cc->BoneRotationSpace = EBoneControlSpace::BCS_OtherBoneSpace;
+                    cc->RotationSpaceBoneName = la;
+                    cc->BoneRotation = QuatToRotator(hbc->q[side][15]);
+                }
+                cc->ControlStrength = cc->StrengthTarget = on ? 1.0f : 0.0f;
+            }
+            // The wrist twist bone takes the 1P arms' bind too (rotation + position), same conditions as the fingers.
+            if (auto* hc = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kHelperFixNames[side])))) {
+                bool on = hb && hb->ok[side][14] && handFree;
+                if (on) {
+                    hc->bApplyRotation = 1;
+                    hc->bAddRotation = 0;
+                    hc->BoneRotationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    hc->BoneRotation = QuatToRotator(hb->q[side][14]);
+                    hc->bApplyTranslation = 1;
+                    hc->bAddTranslation = 0;
+                    hc->BoneTranslationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                    hc->BoneTranslation = FVector{ hb->p[side][14][0], hb->p[side][14][1], hb->p[side][14][2] };
+                }
+                hc->ControlStrength = hc->StrengthTarget = on ? 1.0f : 0.0f;
+            }
+        }
+    }
+}
+
+// Climbing arms (user, 2026-10-11): on ladders/chains the game animates only the first-person arms - forearms and
+// hands (the 1P mesh has no upper arms). The visible body supplies the upper arms: each upper_arm points from its
+// shoulder joint to where the 1P elbow is (1P lower_arm relative to the 1P camera_jnt, placed at the real view point -
+// the arm-shadow trick), stretched so the two meet; the body's own forearm and hand are shrunk away, so the 1P forearm
+// carries on from the body's elbow and does the gripping.
+static void UpdateClimbArms(ADishonoredPlayerPawn* pawn) {
+    if (!g_body || !pawn || !pawn->Mesh) return;
+    float amount = g_cfg.climbArms ? g_climbAmount : 0.0f;
+    static bool active = false;
+    if (amount <= 0.0f && !active) return;
+    Xf cam1P;
+    bool ok = amount > 0.0f && BoneXf(pawn->Mesh, "camera_jnt", cam1P);
+    auto sub = [](const FVector& a, const FVector& b) { return FVector{ a.X - b.X, a.Y - b.Y, a.Z - b.Z }; };
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    auto cross = [](const FVector& a, const FVector& b) { return FVector{ a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X }; };
+    auto norm = [&](const FVector& a) { float l = sqrtf(dot(a, a)); return l > 1e-4f ? FVector{ a.X / l, a.Y / l, a.Z / l } : a; };
+    float pyaw = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+    FVector right{ -sinf(pyaw), cosf(pyaw), 0.0f };
+    static int logged = 0;
+    for (int side = 0; side < 2; ++side) {
+        const char* lower = side == 0 ? "lower_arm_L_jnt" : "lower_arm_R_jnt";
+        auto* upperCtl = static_cast<USkelControlSingleBone*>(g_body->FindSkelControl(FName(kUpperArmBones[side])));
+        auto* lowerCtl = static_cast<USkelControlSingleBone*>(g_body->FindSkelControl(FName(lower)));
+        if (!upperCtl || !lowerCtl) continue;
+        Xf elbow1P;
+        if (!ok || !BoneXf(pawn->Mesh, lower, elbow1P)) {
+            upperCtl->ControlStrength = upperCtl->StrengthTarget = 0.0f;
+            upperCtl->BoneScale = 1.0f;
+            continue;
+        }
+        FVector E{ g_viewLoc.X + elbow1P.t[0] - cam1P.t[0], g_viewLoc.Y + elbow1P.t[1] - cam1P.t[1],
+                   g_viewLoc.Z + elbow1P.t[2] - cam1P.t[2] };
+        FVector S = g_body->GetBoneLocation(FName(kUpperArmBones[side]), 0);
+        FVector Ecur = g_body->GetBoneLocation(FName(lower), 0);
+        FVector d = sub(E, S);
+        float want = sqrtf(dot(d, d)), L1 = sqrtf(dot(sub(Ecur, S), sub(Ecur, S))) / (upperCtl->BoneScale > 0.01f ? upperCtl->BoneScale : 1.0f);
+        if (want < 1.0f || L1 < 5.0f) continue;
+        FVector X = norm(d);
+        float sideSign = side == 0 ? -1.0f : 1.0f;
+        FVector Y = norm(cross(X, FVector{ 0, 0, sideSign }));   // roll: level, across the arm (hidden under the sleeve)
+        if (dot(Y, Y) < 0.5f) Y = norm(cross(X, right));
+        FVector Z = cross(X, Y);
+        upperCtl->BoneRotationSpace = EBoneControlSpace::BCS_WorldSpace;
+        upperCtl->bAddRotation = 0;
+        upperCtl->bApplyRotation = 1;
+        upperCtl->BoneRotation = AxesToRotator(X, Y, Z);
+        upperCtl->BoneScale = Clamp(want / L1, 0.6f, 1.6f);   // the upper arm reaches the 1P elbow
+        upperCtl->ControlStrength = upperCtl->StrengthTarget = amount;
+        lowerCtl->bApplyRotation = 0;
+        lowerCtl->BoneScale = 0.001f;                          // the body's forearm + hand: the 1P ones show instead
+        lowerCtl->ControlStrength = lowerCtl->StrengthTarget = amount;
+        if (logged < 4 && amount > 0.99f) {
+            ++logged;
+            Log("climb arms: %s shoulder->1P elbow %.0f uu (upper arm %.0f, scale %.2f)", side ? "right" : "left", want, L1,
+                upperCtl->BoneScale);
+        }
+    }
+    active = amount > 0.0f;
+    if (!active)
+        for (int side = 0; side < 2; ++side)
+            if (auto* upperCtl = static_cast<USkelControlSingleBone*>(g_body->FindSkelControl(FName(kUpperArmBones[side])))) {
+                upperCtl->ControlStrength = upperCtl->StrengthTarget = 0.0f;
+                upperCtl->BoneScale = 1.0f;
+            }
+}
+
+// First-person arm skin (user, 2026-10-11: "use the texture from the arms used when holding weapons for the arms of
+// the player model - for Daud and his Overseer disguise"). Those bodies have one material for the whole body (its
+// texture is laid out for the body), so the 1P arms' texture can't simply go on. Instead the 1P arms model itself
+// (Daud's / the disguise's: forearms and hands, the same 79-bone names) is drawn on the body: a component that copies
+// the SHADOW body's pose (same controls, arms not shrunk - copying the visible body would copy the shrink below) and
+// sits at the visible body's Translation/Rotation/Scale; the visible body's own forearms and hands shrink away. A side
+// whose hand holds something keeps the game's 1P arm there instead (that copy side is hidden).
+
+static USkeletalMesh* CorvoArmsMesh(ADishonoredPlayerPawn* pawn);
+static bool XfInv(const Xf& a, Xf& o);
+static Xf XfFromRotator(const FRotator& r, const FVector& loc);
+static Xf XfMul(const Xf& a, const Xf& b);
+static void XfDecompose(const Xf& x, FVector& loc, FRotator& rot, float& scale);
+static Xf OwnerXf(ADishonoredPlayerPawn* pawn);
+static bool BoneAtomXf(USkeletalMeshComponent* comp, const char* bone, Xf& out);
+
+// Skin bones the body skeleton lacks are drawn in the skin's own reference pose (INDEX_NONE in ParentBoneMap). Corvo's 1P
+// arms hang the coat cuffs on sleeve_L/R_jnt (292 verts each; 22 uu down the forearm, no rotation off it - the bodies' hand
+// bone is at 25.2): mapped to the hand, each cuff sits at the wrist, ~3 uu nearer the fingers (22:01 clip: Corvo's sleeves
+// far up the arm, bare forearms). Collarbone_L/R (10 verts) -> shoulder_L/R. Re-checked each second (a rebuilt map).
+static void RemapUnmatchedSkinBones(USkeletalMeshComponent* skin, USkeletalMeshComponent* parent, bool log) {
+    auto* map = reinterpret_cast<RawArray*>(&skin->ParentBoneMap);
+    if (!skin->SkeletalMesh || !parent || !parent->SkeletalMesh || !map->Data || map->Num <= 0) return;
+    // Sleeves go to the cuff carrier (handAttachment, placed off the forearm - see kCuffCarrierBones) when the pose source
+    // has that control, else to the hand (the cuff then sits ~4 uu too far down, over the hand).
+    static bool carrier = false;
+    static USkeletalMeshComponent* carrierFor = nullptr;
+    if (carrierFor != parent) { carrierFor = parent; carrier = parent->FindSkelControl(FName(kCuffControlNames[0])) != nullptr; }
+    const char* kRemap[4][2] = { { "sleeve_L_jnt", carrier ? kCuffCarrierBones[0] : "hand_L_jnt" },
+                                 { "sleeve_R_jnt", carrier ? kCuffCarrierBones[1] : "hand_R_jnt" },
+                                 { "Collarbone_L_Jnt", "shoulder_L_jnt" }, { "Collarbone_R_Jnt", "shoulder_R_jnt" } };
+    // Bone indices cached per mesh pair - checked every frame (cheap), so a rebuilt map is fixed before it is drawn.
+    static USkeletalMesh* forSkin = nullptr;
+    static USkeletalMesh* forParent = nullptr;
+    static int idx[4][2];
+    static bool forCarrier = false;
+    if (forSkin != skin->SkeletalMesh || forParent != parent->SkeletalMesh || forCarrier != carrier) {
+        forSkin = skin->SkeletalMesh;
+        forParent = parent->SkeletalMesh;
+        forCarrier = carrier;
+        for (int i = 0; i < 4; ++i) {
+            idx[i][0] = skin->MatchRefBone(FName(kRemap[i][0]));
+            idx[i][1] = parent->MatchRefBone(FName(kRemap[i][1]));
+        }
+    }
+    int* m = static_cast<int*>(map->Data);
+    int done = 0;
+    for (int i = 0; i < 4; ++i) {
+        int si = idx[i][0], pi = idx[i][1];
+        // sleeves (no namesake on the body): always the chosen target; collarbones only while unmatched
+        if (si < 0 || si >= map->Num || pi < 0 || m[si] == pi || (i >= 2 && m[si] != -1)) continue;
+        m[si] = pi;
+        ++done;
+    }
+    static DWORD lastFixLog = 0;
+    if (!log && done && GetTickCount() - lastFixLog > 2000) {
+        lastFixLog = GetTickCount();
+        Log("arm skin: bone map was rebuilt - %d sleeve/collarbone link(s) restored", done);
+    }
+    if (log) {
+        int left = 0;
+        for (int i = 0; i < map->Num; ++i) if (m[i] == -1) ++left;
+        Log("arm skin: %d unmatched bone(s) mapped (sleeves -> %s, collarbones -> shoulders), %d still unmatched", done,
+            carrier ? "cuff carriers on the forearms" : "hands", left);
+    }
+}
+
+static void UpdateArmSkin(ADishonoredPlayerPawn* pawn) {
+    // (16:29 log: no skin - Daud's 1P arms only load when the Arms option is Daud; now the Daud body loads them too.
+    // User: every body, Corvo's as well.)
+    USkeletalMesh* mesh = g_builtChar == 1 ? g_daudArmsMesh : g_builtChar == 2 ? g_ovsArmsMesh : CorvoArmsMesh(pawn);
+    // 16:37 log: 'shadow body 00000000' - no shadow body that session, so the skin never came on. It now copies the
+    // visible body's pose; the body's own forearms are hidden with HideBoneByName, which only stops them being drawn
+    // (the pose - which the copy reads - keeps them), not with a BoneScale the copy would inherit.
+    // (16:43 screenshot: the old forearms still showed - HideBoneByName is undone by the elbow controls' BoneScale.)
+    // Back to: copy the shadow body's pose, shrink the visible body's forearms; the shadow body now always exists.
+    bool want = g_cfg.fpArmSkin && mesh && pawn && g_body && g_shadowBody && g_bodyVisible;
+    static DWORD lastWhy = 0;
+    if (!want && g_cfg.fpArmSkin && GetTickCount() - lastWhy > 10000) {   // (16:32: still never switched on - say why)
+        lastWhy = GetTickCount();
+        Log("arm skin off: body char %d, mesh %s, body %p, shadow body %p, visible %d", g_builtChar,
+            mesh ? mesh->GetName().c_str() : "none", g_body, g_shadowBody, g_bodyVisible ? 1 : 0);
+    }
+    g_skinFrameOk = false;
+    g_skinArmShown[0] = g_skinArmShown[1] = false;
+    if (!want) {
+        if (g_armSkin && g_armSkinOn) g_armSkin->SetHidden(true);
+        g_armSkinOn = false;   // (also when g_armSkin was dropped elsewhere - a stale 'on' kept the handover running)
+
+        return;
+    }
+    // Owned by the pawn (like the arm shadow), dropped - not touched - on a new pawn/world (see g_armsShadow).
+    if (g_armSkin && (g_armSkin->SkeletalMesh != mesh || g_armSkin->ParentAnimComponent != g_shadowBody)) {
+        pawn->DetachComponent(g_armSkin);
+        g_armSkin = nullptr;
+        g_armSkinOn = false;
+    }
+    if (!g_armSkin) {
+        auto* c = static_cast<USkeletalMeshComponent*>(
+            StaticConstructObject(USkeletalMeshComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+        if (!c) return;
+        c->SetSkeletalMesh(mesh, false);
+        c->bUpdateSkelWhenNotRendered = 1;
+        // 20:38 clip/log + retail disassembly: with a ParentAnimComponent and bTransformFromAnimParent (class default 1)
+        // the engine takes the PARENT's LocalToWorld (UpdateTransform 0x757840 -> base SetParentToWorld 0x52a090 with
+        // parent+0x60), ignores the owner's (SetParentToWorld 0x70d6b0 returns early), skips this mesh's own
+        // Origin/RotOrigin and applies our Translation/Rotation/Scale in front of the shadow body's matrix
+        // (CalcCurrentLocalToWorld 0x70d6d0) - in its raw mesh axes: our X drew as left, Y as down, Z as forward. Every
+        // skin offset so far landed on the wrong axis. Off: placed from the owner + its own mesh origin (= skinFrame).
+        const int inheritWas = c->bTransformFromAnimParent, reallyWas = c->m_bReallyInheritTransformFromAnimParent;
+        c->bTransformFromAnimParent = 0;
+        c->m_bReallyInheritTransformFromAnimParent = 0;
+        if (g_body->LightEnvironment) c->SetLightEnvironment(g_body->LightEnvironment);
+        c->CastShadow = 0;
+        c->bCastDynamicShadow = 0;
+        c->DepthPriorityGroup = g_body->DepthPriorityGroup;
+        pawn->AttachComponent(c);
+        c->SetParentAnimComponent(g_shadowBody);
+        c->UpdateParentBoneMap();
+        RemapUnmatchedSkinBones(c, g_shadowBody, true);
+        g_armSkin = c;
+        Log("arm skin: %s drawn on the %s body (%p) | transform from anim parent was %d (really %d), now 0",
+            mesh->GetName().c_str(), CharName(g_builtChar), c, inheritWas, reallyWas);
+    }
+    if (!g_armSkinOn) { g_armSkin->SetHidden(false); g_armSkinOn = true; }
+    {
+        RemapUnmatchedSkinBones(g_armSkin, g_shadowBody, false);   // every frame (indices cached)
+        auto* sm = reinterpret_cast<RawArray*>(&g_armSkin->Materials);
+        UMaterialInterface* cur0 = (sm->Data && sm->Num > 0) ? static_cast<UMaterialInterface**>(sm->Data)[0] : nullptr;
+        if (mesh == g_ovsArmsMesh && g_ovsArmsMat && cur0 != g_ovsArmsMat) {
+            g_armSkin->SetMaterial(0, g_ovsArmsMat);
+            Log("arm skin: Overseer arms material on");
+        }
+    }
+    g_shadowBody->ForcedLodModel = 1;   // the pose source must update every bone (see CreateShadowBody)
+    g_armSkin->ForcedLodModel = 1;
+    // In the air the new arms' shoulders (the 1P model has full sleeves) clipped the camera: ease them back/down.
+    float air = g_jumpAmount;
+    FVector t = g_body->Translation;
+    t.X -= g_cfg.armSkinJumpBack * air;
+    t.Z -= g_cfg.armSkinJumpDown * air;
+    // Jump: keep the arms centred on the view (17:32 clip: mid-jump both arms sat to the right of the camera - fine
+    // standing and walking). The jump pose is built out from the shadow body's two upper-arm joints, and nothing keeps
+    // those under the view sideways in the air. Measured each frame: the gap between the view and their midpoint (moved
+    // to where the skin draws them), across the view's level heading; the skin moves across by it, eased, in the air.
+    {
+        static float lat = 0.0f;
+        static DWORD lastC = 0, lastCLog = 0;
+        DWORD nowC = GetTickCount();
+        float dtC = lastC ? Clamp((nowC - lastC) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+        lastC = nowC;
+        float pyawC = pawn->Rotation.Yaw * (6.2831853f / 65536.0f), cpy = cosf(pyawC), spy = sinf(pyawC);
+        FVector dTc{ t.X - g_shadowBodyT.X, t.Y - g_shadowBodyT.Y, t.Z - g_shadowBodyT.Z };
+        FVector offC{ dTc.X * cpy - dTc.Y * spy, dTc.X * spy + dTc.Y * cpy, dTc.Z };
+        float vyaw = g_viewRot.Yaw * (6.2831853f / 65536.0f);
+        FVector R{ -sinf(vyaw), cosf(vyaw), 0.0f };
+        auto across = [&](const FVector& p) {   // + = right of the view
+            return (p.X + offC.X - g_viewLoc.X) * R.X + (p.Y + offC.Y - g_viewLoc.Y) * R.Y;
+        };
+        FVector a = g_shadowBody->GetBoneLocation(FName(kUpperArmBones[0]), 0);
+        FVector b = g_shadowBody->GetBoneLocation(FName(kUpperArmBones[1]), 0);
+        float gap = across(FVector{ (a.X + b.X) * 0.5f, (a.Y + b.Y) * 0.5f, 0.0f });
+        bool fresh = nowC - g_viewLocTick < 500 && fabsf(gap) < 100.0f;   // (ignore a garbage frame: spawn, teleport)
+        lat += ((fresh ? gap : 0.0f) - lat) * Clamp(dtC * 12.0f, 0.0f, 1.0f);
+        float c = Clamp(lat, -g_cfg.armSkinJumpCentreMax, g_cfg.armSkinJumpCentreMax);
+        float s = -c * air * g_cfg.armSkinJumpCentre;   // along the view's right, world -> actor space
+        t.X += s * (R.X * cpy + R.Y * spy);
+        t.Y += s * (-R.X * spy + R.Y * cpy);
+        if (air > 0.5f && nowC - lastCLog > 500) {
+            lastCLog = nowC;
+            Log("arm skin jump centre: arms %.1f uu right of the view (eased %.1f), moved %.1f | pelvis %.1f head %.1f",
+                gap, lat, s, across(g_shadowBody->GetBoneLocation(FName("Root_jnt"), 0)),
+                across(g_shadowBody->GetBoneLocation(FName("head_jnt"), 0)));
+        }
+    }
+    // Placement (17:10 clip: the arms sat off the body's centre). The bones are copied in the body mesh's space, but
+    // each mesh has its own RotOrigin/Origin (the 1P arms model's stands it up for the camera). World = bone x mesh
+    // origin x component x owner, so the skin's component frame = inv(skin origin) x body origin x body component.
+    // The engine applies Origin first, in the mesh's own frame, then RotOrigin (MODLOG build 89 diag: the 1P arms'
+    // LocalToWorld sat ~72 uu LOWER for Origin (0, 87.5, 0) - not to the side). Composed the other way round
+    // (FRotationTranslationMatrix(RotOrigin, Origin)), the 9.5 uu gap between the two meshes' Origins went to the
+    // side instead of down: the skin drew 9.5 right and 9.5 high (user, 19:22 clip: both arms shifted right; the
+    // inside of the shoulders showed while sprinting). ArmSkinOriginFix = the engine's order.
+    // Sprinting: the new arms ease back a little more than the body (user: the inside of the shoulders showed).
+    t.X -= g_cfg.armSkinSprintBack * g_sprintBackAmount * (1.0f - air);
+    t.Z -= g_cfg.armSkinSprintDown * g_sprintBackAmount * (1.0f - air);
+    // Down stairs the game's camera lags ~50 uu above (log 20:20 stairDz 52); SyncTransform lifts the visible body with
+    // it (g_cameraDip > 0) so the legs stay in view - which lifted these arms straight into the camera (user: worst
+    // running down stairs). The arms keep their own height.
+    if (g_cameraDip > 0.0f) t.Z -= g_cameraDip * g_cfg.armSkinStairUpCut;
+    t.Y += g_cfg.armSkinShiftRight + (g_cfg.armSkinSprintShiftRight - g_cfg.armSkinShiftRight) * g_sprintBackAmount;
+    // Closed loop (19:34 clip: still shifted right, the left sleeve through the camera - yet by the model the arms sat
+    // centred and never came within 25 uu of the camera). Where the skin should be: the shadow body's pose moved by the
+    // gap between the two components' translations. Where it really is: the engine's own bone positions for the skin
+    // (GetBoneMatrix reads the parent's pose through ParentBoneMap times the skin's LocalToWorld - what is drawn). Each
+    // frame the two shoulder joints' midpoint is compared and the difference moves the skin (ArmSkinAlign), whatever the
+    // reason for it (mesh origins, LocalToWorld conventions). Last frame's gap is used: both readings are last frame's.
+    static FVector alignCorr = { 0, 0, 0 };   // actor space, added to the skin's placement
+    static FVector alignPrevOff = { 0, 0, 0 };
+    static USkeletalMesh* alignFor = nullptr;
+    static bool alignHavePrev = false, alignReadOk = false;
+    if (!g_cfg.armSkinAlign) { alignCorr = { 0, 0, 0 }; alignHavePrev = false; alignReadOk = false; }
+    else {
+        if (alignFor != mesh) { alignFor = mesh; alignCorr = { 0, 0, 0 }; alignHavePrev = false; }
+        float py = pawn->Rotation.Yaw * (6.2831853f / 65536.0f), c = cosf(py), sn = sinf(py);
+        FName sl("shoulder_L_jnt"), sr("shoulder_R_jnt");
+        FVector kl = g_armSkin->GetBoneLocation(sl, 0), kr = g_armSkin->GetBoneLocation(sr, 0);
+        FVector hl = g_shadowBody->GetBoneLocation(sl, 0), hr = g_shadowBody->GetBoneLocation(sr, 0);
+        auto len = [](float x, float y, float z) { return sqrtf(x * x + y * y + z * z); };
+        FVector raw{ (kl.X + kr.X - hl.X - hr.X) * 0.5f, (kl.Y + kr.Y - hl.Y - hr.Y) * 0.5f, (kl.Z + kr.Z - hl.Z - hr.Z) * 0.5f };
+        FVector err{ raw.X - alignPrevOff.X, raw.Y - alignPrevOff.Y, raw.Z - alignPrevOff.Z };
+        float e = len(err.X, err.Y, err.Z);
+        bool apart = len(kl.X - kr.X, kl.Y - kr.Y, kl.Z - kr.Z) > 5.0f;   // a real pose (not one point for every bone)
+        bool parentRead = len(raw.X, raw.Y, raw.Z) < 0.5f && len(alignPrevOff.X, alignPrevOff.Y, alignPrevOff.Z) > 3.0f;
+        bool ok = alignHavePrev && apart && !parentRead && e < 60.0f;
+        if (ok != alignReadOk) {
+            Log("arm skin align: %s (skin shoulders %s, raw gap %.1f, error %.1f)", ok ? "reading the skin's bones" : "NOT usable",
+                apart ? "apart" : "together", len(raw.X, raw.Y, raw.Z), e);
+            alignReadOk = ok;
+        }
+        if (ok && g_cfg.armSkinAlign) {
+            FVector el{ err.X * c + err.Y * sn, -err.X * sn + err.Y * c, err.Z };   // world -> actor space
+            alignCorr.X = Clamp(alignCorr.X - el.X * 0.3f, -40.0f, 40.0f);
+            alignCorr.Y = Clamp(alignCorr.Y - el.Y * 0.3f, -40.0f, 40.0f);
+            alignCorr.Z = Clamp(alignCorr.Z - el.Z * 0.3f, -40.0f, 40.0f);
+        }
+        static DWORD lastA = 0;
+        FVector v = pawn->Velocity;
+        if ((air > 0.3f || v.X * v.X + v.Y * v.Y > 300.0f * 300.0f) && GetTickCount() - lastA > 500) {
+            lastA = GetTickCount();
+            FVector el{ err.X * c + err.Y * sn, -err.X * sn + err.Y * c, err.Z };
+            Xf view = XfFromRotator(g_viewRot, g_viewLoc);
+            auto inView = [&](const FVector& p, float& r, float& u, float& f) {
+                FVector d{ p.X - g_viewLoc.X, p.Y - g_viewLoc.Y, p.Z - g_viewLoc.Z };
+                f = d.X * view.m[0][0] + d.Y * view.m[0][1] + d.Z * view.m[0][2];
+                r = d.X * view.m[1][0] + d.Y * view.m[1][1] + d.Z * view.m[1][2];
+                u = d.X * view.m[2][0] + d.Y * view.m[2][1] + d.Z * view.m[2][2];
+            };
+            float lr, lu, lf, rr, ru, rf;
+            inView(g_armSkin->GetBoneLocation(FName(kHandBones[0]), 0), lr, lu, lf);
+            inView(g_armSkin->GetBoneLocation(FName(kHandBones[1]), 0), rr, ru, rf);
+            Log("arm skin align: off fwd %.1f right %.1f up %.1f -> correction (%.1f %.1f %.1f) | skin hands in view (right/up/fwd): "
+                "L %.0f %.0f %.0f  R %.0f %.0f %.0f | pitch %.0f speed %.0f air %.2f", el.X, el.Y, el.Z, alignCorr.X, alignCorr.Y,
+                alignCorr.Z, lr, lu, lf, rr, ru, rf, g_viewPitchDeg, sqrtf(v.X * v.X + v.Y * v.Y), air);
+        }
+        FVector dTn{ t.X - g_shadowBodyT.X, t.Y - g_shadowBodyT.Y, t.Z - g_shadowBodyT.Z };   // this frame's gap, for next time
+        alignPrevOff = { dTn.X * c - dTn.Y * sn, dTn.X * sn + dTn.Y * c, dTn.Z };
+        alignHavePrev = true;
+    }
+    Xf skinFrame;           // pose (shadow body mesh space) -> world, exactly as the skin is placed this frame
+    bool haveSkinFrame = false;
+    {
+        FVector tPlaced{ t.X + alignCorr.X, t.Y + alignCorr.Y, t.Z + alignCorr.Z };
+        Xf cb = XfFromRotator(g_body->Rotation, tPlaced);
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) cb.m[i][j] *= g_body->Scale;
+        USkeletalMesh* bm = g_body->SkeletalMesh;
+        auto meshOrigin = [](USkeletalMesh* m) {
+            if (!g_cfg.armSkinOriginFix) return XfFromRotator(m->RotOrigin, m->Origin);
+            Xf o = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { m->Origin.X, m->Origin.Y, m->Origin.Z } };
+            return XfMul(o, XfFromRotator(m->RotOrigin, FVector{ 0, 0, 0 }));   // Origin, then RotOrigin
+        };
+        Xf ob = meshOrigin(bm), os = meshOrigin(mesh), osInv;
+        skinFrame = XfMul(XfMul(ob, cb), OwnerXf(pawn));
+        haveSkinFrame = true;
+        g_skinFrame = skinFrame;
+        g_skinFrameOk = g_cfg.armSkinOriginFix && g_body->Scale > 0.5f;   // (mantle: body Scale ~0.001 - the inverse would blow up)
+        static USkeletalMesh* loggedFor = nullptr;
+        if (loggedFor != mesh) {
+            loggedFor = mesh;
+            Log("arm skin: body mesh origin (%.1f %.1f %.1f) rot (%d %d %d), arms mesh origin (%.1f %.1f %.1f) rot (%d %d %d)",
+                bm->Origin.X, bm->Origin.Y, bm->Origin.Z, bm->RotOrigin.Pitch, bm->RotOrigin.Yaw, bm->RotOrigin.Roll,
+                mesh->Origin.X, mesh->Origin.Y, mesh->Origin.Z, mesh->RotOrigin.Pitch, mesh->RotOrigin.Yaw, mesh->RotOrigin.Roll);
+        }
+        if (XfInv(os, osInv)) {
+            Xf cs = XfMul(XfMul(osInv, ob), cb);
+            FVector loc; FRotator rot; float sc;
+            XfDecompose(cs, loc, rot, sc);
+            static USkeletalMesh* loggedGap = nullptr;
+            if (loggedGap != mesh) {   // expected with the fix: (0 0 -9.5) for Daud's arms on Daud's body
+                loggedGap = mesh;
+                Log("arm skin: placed at body + (%.1f %.1f %.1f) (origin fix %d)", loc.X - t.X, loc.Y - t.Y, loc.Z - t.Z,
+                    g_cfg.armSkinOriginFix ? 1 : 0);
+            }
+            g_armSkin->SetTranslation(loc);
+            g_armSkin->SetRotation(rot);
+            g_armSkin->SetScale(sc);
+        }
+    }
+    // The visible body's own forearms + hands shrink away (the skin's show). A busy hand: the game's 1P arm shows
+    // there, so the skin must not - HideBoneByName on the skin did nothing (it copies the shadow body's pose; 16:53
+    // clip: a glove floated beside the sword / wristbow). The SHADOW body's forearm on that side shrinks instead (the
+    // skin copies that); its upper arm stays, and the 1P arm shadow casts that forearm when shadows are on.
+    // 17:17 clip: (1) weapons out, the skin's upper sleeve on the busy side still reached up toward the 1P hand (the
+    // shadow arm follows it by IK) - a second arm through the camera. A busy side now loses the skin's whole arm, from
+    // the shoulder (the game's 1P arm is the arm there). (2) Sprinting and looking down, the run swing brought each
+    // upper sleeve (the 1P model's are bulky) through the camera - big flat panels. Each free arm is measured: if its
+    // upper arm (shoulder joint to elbow) passes within ArmSkinNear of the camera it shrinks away fast, and comes
+    // back only once it has stayed clear for ArmSkinNearHold s (so it doesn't pulse with every stride).
+    // Where the skin's bones are: the shadow body's (same component-space pose) moved by the gap between the two
+    // components' translations (actor space, turned by the pawn's yaw). Shrunk arms are measured un-shrunk (the
+    // shoulder scale shrinks them toward the shoulder joint; last frame's scale is known).
+    static float hideAmt[2] = { 0.0f, 0.0f }, lastK[2] = { 1.0f, 1.0f };
+    static DWORD clearSince[2] = { 0, 0 }, lastT = 0, lastLog = 0;
+    static bool wasNear[2] = { false, false };            // trip log: rising edge of tooNear
+    static DWORD lastTrip[2] = { 0, 0 };
+    static float tripGap[2] = { 0.0f, 0.0f };             // ms between the last two trips (hold below)
+    static float minU[2] = { 999.0f, 999.0f }, minF[2] = { 999.0f, 999.0f };   // closest since the last near-camera line
+    DWORD nowT = GetTickCount();
+    static LONGLONG qpc10 = 0;
+    float dt = QpcDt(qpc10);   // (frame-accurate; was GetTickCount steps)
+    lastT = nowT;
+    float pyaw = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+    FVector dT{ t.X - g_shadowBodyT.X, t.Y - g_shadowBodyT.Y, t.Z - g_shadowBodyT.Z };
+    FVector off{ dT.X * cosf(pyaw) - dT.Y * sinf(pyaw), dT.X * sinf(pyaw) + dT.Y * cosf(pyaw), dT.Z };
+    g_skinOffWorld = off;   // (no longer read by the reach: UpdateArmSkinReach aims through g_skinFrame)
+    auto segDist = [](const FVector& c, const FVector& a, const FVector& b) {
+        FVector ab{ b.X - a.X, b.Y - a.Y, b.Z - a.Z }, ac{ c.X - a.X, c.Y - a.Y, c.Z - a.Z };
+        float l2 = ab.X * ab.X + ab.Y * ab.Y + ab.Z * ab.Z;
+        float u = l2 > 1e-4f ? Clamp((ac.X * ab.X + ac.Y * ab.Y + ac.Z * ab.Z) / l2, 0.0f, 1.0f) : 0.0f;
+        FVector d{ ac.X - ab.X * u, ac.Y - ab.Y * u, ac.Z - ab.Z * u };
+        return sqrtf(d.X * d.X + d.Y * d.Y + d.Z * d.Z);
+    };
+    bool busy[2] = { g_leftHandBusy, g_rightHandBusy };
+    float nearD[2] = { -1.0f, -1.0f }, nearU[2] = { -1.0f, -1.0f }, nearF[2] = { -1.0f, -1.0f };
+    // Where a skin bone is drawn: the shadow body's pose (this frame's SpaceBases) x the skin's own placement - not
+    // GetBoneLocation on the shadow body, whose LocalToWorld trails while moving (20:25: guard said 28+ uu sprinting
+    // while the forearm filled the view).
+    auto skinBone = [&](const char* bone, FVector& out) {
+        Xf a;
+        if (haveSkinFrame && BoneAtomXf(g_shadowBody, bone, a)) {
+            Xf w = XfMul(a, skinFrame);
+            out = FVector{ w.t[0], w.t[1], w.t[2] };
+            return true;
+        }
+        FVector p = g_shadowBody->GetBoneLocation(FName(bone), 0);
+        out = FVector{ p.X + off.X, p.Y + off.Y, p.Z + off.Z };
+        return false;
+    };
+    for (int side = 0; side < 2; ++side) {
+        FName lower(side == 0 ? "lower_arm_L_jnt" : "lower_arm_R_jnt");
+        FName shoulder(side == 0 ? "shoulder_L_jnt" : "shoulder_R_jnt");
+        if (auto* ctl = static_cast<USkelControlSingleBone*>(g_body->FindSkelControl(lower))) {
+            ctl->BoneScale = 0.001f;
+            ctl->ControlStrength = ctl->StrengthTarget = 1.0f;
+        }
+        // The whole old arm, from the shoulder (user: old fingers showed by the armpits looking down).
+        // Slide (08:50 clip, looking straight down): the skin's forearm + hand folded over the chest looked like a
+        // floating sleeve - the skin has nothing above the elbow. A free arm's shoulder + upper arm grow back in with the
+        // slide (the lower arm stays shrunk at the elbow, under the skin's forearm), so the sleeve joins the shoulder.
+        if (auto* ctl = static_cast<USkelControlSingleBone*>(g_body->FindSkelControl(shoulder))) {
+            float up = (g_cfg.slideShowUpperArms && !busy[side]) ? Clamp((g_slideAmount - 0.2f) / 0.3f, 0.0f, 1.0f) : 0.0f;
+            ctl->BoneScale = 0.001f + 0.999f * up;
+            ctl->ControlStrength = ctl->StrengthTarget = 1.0f;
+        }
+        bool tooNear = false;
+        if (!busy[side] && lastK[side] > 0.005f && !(g_cfg.armSkinHandoff && g_weaponRaise[side] > 0.02f)) {   // (not mid-handover)   // 0.015 floor measured (1 - 0.985f*1 = 0.0149999857f failed >= 0.015f); busy 0.001 skipped
+            // 19:34: measured on the skin itself when its bones read back (see the closed loop above) - the model's
+            // positions said 25+ uu while the left sleeve went through the camera. Forearm included (E to hand).
+            FVector S, U, E, H;
+            skinBone(side == 0 ? "shoulder_L_jnt" : "shoulder_R_jnt", S);
+            skinBone(kUpperArmBones[side], U);
+            skinBone(side == 0 ? "lower_arm_L_jnt" : "lower_arm_R_jnt", E);
+            skinBone(kHandBones[side], H);
+            float inv = 1.0f / lastK[side];
+            auto unshrink = [&](const FVector& p) {
+                return FVector{ S.X + (p.X - S.X) * inv, S.Y + (p.Y - S.Y) * inv, S.Z + (p.Z - S.Z) * inv };
+            };
+            U = unshrink(U); E = unshrink(E); H = unshrink(H);
+            float dU = segDist(g_viewLoc, U, E), dF = segDist(g_viewLoc, E, H);
+            nearD[side] = dU < dF ? dU : dF;
+            nearU[side] = dU; nearF[side] = dF;
+            if (dU < minU[side]) minU[side] = dU;
+            if (dF < minF[side]) minF[side] = dF;
+            float limF = g_cfg.armSkinNearForearm + (g_cfg.armSkinNearForearmSprint - g_cfg.armSkinNearForearm) * g_sprintBackAmount;
+            float limU = g_cfg.armSkinNear;
+            float nearScale = 1.0f - (1.0f - g_cfg.slideArmNearScale) * g_slideAmount;   // (slide: the bracing hands are close by design)
+            if (g_climbHandsOn) nearScale *= 1.0f - (1.0f - g_cfg.climbArmNearScale) * g_climbAmount;   // (climbing: hands on the chain at the face)
+            limF *= nearScale; limU *= nearScale;
+            tooNear = dU < limU || dF < limF;
+            if (tooNear && !wasNear[side]) {   // the frame that hides the arm (was lost in the 500 ms throttle)
+                Xf vw = XfFromRotator(g_viewRot, g_viewLoc);
+                auto vs = [&](const FVector& p, float* o) {   // view space: forward, right, up
+                    FVector d{ p.X - g_viewLoc.X, p.Y - g_viewLoc.Y, p.Z - g_viewLoc.Z };
+                    for (int i = 0; i < 3; ++i) o[i] = d.X * vw.m[i][0] + d.Y * vw.m[i][1] + d.Z * vw.m[i][2];
+                };
+                float e3[3], h3[3];
+                vs(E, e3); vs(H, h3);
+                FVector pv = pawn->Velocity;
+                if (lastTrip[side] && nowT - lastTrip[side] < 1500) tripGap[side] = static_cast<float>(nowT - lastTrip[side]);
+                Log("arm skin near TRIP: %s %s (upper %.1f fore %.1f, limits %.0f / %.0f) | elbow view fwd/right/up %.0f %.0f %.0f, "
+                    "hand %.0f %.0f %.0f | %.2f s since last trip | pitch %.0f fwd speed %.0f sprint %.2f air %.2f",
+                    side ? "right" : "left", dU < limU ? "upper arm" : "forearm", dU, dF, limU, limF,
+                    e3[0], e3[1], e3[2], h3[0], h3[1], h3[2], lastTrip[side] ? (nowT - lastTrip[side]) / 1000.0f : -1.0f,
+                    g_viewPitchDeg, pv.X * cosf(pyaw) + pv.Y * sinf(pyaw), g_sprintBackAmount, air);
+                lastTrip[side] = nowT;
+            }
+        }
+        wasNear[side] = tooNear;
+        if (tooNear || busy[side]) clearSince[side] = 0;
+        else if (!clearSince[side]) clearSince[side] = nowT;
+        // Trips that recur every stride: stay away for a whole measured trip interval instead of flashing back between strides.
+        float holdMs = g_cfg.armSkinNearHold * 1000.0f;
+        if (lastTrip[side] && nowT - lastTrip[side] < 1500 && tripGap[side] * 1.15f > holdMs) holdMs = tripGap[side] * 1.15f;
+        bool hold = !busy[side] && (tooNear || (clearSince[side] && nowT - clearSince[side] < holdMs));
+        if (hideAmt[side] <= 0.0f && !tooNear) hold = false;   // nothing to hold back
+        if (g_cfg.armSkinHandoff && g_weaponRaise[side] > 0.02f) { hold = false; clearSince[side] = 0; }   // not mid-handover
+        hideAmt[side] += Clamp((hold ? 1.0f : 0.0f) - hideAmt[side], -dt * g_cfg.reappearSpeed, dt * 20.0f);
+        // Handover with the game's 1P arm (user 22:57: on holstering the arms "appeared out of nowhere"). While the
+        // shadow arm's reach for the 1P hand (g_weaponRaise -> UpdateArmsShadow IK) is still blending - rising on a draw,
+        // lowering after a holster - this arm stays shown and follows it, so it takes over from / hands over to the game's
+        // arm right where that arm is. A busy arm hides once the reach is (nearly) complete.
+        // One arm on screen at a time, decided by where the game's hand is (log 23:00: the sword holster runs while the
+        // hand is still 'busy' and flips straight to Empty ~1 s later - hiding by reach amount left no arm in between).
+        // Busy (or being drawn): the game's arm, unless its hand has gone off the bottom of the view (150 ms: attacks dip
+        // out briefly) - then ours, already at that hand (UpdateArmSkinReach). Just freed: the game's arm while its hand is
+        // still in view (1 s), then ours from that hand back to the side.
+        bool hideBusy;
+        bool busyNow = busy[side] || g_handDrawing[side];
+        // (23:40 clip: holding a weapon and looking UP the 1P hand drops under the bottom edge - ours then reached past the
+        // camera for it: big sleeves across the top of the view. Taking over is only for the start of a draw, and never
+        // looking up.)
+        static DWORD busySince[2] = { 0, 0 };
+        if (!busyNow) busySince[side] = 0; else if (!busySince[side]) busySince[side] = nowT;
+        bool drawWindow = busyNow && nowT - busySince[side] < static_cast<DWORD>(g_cfg.armSkinDrawWindow * 1000.0f);
+        bool lookingUp = g_viewPitchDeg > g_cfg.armSkinReachMaxPitch;
+        if (!g_cfg.armSkinHandoff || !g_cfg.shadowWeaponArms) hideBusy = busy[side];   // no reach: the old rule
+        else if (busyNow) hideBusy = !(drawWindow && !lookingUp && g_onePHandBelow[side] && g_onePHandOffMs[side] > 150);
+        else hideBusy = g_weaponRaise[side] > 0.02f && g_onePHandOnScreen[side] && g_handFreeMs[side] < 1000 &&
+                        JumpArmAmount(side) <= 0.05f;
+        float k = hideBusy ? 0.001f : 1.0f - 0.985f * hideAmt[side];
+        g_skinArmShown[side] = !hideBusy && k > 0.05f;
+        if (auto* ctl = static_cast<USkelControlSingleBone*>(g_shadowBody->FindSkelControl(shoulder))) {
+            if (k < 0.999f) {
+                ctl->BoneScale = k;
+                ctl->ControlStrength = ctl->StrengthTarget = 1.0f;
+            }
+        }
+        lastK[side] = k < 0.999f ? k : 1.0f;
+    }
+    // Diagnostic (19:46: still "not centred" sprinting/jumping, but the arms measured centred on the body): how the view
+    // is turned/tilted against the pawn, and where each hand should be on screen by the model (shadow pose + gap),
+    // x/y -1..1 (right/up) - compare with the clip.
+    {
+        static DWORD lastV = 0;
+        FVector v = pawn->Velocity;
+        if ((air > 0.3f || v.X * v.X + v.Y * v.Y > 300.0f * 300.0f) && nowT - lastV > 250) {
+            lastV = nowT;
+            Xf view = XfFromRotator(g_viewRot, g_viewLoc);
+            float th = tanf(g_viewFov * 0.5f * 0.0174533f) * (4.0f / 3.0f);   // POV.FOV is the 4:3 FOV; 16:9 is wider (20:38 overlay)
+            auto screen = [&](const FVector& p, float& x, float& y) {
+                FVector d{ p.X - g_viewLoc.X, p.Y - g_viewLoc.Y, p.Z - g_viewLoc.Z };
+                float f = d.X * view.m[0][0] + d.Y * view.m[0][1] + d.Z * view.m[0][2];
+                float r = d.X * view.m[1][0] + d.Y * view.m[1][1] + d.Z * view.m[1][2];
+                float u = d.X * view.m[2][0] + d.Y * view.m[2][1] + d.Z * view.m[2][2];
+                if (f < 1.0f) { x = y = 9.0f; return; }   // behind the camera
+                x = r / (f * th); y = u / (f * th * 0.5625f);
+            };
+            float lx, ly, rx, ry;
+            FVector hl, hr;
+            skinBone(kHandBones[0], hl);
+            skinBone(kHandBones[1], hr);
+            screen(hl, lx, ly);
+            screen(hr, rx, ry);
+            // How far the old reading (shadow body GetBoneLocation + gap) is from the drawn hand, and along the motion.
+            FVector old = g_shadowBody->GetBoneLocation(FName(kHandBones[0]), 0);
+            FVector dd{ old.X + off.X - hl.X, old.Y + off.Y - hl.Y, old.Z + off.Z - hl.Z };
+            float sp = sqrtf(v.X * v.X + v.Y * v.Y);
+            float along = sp > 1.0f ? (dd.X * v.X + dd.Y * v.Y) / sp : 0.0f;
+            int dy = static_cast<int16_t>((g_viewRot.Yaw - pawn->Rotation.Yaw) & 0xFFFF);
+            int roll = static_cast<int16_t>(g_viewRot.Roll & 0xFFFF);
+            Log("arm skin view: camera turned %.1f deg right of the body, rolled %.1f, pitch %.0f | on screen: L hand %.2f %.2f  "
+                "R hand %.2f %.2f | old reading off by %.1f uu (%.1f along the motion) | speed %.0f air %.2f",
+                dy * (360.0f / 65536.0f), roll * (360.0f / 65536.0f), g_viewPitchDeg, lx, ly, rx, ry,
+                sqrtf(dd.X * dd.X + dd.Y * dd.Y + dd.Z * dd.Z), along, sp, air);
+        }
+    }
+    if ((nearD[0] >= 0.0f && nearD[0] < g_cfg.armSkinNear + 10.0f) || (nearD[1] >= 0.0f && nearD[1] < g_cfg.armSkinNear + 10.0f)) {
+        if (nowT - lastLog > 500) {
+            lastLog = nowT;
+            FVector v = pawn->Velocity;
+            Log("arm skin near camera: left upper %.0f fore %.0f, right upper %.0f fore %.0f (limits %.0f / %.0f) hidden %.2f/%.2f | "
+                "min since last line L %.0f/%.0f R %.0f/%.0f | pitch %.0f speed %.0f sprint %.2f air %.2f stair lift %.0f",
+                nearU[0], nearF[0], nearU[1], nearF[1], g_cfg.armSkinNear,
+                g_cfg.armSkinNearForearm + (g_cfg.armSkinNearForearmSprint - g_cfg.armSkinNearForearm) * g_sprintBackAmount, hideAmt[0],
+                hideAmt[1], minU[0], minF[0], minU[1], minF[1], g_viewPitchDeg, sqrtf(v.X * v.X + v.Y * v.Y), g_sprintBackAmount, air, g_cameraDip);
+            minU[0] = minU[1] = minF[0] = minF[1] = 999.0f;
+        }
+    }
+    // Placement check: the engine's own hand positions (parent pose x the skin's LocalToWorld = what is drawn) vs the
+    // model (skinBone). With bTransformFromAnimParent off they should agree (standing ~0, moving ~one frame of motion).
+    {
+        static DWORD lastP = 0;
+        if (haveSkinFrame && nowT - lastP > 2000) {
+            lastP = nowT;
+            float cp = cosf(pyaw), sn = sinf(pyaw), g[2][3];
+            for (int s = 0; s < 2; ++s) {
+                FVector m, e = g_armSkin->GetBoneLocation(FName(kHandBones[s]), 0);
+                skinBone(kHandBones[s], m);
+                FVector d{ e.X - m.X, e.Y - m.Y, e.Z - m.Z };
+                g[s][0] = d.X * cp + d.Y * sn; g[s][1] = -d.X * sn + d.Y * cp; g[s][2] = d.Z;
+            }
+            USkeletalMeshComponent* a1 = pawn->Mesh;
+            FVector v = pawn->Velocity;
+            Log("arm skin placement check: engine - model (fwd/right/up) L hand %.1f %.1f %.1f, R hand %.1f %.1f %.1f | guard L %.0f/%.0f "
+                "R %.0f/%.0f | skin T (%.1f %.1f %.1f) body T (%.1f %.1f %.1f) shadow T (%.1f %.1f %.1f) 1P T (%.1f %.1f %.1f) | "
+                "inherit %d/%d fov %.1f speed %.0f", g[0][0], g[0][1], g[0][2], g[1][0], g[1][1], g[1][2], nearU[0], nearF[0], nearU[1],
+                nearF[1], g_armSkin->Translation.X, g_armSkin->Translation.Y, g_armSkin->Translation.Z, g_body->Translation.X,
+                g_body->Translation.Y, g_body->Translation.Z, g_shadowBodyT.X, g_shadowBodyT.Y, g_shadowBodyT.Z,
+                a1 ? a1->Translation.X : 0.0f, a1 ? a1->Translation.Y : 0.0f, a1 ? a1->Translation.Z : 0.0f,
+                g_armSkin->bTransformFromAnimParent, g_armSkin->m_bReallyInheritTransformFromAnimParent, g_viewFov,
+                sqrtf(v.X * v.X + v.Y * v.Y));
+        }
+    }
 }
 
 static void UpdateCoat() {
@@ -1193,7 +2971,8 @@ static void UpdateCoat() {
     static DWORD coatLast = 0;
     {
         DWORD nowC = GetTickCount();
-        float dtC = coatLast ? Clamp((nowC - coatLast) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+        static LONGLONG qpc12 = 0;
+        float dtC = QpcDt(qpc12);   // (frame-accurate; was GetTickCount steps)
         coatLast = nowC;
         // Sprinting: the coat flaps into view - hide it the same way (user), back when slowing down.
         bool sprinting = false;
@@ -1228,20 +3007,38 @@ static void UpdateCoat() {
     // Shadow arms follow what each hand holds (eased so drawing/holstering doesn't pop).
     {
         static DWORD lastW = 0;
+        static bool wasBusyW[2] = { false, false };   // busy -> free edge per hand (post-holster hold below)
+        static DWORD freeAtW[2] = { 0, 0 };
         DWORD nowW = GetTickCount();
         float dtW = lastW ? Clamp((nowW - lastW) / 1000.0f, 0.0f, 0.1f) : 0.0f;
         lastW = nowW;
         bool busy[2] = { g_leftHandBusy, g_rightHandBusy };
         for (int h = 0; h < 2; ++h)
-            g_weaponRaise[h] += Clamp((busy[h] && g_cfg.shadowWeaponArms ? 1.0f : 0.0f) - g_weaponRaise[h], -dtW * 5.0f, dtW * 5.0f);
+        {
+            // Lowering after a holster runs slower while the arm skin shows it (ArmSkinLowerTime): the drawn arm comes
+            // down from where the game's arm was instead of popping in at the side (user 22:57).
+            float fall = (g_armSkinOn && g_cfg.armSkinHandoff && g_cfg.armSkinLowerTime > 0.05f) ? 1.0f / g_cfg.armSkinLowerTime : 5.0f;
+            // ...and only once the game's arm has left the view (it is still putting the item away): ours then starts at
+            // that hand and comes back to the side. Only for 1 s after the holster and not under the jump pose - the game's
+            // holstered sprint/jump animations bring a 1P hand into view too, which held the reach for the whole sprint/jump.
+            if (wasBusyW[h] && !busy[h]) freeAtW[h] = nowW;
+            wasBusyW[h] = busy[h];
+            g_handFreeMs[h] = busy[h] ? 0u : freeAtW[h] ? nowW - freeAtW[h] : 0x7FFFFFFFu;
+            if (g_armSkinOn && g_cfg.armSkinHandoff && !busy[h] && g_onePHandOnScreen[h] && g_handFreeMs[h] < 1000 &&
+                JumpArmAmount(h) <= 0.05f) fall = 0.0f;
+            g_weaponRaise[h] += Clamp(((busy[h] || g_handDrawing[h]) && g_cfg.shadowWeaponArms ? 1.0f : 0.0f) - g_weaponRaise[h],
+                                      -dtW * fall, dtW * 5.0f);
+        }
     }
     // Both bodies get the same pose controls; only the visible one hides its coat and busy arms. The shadow body
     // keeps them, so the shadow always has a coat and (fake) arms.
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
-    for (int ci = 0; ci < 2; ++ci) {
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
+    for (int ci = 0; ci < 4; ++ci) {
     USkeletalMeshComponent* comp = comps[ci];
     if (!comp) continue;
-    bool isShadow = ci == 1;
+    bool isShadow = ci >= 1;
+    // (14:08 clip: with the casting body's hand IK following the real arm, the fixed ShadowArmPose shoulder/elbow raise
+    // on top of it hunched the shoulders - it is off for that body; UpdateCastingArmReach owns its weapon arm.)
     for (int b = 0; b < 12; ++b) {
         FName name(kCoatBones[b]);
         auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(name));
@@ -1272,7 +3069,7 @@ static void UpdateCoat() {
             ctl->bApplyRotation = 1;
             ctl->bAddRotation = 1;
             ctl->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;
-            float weapon = (isShadow && !g_cfg.armIK && !g_cfg.fpArmShadow) ? g_weaponRaise[b == 6 ? 0 : 1] : 0.0f;
+            float weapon = (isShadow && comp != g_holsterCast && !g_cfg.armIK && !g_cfg.fpArmShadow && !(g_armSkinOn && g_cfg.armSkinHandoff)) ? g_weaponRaise[b == 6 ? 0 : 1] : 0.0f;   // (skin on: UpdateArmSkinReach poses it)
             if (weapon > 0.0f) {
                 // Shadow body, hand holding a weapon/power: raise the forearm in PLAYER space (forward/up, then in
                 // toward the middle). In bone space the elbow hinge follows the idle arm's twist and the forearm
@@ -1308,19 +3105,25 @@ static void UpdateCoat() {
             // 14-55-18; they only showed when the sprint swing brought them forward). Swing them forward from the
             // shoulder as the view tilts down, visible body only.
             float down = Clamp(-g_viewPitchDeg / 45.0f, 0.0f, 1.0f) * (1.0f - crouchAmount);
-            bool forward = !hide && !isShadow && g_cfg.armForwardDeg != 0.0f && down > 0.01f;
-            float fwdDeg = forward ? g_cfg.leanSign * g_cfg.armForwardDeg * down : 0.0f;
+            // (the arm skin copies the shadow body's pose - it needs the swing too, or looking down the arms stayed out
+            // of view, 17:10)
+            bool forward = !hide && (!isShadow || g_armSkinOn) && g_cfg.armForwardDeg != 0.0f && down > 0.01f;
+            float fwdDeg = forward ? g_cfg.leanSign * g_cfg.armForwardDeg * down * (1.0f - g_cfg.armForwardSprintCut * g_sprintBackAmount) : 0.0f;
             float rollDeg = spread ? side * g_cfg.armSpreadDeg * crouchAmount : 0.0f;
+            // Standing / walking: a little away from the body (left arm left, right arm right) so the hands clear the coat.
+            if (!hide && g_cfg.armStandSpreadDeg != 0.0f) { rollDeg += side * g_cfg.armStandSpreadDeg * (1.0f - crouchAmount); spread = true; }
             // Jumping/falling with that hand free: the arm floats up in front (user reference), back to the side on landing.
             float jumpArm = hide ? 0.0f : JumpArmAmount(b == 4 ? 0 : 1);
             if (jumpArm > 0.0f) {
-                fwdDeg += g_cfg.leanSign * g_cfg.jumpArmRaise * jumpArm;
-                rollDeg = rollDeg * (1.0f - jumpArm) - side * g_cfg.jumpArmIn * jumpArm;
+                // ...and moves with the body (jump hands): lifts as you fall, trails sideways moves and turns.
+                float sway = g_cfg.jumpHands ? 1.0f : 0.0f;
+                fwdDeg += g_cfg.leanSign * (g_cfg.jumpArmRaise + sway * g_jumpSwayRaise) * jumpArm;
+                rollDeg = rollDeg * (1.0f - jumpArm) + (-side * g_cfg.jumpArmIn + sway * g_jumpSwayRoll) * jumpArm;
                 forward = true;
             }
             // Shadow body: an arm whose hand holds a weapon/power is raised forward like the 1P arm (the shadow
             // kept the idle arms-down pose with weapons out, user screenshot), and pulled in a little.
-            float weapon = (isShadow && !g_cfg.armIK && !g_cfg.fpArmShadow) ? g_weaponRaise[b == 4 ? 0 : 1] : 0.0f;
+            float weapon = (isShadow && comp != g_holsterCast && !g_cfg.armIK && !g_cfg.fpArmShadow && !(g_armSkinOn && g_cfg.armSkinHandoff)) ? g_weaponRaise[b == 4 ? 0 : 1] : 0.0f;   // (skin on: UpdateArmSkinReach poses it)
             if (weapon > 0.0f) {
                 ArmPose pose = ShadowArmPose(b == 4 ? 0 : 1);
                 fwdDeg += g_cfg.leanSign * pose.raise * weapon;
@@ -1369,7 +3172,8 @@ static void UpdateHands(ADishonoredPlayerPawn* pawn) {
     if (!pawn || !pawn->m_pInventory) return;
     UDishonoredInventory* inv = pawn->m_pInventory;
     auto* slots = reinterpret_cast<RawArray*>(&inv->m_Slots);
-    bool busy[3] = { false, false, false };
+    bool busy[3] = { false, false, false }, holstered[3] = { false, false, false }, unseen[3] = { false, false, false };
+    int meshState[3] = { -1, -1, -1 };   // item's 1P mesh: -1 none, else attached*2 + visible
     std::string names[3];
     for (int usage = 1; usage <= 2; ++usage) {
         int slot = inv->m_EquipUsageInfo[usage].m_iEquippedSlot;
@@ -1377,10 +3181,62 @@ static void UpdateHands(ADishonoredPlayerPawn* pawn) {
         auto* item = *reinterpret_cast<UObject**>(static_cast<uint8_t*>(slots->Data) + slot * 12);
         if (!item || !item->Class) continue;
         names[usage] = item->Class->GetName();
-        busy[usage] = names[usage].find("Empty") == std::string::npos;
+        // An item still equipped but put away (UDishonoredInventoryItem::m_CurSocket = ItemSocket_Holstered) leaves the
+        // hand free too (20:31 clip: sword holstered but still the equipped item - the body's right arm hid for a 1P arm
+        // that wasn't there, so there was no right arm at all).
+        auto* invItem = item->IsA(UDishonoredInventoryItem::StaticClass()) ? static_cast<UDishonoredInventoryItem*>(item) : nullptr;
+        holstered[usage] = invItem && invItem->m_CurSocket == EItemSocket::ItemSocket_Holstered;
+        // Equipped and "in hand" but its first-person model isn't showing (21:54 clip: the sword stayed the equipped item,
+        // never holstered, while no 1P sword arm was drawn - the body's right arm hid for an arm that wasn't there).
+        // Items without a 1P model (powers) can't be judged this way and keep the old rule.
+        if (invItem && invItem->m_pPlayerMesh) {
+            UPrimitiveComponent* pm = invItem->m_pPlayerMesh;
+            meshState[usage] = (pm->bAttached ? 2 : 0) + (pm->HiddenGame ? 0 : 1);
+            unseen[usage] = !pm->bAttached || pm->HiddenGame;
+        }
+        busy[usage] = names[usage].find("Empty") == std::string::npos && !holstered[usage] && !unseen[usage];
         g_handItem[usage == 2 ? 0 : 1] = busy[usage] ? item : nullptr;
     }
     for (int usage = 1; usage <= 2; ++usage) if (!busy[usage]) g_handItem[usage == 2 ? 0 : 1] = nullptr;
+    // Quiet hands (18:4x, user: drew the crossbow, then could neither fire nor switch - Daud's package finished 0.1 s into
+    // the crossbow's draw and the character swap replaced the 1P arms mesh mid-animation): what the hands hold, and the
+    // newest animation of each held item (its anim state component's sequence history), so the swap can wait for idle.
+    {
+        static UObject* lastItem[3] = {};
+        static int lastMesh[3] = { -2, -2, -2 };
+        static bool lastBusy[3] = {};
+        static std::string lastSeq[3];
+        static DWORD lastSeqLog = 0;
+        std::string seq[3];
+        bool allIdle = true, changed = false;
+        for (int usage = 1; usage <= 2; ++usage) {
+            int slot = inv->m_EquipUsageInfo[usage].m_iEquippedSlot;
+            UObject* item = (slot >= 0 && slot < slots->Num && slots->Data) ? *reinterpret_cast<UObject**>(static_cast<uint8_t*>(slots->Data) + slot * 12) : nullptr;
+            if (item != lastItem[usage] || meshState[usage] != lastMesh[usage] || busy[usage] != lastBusy[usage]) changed = true;
+            lastItem[usage] = item; lastMesh[usage] = meshState[usage]; lastBusy[usage] = busy[usage];
+            if (!item || !busy[usage] || !item->IsA(UDishonoredInventoryItem::StaticClass())) continue;
+            UDisAnimStateComponent* asc = static_cast<UDishonoredInventoryItem*>(item)->m_pAnimStateCompPlayer;
+            if (!asc || IsBadReadPtr(asc, sizeof(UDisAnimStateComponent))) continue;
+            int i = asc->m_iCurNewestSeqInHistory;
+            if (i < 0 || i >= 12) continue;
+            const FName& n = asc->m_AnimSeqHistory[i].m_SeqName;
+            if (n.FNameEntryId <= 0 || !n.IsValid()) continue;
+            seq[usage] = n.ToString();
+            std::string low = seq[usage];
+            for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            if (low.find("idle") == std::string::npos) allIdle = false;
+        }
+        if (changed) g_handsChangedTick = GetTickCount();
+        if (seq[1] != lastSeq[1] || seq[2] != lastSeq[2]) {
+            g_handSeqChangedTick = GetTickCount();
+            if (GetTickCount() - lastSeqLog > 250) {
+                lastSeqLog = GetTickCount();
+                Log("hands anim: right %s, left %s%s", seq[1].empty() ? "-" : seq[1].c_str(), seq[2].empty() ? "-" : seq[2].c_str(), allIdle ? " (idle)" : "");
+            }
+            lastSeq[1] = seq[1]; lastSeq[2] = seq[2];
+        }
+        g_handsAllIdle = allIdle;
+    }
     // What each hand holds, for the shadow arm pose: 1 sword, 2 gun (pistol/crossbow), 3 power or other.
     for (int usage = 1; usage <= 2; ++usage) {
         const std::string& n = names[usage];
@@ -1389,10 +3245,18 @@ static void UpdateHands(ADishonoredPlayerPawn* pawn) {
         g_handKind[usage == 2 ? 0 : 1] = kind;
     }
     if (busy[1] != g_rightHandBusy || busy[2] != g_leftHandBusy)
-        Log("hands: right %s (%s), left %s (%s)", busy[1] ? "busy" : "free", names[1].c_str(),
-            busy[2] ? "busy" : "free", names[2].c_str());
+        Log("hands: right %s (%s%s%s, 1P mesh %d), left %s (%s%s%s, 1P mesh %d)", busy[1] ? "busy" : "free", names[1].c_str(),
+            holstered[1] ? ", holstered" : "", unseen[1] ? ", not shown" : "", meshState[1], busy[2] ? "busy" : "free",
+            names[2].c_str(), holstered[2] ? ", holstered" : "", unseen[2] ? ", not shown" : "", meshState[2]);
     g_rightHandBusy = busy[1];
     g_leftHandBusy = busy[2];
+    static DWORD drawSince[3] = { 0, 0, 0 };   // (log 23:00: the sword turns busy ~240 ms into its draw)
+    for (int usage = 1; usage <= 2; ++usage) {
+        bool d = !busy[usage] && unseen[usage] && !holstered[usage] && !names[usage].empty() &&
+                 names[usage].find("Empty") == std::string::npos;
+        if (!d) drawSince[usage] = 0; else if (!drawSince[usage]) drawSince[usage] = GetTickCount();
+        g_handDrawing[usage == 2 ? 0 : 1] = d && GetTickCount() - drawSince[usage] < 600;
+    }
 }
 
 // Diagnostic for "head shadow slides back when crouching": every 2 s while crouched (and once standing), log the
@@ -1420,7 +3284,6 @@ static void DiagHeadShadow() {
 // grenades...) is kept in the shadow body's hand. Each frame the real model's transform relative to the 1P arms'
 // hand bone is measured and re-applied relative to the shadow body's hand bone, so whatever pose the shadow arm
 // has, the item sits in its hand the way the game holds it. Row-vector affine transforms (UE3 FMatrix layout).
-struct Xf { float m[3][3]; float t[3]; };
 
 static Xf g_armsShadowUnpitch = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { 0, 0, 0 } };   // arm/item shadow view-pitch undo
 
@@ -1491,6 +3354,29 @@ static void XfDecompose(const Xf& x, FVector& loc, FRotator& rot, float& scale) 
 // World transform of a bone, read straight from SpaceBases (component-space FBoneAtom: quat, translation, scale)
 // times the component's LocalToWorld. Not GetBoneMatrix: its FMatrix return through ProcessEvent overran the
 // stack and crashed on startup (build 83).
+// A bone's pose in its mesh's own space: SpaceBases only (the FBoneAtom quat/translation/scale), no mesh origin and no
+// LocalToWorld. (20:25: the hidden shadow body's LocalToWorld lags while moving - its GetBoneLocation trailed the
+// drawn arm skin by tens of uu sprinting - so the skin's bones are built from this x our own placement instead.)
+static bool BoneAtomXf(USkeletalMeshComponent* comp, const char* bone, Xf& out) {
+    if (!comp || !comp->SkeletalMesh) return false;
+    FName name(bone);
+    if (name.FNameEntryId < 0) return false;
+    int idx = comp->MatchRefBone(name);
+    auto* bases = reinterpret_cast<RawArray*>(&comp->SpaceBases);
+    if (idx < 0 || !bases->Data || idx >= bases->Num) return false;
+    const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(bases->Data) + idx * 32);
+    float x = a[0], y = a[1], z = a[2], w = a[3], sc = a[7];
+    if (!(sc > 0.0f && sc < 100.0f)) sc = 1.0f;
+    float x2 = x + x, y2 = y + y, z2 = z + z;
+    float xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2;
+    float wx = w * x2, wy = w * y2, wz = w * z2;
+    out.m[0][0] = (1.0f - (yy + zz)) * sc; out.m[0][1] = (xy + wz) * sc;          out.m[0][2] = (xz - wy) * sc;
+    out.m[1][0] = (xy - wz) * sc;          out.m[1][1] = (1.0f - (xx + zz)) * sc; out.m[1][2] = (yz + wx) * sc;
+    out.m[2][0] = (xz + wy) * sc;          out.m[2][1] = (yz - wx) * sc;          out.m[2][2] = (1.0f - (xx + yy)) * sc;
+    out.t[0] = a[4]; out.t[1] = a[5]; out.t[2] = a[6];
+    return true;
+}
+
 static bool BoneXf(USkeletalMeshComponent* comp, const char* bone, Xf& out) {
     if (!comp || !comp->SkeletalMesh) return false;
     FName name(bone);
@@ -1682,9 +3568,925 @@ static bool ArmsCopyBoneXf(ADishonoredPlayerPawn* pawn, const char* bone, Xf& ou
         if (want == hidden[h]) continue;
         FName bone(kArmRoots[h]);
         if (bone.FNameEntryId < 0) continue;
-        if (want) g_armsShadow->HideBoneByName(bone, EPhysBodyOp::PBO_None);
-        else g_armsShadow->UnHideBoneByName(bone);
+        // (21:55: HideBone is physics-only in this game and UnHideBone enables collision bodies - not called. The copy is
+        // scaled to nothing when no hand is busy, below.)
+        (void)bone;
         hidden[h] = want;
+    }
+}
+
+// Is the game's own 1P hand in view? (handover: one arm on screen at a time.) Called right after UpdateHands so UpdateCoat
+// and UpdateArmSkin read this frame's answer. Wrist, middle fingertip and mid-forearm are tested (fingers reach ~10 uu past
+// the wrist) against the frame + 2 uu; once in view a hand stays "in" until 5 uu out (no edge flicker).
+static void UpdateOnePHandOnScreen(ADishonoredPlayerPawn* pawn) {
+    static DWORD offSince[2] = { 0, 0 };
+    DWORD now = GetTickCount();
+    USkeletalMeshComponent* arms = pawn ? pawn->Mesh : nullptr;
+    bool ok = arms && arms->SkeletalMesh && now - g_viewLocTick < 500;   // (stale view: the rigid-camera hook bailed out)
+    Xf vw = XfFromRotator(g_viewRot, g_viewLoc);
+    Xf L1 = ok ? XfFromMatrix(arms->LocalToWorld) : vw;   // bone atom x LocalToWorld = GetBoneMatrix (LocalToWorld has the mesh origin)
+    float tv = tanf(g_viewFov * 0.5f * 0.0174533f) * 0.75f;   // POV.FOV is the 4:3 horizontal FOV (Hor+): vertical half-tangent
+    static float aspect = 16.0f / 9.0f;
+    RECT rc;
+    HWND wnd = GetActiveWindow();
+    if (wnd && GetClientRect(wnd, &rc) && rc.bottom > 0 && rc.right > 0) aspect = static_cast<float>(rc.right) / rc.bottom;
+    float th = tv * aspect;
+    // (23:44 clip: two right hands in a draw - the 1P arms are drawn relative to the camera, not where their LocalToWorld
+    // puts them; the reach log said 0.1 uu while the hands were a hand-width apart. Each 1P point is taken relative to the
+    // 1P camera_jnt and put at the real view point - the arm-shadow trick, as UpdateClimbArms does.)
+    Xf camA;
+    bool haveCam = ok && BoneAtomXf(arms, "camera_jnt", camA);
+    Xf camW = haveCam ? XfMul(camA, L1) : vw;
+    auto vis = [&](const Xf& wx) {
+        return haveCam ? FVector{ g_viewLoc.X + wx.t[0] - camW.t[0], g_viewLoc.Y + wx.t[1] - camW.t[1], g_viewLoc.Z + wx.t[2] - camW.t[2] }
+                       : FVector{ wx.t[0], wx.t[1], wx.t[2] };
+    };
+    for (int s = 0; s < 2; ++s) {
+        bool in = false, below = false;
+        FVector pts[3];
+        int n = 0;
+        Xf a, w, e;
+        if (ok && BoneAtomXf(arms, kHandBones[s], a)) {
+            w = XfMul(a, L1);
+            pts[n++] = vis(w);
+            if (BoneAtomXf(arms, kFingerBones[s][5], a)) { e = XfMul(a, L1); pts[n++] = vis(e); }
+            if (BoneAtomXf(arms, kLowerArmBones[s], a)) {
+                e = XfMul(a, L1);
+                FVector pw = vis(w), pe = vis(e);
+                pts[n++] = FVector{ (pw.X + pe.X) * 0.5f, (pw.Y + pe.Y) * 0.5f, (pw.Z + pe.Z) * 0.5f };
+            }
+        }
+        float m = g_onePHandOnScreen[s] ? 5.0f : 2.0f;
+        for (int i = 0; i < n; ++i) {
+            FVector d{ pts[i].X - g_viewLoc.X, pts[i].Y - g_viewLoc.Y, pts[i].Z - g_viewLoc.Z };
+            float f = d.X * vw.m[0][0] + d.Y * vw.m[0][1] + d.Z * vw.m[0][2];
+            float r = d.X * vw.m[1][0] + d.Y * vw.m[1][1] + d.Z * vw.m[1][2];
+            float u = d.X * vw.m[2][0] + d.Y * vw.m[2][1] + d.Z * vw.m[2][2];
+            if (f > 1.0f && fabsf(r) < f * th + m && fabsf(u) < f * tv + m) in = true;
+            if (i == 0) below = u < 0.0f && (f <= 1.0f || -u > f * tv);   // the wrist: under the bottom edge (or behind the view)
+        }
+        if (in) offSince[s] = 0; else if (!offSince[s]) offSince[s] = now;
+        g_onePHandOnScreen[s] = in;
+        g_onePHandBelow[s] = !in && below;
+        g_onePHandOffMs[s] = in ? 0 : now - offSince[s];
+    }
+}
+
+static float g_armsFov = 0.0f;   // the camera's arms FOV (m_fCurFOV_Arms; diagnostic, HookedGetPlayerViewPoint)
+
+// Handover (user 23:01: "make the unholstered arms look like the same arms as the holstered ones"): while the reach blends
+// (g_weaponRaise) the shadow body's arm - which the arm skin draws - goes to the game's own 1P hand: position, rotation,
+// elbow toward the 1P elbow. Aimed in the shadow body's component space through the frame the skin is drawn with
+// (g_skinFrame; the placement check confirms it): world/actor-space targets go through the shadow body's own LocalToWorld.
+// Runs after UpdateArmIK / UpdateArmsShadow / PlaceJumpArm, with or without the arm shadow (PlayerShadows=0 turns that off
+// - the 23:01 build ran none of the reach).
+static void UpdateArmSkinReach(ADishonoredPlayerPawn* pawn) {
+    if (!g_shadowBody) return;
+    USkeletalMeshComponent* arms = pawn ? pawn->Mesh : nullptr;
+    Xf inv = g_skinFrame, L1 = g_skinFrame;
+    bool on = g_armSkinOn && g_cfg.armSkinHandoff && g_skinFrameOk && arms && arms->SkeletalMesh && XfInv(g_skinFrame, inv);
+    if (on) L1 = XfFromMatrix(arms->LocalToWorld);
+    // Where the 1P arms are DRAWN: relative to their camera_jnt, at the real view point (see UpdateOnePHandOnScreen).
+    Xf camA, camW = L1;
+    bool haveCam = on && BoneAtomXf(arms, "camera_jnt", camA) && GetTickCount() - g_viewLocTick < 500;
+    if (haveCam) camW = XfMul(camA, L1);
+    auto drawn = [&](Xf wx) {
+        if (haveCam) { wx.t[0] += g_viewLoc.X - camW.t[0]; wx.t[1] += g_viewLoc.Y - camW.t[1]; wx.t[2] += g_viewLoc.Z - camW.t[2]; }
+        return wx;
+    };
+    for (int h = 0; h < 2; ++h) {
+        auto* ik = static_cast<USkelControlLimb*>(g_shadowBody->FindSkelControl(FName(kHandBones[h])));
+        if (!ik) continue;
+        ik->JointTargetLocationSpace = EBoneControlSpace::BCS_ActorSpace;   // UpdateArmIK wrote the actor-space pole this frame
+        if (!on) continue;
+        // A hidden side gets no reach at all (user 23:44, "two sets of arms ... the playermodel arms behind the weapon holding
+        // arms" the whole time a weapon was out): the side is hidden by shrinking the shoulder (UpdateArmSkin), and the limb
+        // IK rebuilds upper arm / forearm / hand from the reference bone lengths - a full-size arm again, reaching the 1P hand
+        // from behind it. (PlayerShadows=0 turns fpArmShadow off, so the old skip never ran.) The reach comes back the frame
+        // the side shows (UpdateArmSkin runs first), already at the 1P hand.
+        if (!g_skinArmShown[h]) {
+            ik->ControlStrength = ik->StrengthTarget = 0.0f;
+            if (auto* wrist = static_cast<USkelControlSingleBone*>(g_shadowBody->FindSkelControl(FName(kWristControlNames[h]))))
+                if (JumpArmAmount(h) <= 0.0f) wrist->ControlStrength = wrist->StrengthTarget = 0.0f;
+            continue;
+        }
+        float jump = JumpArmAmount(h);   // (0 for a busy hand) the jump pose owns a free arm
+        float s = g_weaponRaise[h] * (1.0f - jump);
+        if (g_viewPitchDeg > g_cfg.armSkinReachMaxPitch) s = 0.0f;   // looking up: no reach (the arm stays at the side, out of view)
+        ik->ControlStrength = ik->StrengthTarget = s;
+        Xf a1;
+        if (s <= 0.0f || !BoneAtomXf(arms, kHandBones[h], a1)) continue;
+        Xf w1raw = XfMul(a1, L1);
+        Xf c1 = XfMul(drawn(w1raw), inv);   // the 1P hand as drawn -> shadow pose space
+        ik->EffectorLocationSpace = EBoneControlSpace::BCS_ComponentSpace;
+        ik->EffectorLocation = FVector{ c1.t[0], c1.t[1], c1.t[2] };
+        {
+            static DWORD lastReachLog = 0;
+            if (g_armSkin && s > 0.9f && g_skinArmShown[h] && GetTickCount() - lastReachLog > 500) {
+                lastReachLog = GetTickCount();
+                FVector k = g_armSkin->GetBoneLocation(FName(kHandBones[h]), 0);
+                Xf w1 = drawn(w1raw);
+                float dx = k.X - w1.t[0], dy = k.Y - w1.t[1], dz = k.Z - w1.t[2];
+                float ox = w1.t[0] - w1raw.t[0], oy = w1.t[1] - w1raw.t[1], oz = w1.t[2] - w1raw.t[2];
+                Log("arm skin reach: %s skin hand - drawn 1P hand %.1f uu (last frame's target) | drawn vs LocalToWorld %.1f uu "
+                    "(camera_jnt %s) | fov world %.1f arms %.1f", h ? "right" : "left", sqrtf(dx * dx + dy * dy + dz * dz),
+                    sqrtf(ox * ox + oy * oy + oz * oz), haveCam ? "found" : "MISSING", g_viewFov, g_armsFov);
+            }
+        }
+        Xf e1;
+        if (BoneAtomXf(arms, kLowerArmBones[h], e1)) {   // elbow toward the 1P elbow: the forearm comes in at its angle
+            Xf ce = XfMul(drawn(XfMul(e1, L1)), inv);
+            ik->JointTargetLocationSpace = EBoneControlSpace::BCS_ComponentSpace;
+            ik->JointTargetLocation = FVector{ ce.t[0], ce.t[1], ce.t[2] };
+        }
+        // The hand turned as the 1P hand is (the skin is the 1P arms model - same bind - so the drawn hands match).
+        // The wrist control runs after the IK on hand_X; UpdateJumpHands zeroes it every frame when not jumping.
+        if (jump <= 0.0f) {
+            if (auto* wrist = static_cast<USkelControlSingleBone*>(g_shadowBody->FindSkelControl(FName(kWristControlNames[h])))) {
+                FVector l; FRotator r; float sc;
+                XfDecompose(c1, l, r, sc);
+                wrist->BoneRotationSpace = EBoneControlSpace::BCS_ComponentSpace;
+                wrist->bAddRotation = 0;
+                wrist->bApplyRotation = 1;
+                wrist->BoneRotation = r;
+                wrist->ControlStrength = wrist->StrengthTarget = s;
+            }
+        }
+    }
+}
+
+// A bone's component-space rotation (its SpaceBases atom's quaternion), x y z w.
+static bool BoneQuat(USkeletalMeshComponent* comp, const char* bone, float q[4]) {
+    if (!comp || !comp->SkeletalMesh) return false;
+    FName name(bone);
+    if (name.FNameEntryId < 0) return false;
+    int idx = comp->MatchRefBone(name);
+    auto* bases = reinterpret_cast<RawArray*>(&comp->SpaceBases);
+    if (idx < 0 || !bases->Data || idx >= bases->Num) return false;
+    const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(bases->Data) + idx * 32);
+    q[0] = a[0]; q[1] = a[1]; q[2] = a[2]; q[3] = a[3];
+    return true;
+}
+
+// A bone's parent-space rotation as the animation left it this frame (its LocalAtoms atom's quaternion), x y z w.
+static bool BoneAnimLocalQuat(USkeletalMeshComponent* comp, const char* bone, float q[4]) {
+    if (!comp || !comp->SkeletalMesh) return false;
+    FName name(bone);
+    if (name.FNameEntryId < 0) return false;
+    int idx = comp->MatchRefBone(name);
+    auto* local = reinterpret_cast<RawArray*>(&comp->LocalAtoms);
+    if (idx < 0 || !local->Data || idx >= local->Num) return false;
+    const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(local->Data) + idx * 32);
+    q[0] = a[0]; q[1] = a[1]; q[2] = a[2]; q[3] = a[3];
+    float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    return n > 0.9f && n < 1.1f;
+}
+
+// Bones' space -> the mesh's (component) space: the mesh Origin, then its RotOrigin - the order the skin frame uses
+// (ArmSkinOriginFix; the body's is Origin (0 97 0), RotOrigin yaw -90 / roll 90, so leaving it out puts a target a
+// quarter turn and ~100 uu off). Bones -> world is MeshOriginXf x component local x owner.
+static Xf MeshOriginXf(USkeletalMesh* m) {
+    if (!g_cfg.armSkinOriginFix) return XfFromRotator(m->RotOrigin, m->Origin);
+    Xf o = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { m->Origin.X, m->Origin.Y, m->Origin.Z } };
+    return XfMul(o, XfFromRotator(m->RotOrigin, FVector{ 0, 0, 0 }));
+}
+
+// A node of this class in an anim tree (depth-first; only blend nodes have children, laid out as ChildAnim reads them).
+static UAnimNode* FindAnimNodeOfClass(UAnimNode* node, UClass* cls, int depth) {
+    if (!node || !cls || depth > 24) return nullptr;
+    if (node->Class == cls) return node;
+    if (!node->IsA(UAnimNodeBlendBase::StaticClass())) return nullptr;
+    auto* children = reinterpret_cast<RawArray*>(&static_cast<UAnimNodeBlendBase*>(node)->Children);
+    if (!children->Data) return nullptr;
+    for (int i = 0; i < children->Num && i < 64; ++i) {
+        UAnimNode* c = *reinterpret_cast<UAnimNode**>(static_cast<uint8_t*>(children->Data) + i * 0x50 + 8);
+        if (UAnimNode* f = FindAnimNodeOfClass(c, cls, depth + 1)) return f;
+    }
+    return nullptr;
+}
+
+// The sword's melee-block context (a UDisItemContext_MeleeBlockPlayer in the item's m_ContextSlots_Parry_Player): its
+// m_BlockState is StartBlock 0 (also the fresh value), Blocking 1, Block_Parry 2, Block_Cancel 3 - and stays 3 after a
+// block (15:10 log: state 1 only while the user blocked; the 1P arms' tree has no block node). -1: no such context.
+static int BlockContextState() {
+    static int lastSt = -2;
+    int st = -1;
+    if (g_rightHandBusy && g_handItem[1]) {
+        auto* item = static_cast<UDishonoredInventoryItem*>(g_handItem[1]);
+        auto* arr = reinterpret_cast<RawArray*>(&item->m_ContextSlots_Parry_Player);
+        if (arr->Data && arr->Num > 0 && arr->Num <= 32) {
+            for (int i = 0; i < arr->Num; ++i) {
+                auto* c = static_cast<UDisItemContext**>(arr->Data)[i];
+                if (c && c->IsA(UDisItemContext_MeleeBlockPlayer::StaticClass())) { st = static_cast<int>(static_cast<UDisItemContext_MeleeBlockPlayer*>(c)->m_BlockState); break; }
+            }
+        }
+    }
+    if (st != lastSt) { lastSt = st; Log("block: context state %d", st); }
+    return st;
+}
+
+// Is the player blocking with the sword? The 1P arms' tree has a DisAnimNodeBlendByMeleeBlockState (the game drives it
+// Intro / Loop / Cancel / Parry while blocking); its total weight in the tree is the block. Found once per tree.
+// Returns -1 when the node isn't there (then the caller falls back to the out-of-view rule).
+static float BlockWeight(USkeletalMeshComponent* arms) {
+    static UAnimNode* node = nullptr;
+    static UAnimNode* forRoot = nullptr;
+    static DWORD lastTry = 0;
+    if (!arms || !arms->Animations) { node = nullptr; forRoot = nullptr; return -1.0f; }
+    if (forRoot != arms->Animations || (!node && GetTickCount() - lastTry > 2000)) {
+        forRoot = arms->Animations;
+        lastTry = GetTickCount();
+        node = FindAnimNodeOfClass(arms->Animations, UDisAnimNodeBlendByMeleeBlockState::StaticClass(), 0);
+        Log("block node %s on the 1P arms' tree%s", node ? "found" : "not found", node ? "" : " (the out-of-view rule stands in for the off-hand)");
+    }
+    return node ? node->NodeTotalWeight : -1.0f;
+}
+
+// Casting body (13:48 clip: the shadow arm held the fixed ShadowArmPose while the 1P arm swung): its weapon-side hand
+// follows the 1P hand as DRAWN - the same target UpdateArmSkinReach uses (1P hand relative to its camera_jnt, at the real
+// view point) - into THIS body's own component frame, at the full weapon strength and never gated by the skin's show /
+// look-up rules: this body is never drawn, so it cannot double the 1P arm. The elbow pole follows the 1P elbow and the
+// wrist takes the 1P hand's rotation, so the item copy riding this hand (UpdateItemShadows) sits where the real item is.
+// The IK's hinge (17:28 log; 17:4x review). UE3's limb solver builds each arm bone from two directions: BoneAxis along
+// the limb, and JointAxis along the NORMAL of the plane the arm bends in (desired direction x joint-target direction),
+// negated by bInvertJointAxis - the hinge. JointAxis Y is the hinge on this rig (MODLOG 15:44), but which way round it
+// points is the rig's (and the rig is mirrored), and PlaceJumpArm clears bInvertJointAxis every frame. With the wrong
+// sign each bone is turned half round about its length: the elbow still lands where it should, but the skin blended
+// between the collar bone and a half-turned upper arm collapses to a line (the notch at the shoulder, the arm "floating
+// below it"), and so does the wrist between a half-turned forearm and the hand. The 17:28 log has that signature: the
+// IK'd upper arm 167-180 deg from its rest rotation (a half turn composed with any swing is a half turn).
+// The sign is learned off this body's own animated arm while the IK has been off for a few frames (SpaceBases are the
+// last evaluation's): the bend-plane normal (H-E) x (E-S) - the solver's normal for the same bend - in the upper arm's
+// frame; the sign of its Y is the rig's. Then a check on the result: at full strength an upper arm still reading a half
+// turn from rest for CHECK frames flips that arm's sign once (and back once more if that reads a half turn too).
+struct ArmRoll {
+    float acc[3], accLow[3], weight;   // hinge normal in the upper arm's / forearm's frame, bend-angle weighted
+    float bendMax;
+    int samples;
+    bool learned, invert;              // from the animation
+    int offFrames;                     // consecutive frames with the IK off and the body in first person
+    int halfTurnFrames, flips;         // the result check
+    bool checkOff;
+    DWORD lastLog;
+};
+static ArmRoll g_armRoll[2] = {};
+static void ResetArmRoll() { for (auto& r : g_armRoll) r = ArmRoll{}; }
+
+// v in the frame whose axes are the rows of X.m (a bone atom: scaled rows, so normalised here).
+static void InFrame(const Xf& X, const float v[3], float out[3]) {
+    for (int i = 0; i < 3; ++i) {
+        float n = sqrtf(X.m[i][0] * X.m[i][0] + X.m[i][1] * X.m[i][1] + X.m[i][2] * X.m[i][2]);
+        out[i] = n > 1e-6f ? (v[0] * X.m[i][0] + v[1] * X.m[i][1] + v[2] * X.m[i][2]) / n : 0.0f;
+    }
+}
+
+static bool Finite3(const float v[3]) {
+    for (int i = 0; i < 3; ++i) if (!(v[i] == v[i]) || fabsf(v[i]) > 1e30f) return false;
+    return true;
+}
+
+static void LearnArmHinge(int h) {
+    ArmRoll& r = g_armRoll[h];
+    Xf S, E, H;
+    if (!BoneAtomXf(g_shadowArms, kUpperArmBones[h], S) || !BoneAtomXf(g_shadowArms, kLowerArmBones[h], E) ||
+        !BoneAtomXf(g_shadowArms, kHandBones[h], H)) return;
+    if (!Finite3(S.t) || !Finite3(E.t) || !Finite3(H.t)) return;
+    float u[3] = { E.t[0] - S.t[0], E.t[1] - S.t[1], E.t[2] - S.t[2] }, f[3] = { H.t[0] - E.t[0], H.t[1] - E.t[1], H.t[2] - E.t[2] };
+    float lu = sqrtf(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]), lf = sqrtf(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+    if (lu < 5.0f || lf < 5.0f) return;
+    float n[3] = { f[1] * u[2] - f[2] * u[1], f[2] * u[0] - f[0] * u[2], f[0] * u[1] - f[1] * u[0] };   // (H-E) x (E-S)
+    float ln = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    float bend = atan2f(ln, u[0] * f[0] + u[1] * f[1] + u[2] * f[2]) * 57.29578f;   // 0 = straight arm
+    if (!(bend >= 4.0f) || !(ln > 1e-3f)) return;   // too straight to tell the bend plane
+    for (float& v : n) v /= ln;
+    float a[3], b[3];
+    InFrame(S, n, a);
+    InFrame(E, n, b);
+    if (!Finite3(a) || !Finite3(b)) return;
+    for (int i = 0; i < 3; ++i) { r.acc[i] += a[i] * bend; r.accLow[i] += b[i] * bend; }
+    r.weight += bend;
+    if (r.weight > 20000.0f) { for (int i = 0; i < 3; ++i) { r.acc[i] *= 0.5f; r.accLow[i] *= 0.5f; } r.weight *= 0.5f; }
+    r.samples++;
+    if (bend > r.bendMax) r.bendMax = bend;
+    float m = sqrtf(r.acc[0] * r.acc[0] + r.acc[1] * r.acc[1] + r.acc[2] * r.acc[2]);
+    float share = m > 1e-3f ? fabsf(r.acc[1]) / m : 0.0f;
+    if (r.samples >= 10 && share > 0.7f) {
+        bool inv = r.acc[1] < 0.0f;
+        if (!r.learned || inv != r.invert) Log("arm hinge %s: learned - hinge Y %s the bend normal -> bInvertJointAxis %d (%d samples, Y share %.2f)",
+                                                h ? "right" : "left", inv ? "opposes" : "follows", inv ? 1 : 0, r.samples, share);
+        if (!r.learned || inv != r.invert) { r.flips = 0; r.halfTurnFrames = 0; r.checkOff = false; }   // (review: a flip belongs to the answer it corrected)
+        r.invert = inv;
+        r.learned = true;
+    }
+    if (GetTickCount() - r.lastLog > 2000) {
+        r.lastLog = GetTickCount();
+        float ml = sqrtf(r.accLow[0] * r.accLow[0] + r.accLow[1] * r.accLow[1] + r.accLow[2] * r.accLow[2]);
+        Log("arm hinge %s: elbow bent %.0f deg (max %.0f) | bend normal in the upper arm's frame (%.2f %.2f %.2f) forearm's (%.2f %.2f %.2f) | totals upper Y %+.2f forearm Y %+.2f of 1, %d samples%s",
+            h ? "right" : "left", bend, r.bendMax, a[0], a[1], a[2], b[0], b[1], b[2], m > 1e-3f ? r.acc[1] / m : 0.0f,
+            ml > 1e-3f ? r.accLow[1] / ml : 0.0f, r.samples, r.learned ? "" : " (not learned yet)");
+    }
+}
+
+// The upper arm's rotation from its rest pose right now (from this body's atoms: parent^-1 x upper arm, against the
+// reference skeleton's local rotation), in degrees; -1 if unreadable.
+static float UpperArmFromRest(int h) {
+    float qc[4], qu[4], ref[4];
+    if (!BoneQuat(g_shadowArms, kArmBones[h], qc) || !BoneQuat(g_shadowArms, kUpperArmBones[h], qu) ||
+        !RefLocalQuat(g_shadowArms, kUpperArmBones[h], ref)) return -1.0f;
+    float qcInv[4] = { -qc[0], -qc[1], -qc[2], qc[3] }, refInv[4] = { -ref[0], -ref[1], -ref[2], ref[3] }, local[4], d[4];
+    QuatMul(qcInv, qu, local);
+    QuatMul(local, refInv, d);
+    return 2.0f * acosf(Clamp(fabsf(d[3]), 0.0f, 1.0f)) * 57.29578f;
+}
+
+// One arm on the chain (UpdateClimbHands): built like PlaceJumpArm - world-space rotations for upper arm, forearm and hand
+// from points, no limb IK (its roll can't flip). The elbow from the arm's own lengths, bent toward a pole down, out and
+// back; the roll from the elbow's bend axis (JumpArmRollSign, as the jump hands); the hand turned so its palm faces the
+// chain, fingers up along the forearm (bind-derived axes, FlatHandAxesLocal - the slide's flat hand uses them too).
+static void PlaceClimbArm(USkeletalMeshComponent* comp, int side, float w, const FVector& T, const FVector& towardChain,
+                          const FVector& F, const FVector& R, const FVector& U) {
+    if (!comp || w <= 0.0f) return;
+    auto* upperCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kUpperArmBones[side])));
+    auto* lowerCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kLowerArmBones[side])));
+    auto* handCtl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kWristControlNames[side])));
+    if (!upperCtl || !lowerCtl || !handCtl) return;
+    if (auto* ik = static_cast<USkelControlLimb*>(comp->FindSkelControl(FName(kHandBones[side])))) ik->ControlStrength = ik->StrengthTarget = 0.0f;
+    auto sub = [](const FVector& a, const FVector& b) { return FVector{ a.X - b.X, a.Y - b.Y, a.Z - b.Z }; };
+    auto add = [](const FVector& a, const FVector& b) { return FVector{ a.X + b.X, a.Y + b.Y, a.Z + b.Z }; };
+    auto mul = [](const FVector& a, float k) { return FVector{ a.X * k, a.Y * k, a.Z * k }; };
+    auto dot = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+    auto cross = [](const FVector& a, const FVector& b) { return FVector{ a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X }; };
+    auto len = [&](const FVector& a) { return sqrtf(dot(a, a)); };
+    auto norm = [&](const FVector& a) { float l = len(a); return l > 1e-4f ? mul(a, 1.0f / l) : a; };
+    auto orth = [&](const FVector& v, const FVector& x) { return norm(sub(v, mul(x, dot(v, x)))); };
+    FVector S = comp->GetBoneLocation(FName(kUpperArmBones[side]), 0);
+    FVector Ecur = comp->GetBoneLocation(FName(kLowerArmBones[side]), 0);
+    FVector Hcur = comp->GetBoneLocation(FName(kHandBones[side]), 0);
+    float L1 = len(sub(Ecur, S)), L2 = len(sub(Hcur, Ecur));
+    if (L1 < 5.0f || L2 < 5.0f) return;
+    FVector d = sub(T, S);
+    float D = len(d);
+    if (D < 1e-3f) return;
+    FVector dir = mul(d, 1.0f / D);
+    D = Clamp(D, fabsf(L1 - L2) + 1.0f, (L1 + L2) * 0.97f);
+    float sideSign = side == 0 ? -1.0f : 1.0f;
+    FVector pole = norm(add(add(mul(R, sideSign * 1.0f), mul(U, -0.35f)), mul(F, -0.1f)));   // out to the side, a little down and back (a down/out/back pole is near-opposite an overhead reach and flips - review 18:5x)
+    FVector bendDir = orth(pole, dir);
+    if (dot(bendDir, bendDir) < 0.5f) bendDir = orth(mul(R, sideSign), dir);
+    float a = (L1 * L1 - L2 * L2 + D * D) / (2.0f * D);
+    float hgt = sqrtf(L1 * L1 - a * a > 0.0f ? L1 * L1 - a * a : 0.0f);
+    FVector E = add(add(S, mul(dir, a)), mul(bendDir, hgt));
+    FVector Tc = add(S, mul(dir, D));
+    FVector Xu = norm(sub(E, S)), Xl = norm(sub(Tc, E));
+    FVector bend = cross(Xu, Xl);
+    FVector Yarm = dot(bend, bend) > 1e-4f ? mul(norm(bend), -g_cfg.jumpArmRollSign) : mul(U, 1.0f);
+    FVector Yu = orth(Yarm, Xu), Yl = orth(Yarm, Xl);
+    FVector Xh = Xl, Yh = Yl;
+    FVector fL, pL, tL;
+    if (FlatHandAxesLocal(side, fL, pL, &tL)) {
+        FVector Fw = norm(add(Xl, mul(towardChain, 0.35f)));                       // fingers on along the forearm, a little toward the chain
+        FVector Pw = orth(mul(towardChain, g_cfg.slideLeftHandPalmSign), Fw);       // palm to the chain (the bind's "palm" side maps with the slide's sign)
+        FVector Cw = cross(Fw, Pw);
+        pL = orth(pL, fL);
+        FVector cL = cross(fL, pL);
+        Xh = norm(add(add(mul(Fw, fL.X), mul(Pw, pL.X)), mul(Cw, cL.X)));
+        Yh = orth(add(add(mul(Fw, fL.Y), mul(Pw, pL.Y)), mul(Cw, cL.Y)), Xh);
+        Yl = orth(add(mul(Yl, 0.5f), mul(Yh, 0.5f)), Xl);                          // the forearm turns half way with the hand (no wrist wring)
+    }
+    upperCtl->BoneRotationSpace = lowerCtl->BoneRotationSpace = handCtl->BoneRotationSpace = EBoneControlSpace::BCS_WorldSpace;
+    upperCtl->bAddRotation = lowerCtl->bAddRotation = handCtl->bAddRotation = 0;
+    upperCtl->bApplyRotation = lowerCtl->bApplyRotation = handCtl->bApplyRotation = 1;
+    upperCtl->bApplyTranslation = lowerCtl->bApplyTranslation = handCtl->bApplyTranslation = 0;
+    upperCtl->BoneScale = lowerCtl->BoneScale = 1.0f;
+    upperCtl->BoneRotation = AxesToRotator(Xu, Yu, cross(Xu, Yu));
+    lowerCtl->BoneRotation = AxesToRotator(Xl, Yl, cross(Xl, Yl));
+    handCtl->BoneRotation = AxesToRotator(Xh, Yh, cross(Xh, Yh));
+    upperCtl->ControlStrength = upperCtl->StrengthTarget = w;
+    lowerCtl->ControlStrength = lowerCtl->StrengthTarget = w;
+    handCtl->ControlStrength = handCtl->StrengthTarget = w;
+}
+
+// Hand over hand on a chain/ladder (user 18:55). Each hand holds a point on the chain fixed in the world, so the climb
+// carries it down past the face: that is the pull. Once the holding hand is down at ClimbGripBottom (and the other hand
+// holds) it lets go and reaches, on a small outward arc, to a new grip ClimbGripTop above the eyes; the fingers open on
+// the way and close on the chain. Going down it runs the other way. Still: both hold where they are. Posed onto the
+// arm skin's pose source (g_shadowBody: what the first-person arms draw) through the skin frame, and onto the casting
+// body. Also asks for frames (SelfTestCapture) while climbing, and on the Home key.
+static void UpdateClimbHands(ADishonoredPlayerPawn* pawn) {
+    struct HandState { bool holding; FVector grip; FVector fromRel; float toRel; float t; float dur; };
+    static HandState hs[2];
+    static bool active = false;
+    static LONGLONG qpcH = 0;
+    float dt = QpcDt(qpcH);
+    if (dt > 0.1f) dt = 0.1f;
+    g_climbHandsOn = false;
+    // ---- frame requests (development) ----
+    {
+        static DWORD nextShot = 0, burstUntil = 0;
+        static bool homeWas = false;
+        DWORD now = GetTickCount();
+        bool home = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+        if (home && !homeWas) { burstUntil = now + 5000; nextShot = 0; Log("capture: Home pressed - 10 frames over 5 s"); }
+        homeWas = home;
+        bool want = g_cfg.selfTestCapture && ((g_cfg.climbHands && g_climbAmount > 0.5f && g_captureCount < 45) || now < burstUntil);
+        if (want && now >= nextShot && g_captureWant == 0) {
+            strncpy(g_captureTag, now < burstUntil ? "home" : "climb", sizeof(g_captureTag) - 1);
+            InterlockedExchange(&g_captureWant, 1);
+            nextShot = now + (now < burstUntil ? 500 : 330);
+        }
+    }
+    float w = g_cfg.climbHands ? g_climbAmount : 0.0f;
+    if (!pawn || w <= 0.0f || GetTickCount() - g_viewLocTick > 500) {
+        if (active) {   // let go: hand the forearm / wrist controls back (PlaceJumpArm only zeroes the upper arm)
+            USkeletalMeshComponent* cs[2] = { g_shadowBody, g_shadowArms };
+            for (USkeletalMeshComponent* c : cs) for (int h = 0; c && h < 2; ++h) {
+                if (auto* l = static_cast<USkelControlSingleBone*>(c->FindSkelControl(FName(kLowerArmBones[h])))) l->ControlStrength = l->StrengthTarget = 0.0f;
+                if (auto* wr = static_cast<USkelControlSingleBone*>(c->FindSkelControl(FName(kWristControlNames[h])))) wr->ControlStrength = wr->StrengthTarget = 0.0f;
+            }
+            Log("climb hands: let go");
+        }
+        active = false;
+        g_climbGrip[0] = g_climbGrip[1] = 0.0f;
+        return;
+    }
+    auto add = [](const FVector& a, const FVector& b) { return FVector{ a.X + b.X, a.Y + b.Y, a.Z + b.Z }; };
+    auto sub = [](const FVector& a, const FVector& b) { return FVector{ a.X - b.X, a.Y - b.Y, a.Z - b.Z }; };
+    auto mul = [](const FVector& a, float k) { return FVector{ a.X * k, a.Y * k, a.Z * k }; };
+    float yaw = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+    FVector F{ cosf(yaw), sinf(yaw), 0.0f }, R{ -sinf(yaw), cosf(yaw), 0.0f }, U{ 0.0f, 0.0f, 1.0f };
+    FVector P = pawn->Location;
+    FVector C = add(add(P, mul(F, g_cfg.climbChainForward)), mul(R, -g_cfg.climbSideShift));   // the chain's line (x, y)
+    float eyeZ = g_viewLoc.Z;
+    float top = g_cfg.climbGripTop, bottom = g_cfg.climbGripBottom;
+    if (top - bottom < 10.0f) bottom = top - 10.0f;
+    auto gripAt = [&](int h, float z) { float sd = h ? 1.0f : -1.0f; return FVector{ C.X + R.X * sd * g_cfg.climbHandSpread, C.Y + R.Y * sd * g_cfg.climbHandSpread, z }; };
+    if (!active) {   // the grab: staggered, one high, one lower
+        hs[0] = { true, gripAt(0, eyeZ + top - 2.0f), FVector{ 0, 0, 0 }, 0.0f, 1.0f, 0.3f };
+        hs[1] = { true, gripAt(1, eyeZ + (top + bottom) * 0.5f), FVector{ 0, 0, 0 }, 0.0f, 1.0f, 0.3f };
+        active = true;
+    }
+    float speed = fabsf(g_climbVz);
+    float span = top - bottom;
+    float reachDur = Clamp(speed > 1.0f ? 0.45f * span / speed : g_cfg.climbReachTime, 0.12f, g_cfg.climbReachTime > 0.12f ? g_cfg.climbReachTime : 0.12f);
+    for (int h = 0; h < 2; ++h) {
+        HandState& m = hs[h];
+        HandState& o = hs[1 - h];
+        if (m.holding) {
+            FVector g = gripAt(h, m.grip.Z);   // (the chain's line may drift with the pawn: the grip keeps its height)
+            m.grip = g;
+            float rel = m.grip.Z - eyeZ;
+            bool low = rel < bottom && g_climbVz >= -5.0f, high = rel > top + 6.0f && g_climbVz <= 5.0f;
+            if ((low || high) && o.holding) {
+                m.holding = false;
+                m.t = 0.0f;
+                m.dur = reachDur;
+                m.fromRel = sub(m.grip, FVector{ g_viewLoc.X, g_viewLoc.Y, eyeZ });
+                m.toRel = low ? top : bottom + 6.0f;
+            }
+        } else {
+            m.t += dt / (m.dur > 0.05f ? m.dur : 0.05f);
+            if (m.t >= 1.0f) { m.holding = true; m.t = 1.0f; m.grip = gripAt(h, eyeZ + m.toRel); }
+        }
+    }
+    FVector eye{ g_viewLoc.X, g_viewLoc.Y, eyeZ };
+    Xf invSkin;
+    bool skin = g_armSkinOn && g_skinFrameOk && g_shadowBody && XfInv(g_skinFrame, invSkin);
+    Xf shadowL2W = skin ? XfMul(MeshOriginXf(g_shadowBody->SkeletalMesh), XfFromMatrix(g_shadowBody->LocalToWorld)) : Xf{};   // (bone space -> mesh origin -> component -> world, as GetBoneLocation)
+    for (int h = 0; h < 2; ++h) {
+        if (h ? g_rightHandBusy : g_leftHandBusy) { g_climbGrip[h] = 0.0f; continue; }   // (an item in hand: the game's arm)
+        HandState& m = hs[h];
+        float sd = h ? 1.0f : -1.0f;
+        FVector T;
+        if (m.holding) {
+            T = m.grip;
+            g_climbGrip[h] = 1.0f;
+        } else {
+            float u = Clamp(m.t, 0.0f, 1.0f);
+            u = u * u * (3.0f - 2.0f * u);
+            FVector a = add(eye, m.fromRel), b = gripAt(h, eyeZ + m.toRel);
+            float arc = sinf(3.14159265f * u);
+            T = add(add(a, mul(sub(b, a), u)), add(mul(R, sd * 5.0f * arc), mul(F, -4.0f * arc)));
+            g_climbGrip[h] = Clamp(1.0f - 2.2f * arc, 0.0f, 1.0f);   // open mid-reach
+        }
+        FVector tc{ C.X - T.X, C.Y - T.Y, 0.0f };
+        float tl = sqrtf(tc.X * tc.X + tc.Y * tc.Y);
+        FVector toward = tl > 0.5f ? FVector{ tc.X / tl, tc.Y / tl, 0.0f } : F;
+        if (skin) {   // where the skin draws the hand -> the shadow body's own world
+            Xf tw = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { T.X, T.Y, T.Z } };
+            Xf ts = XfMul(XfMul(tw, invSkin), shadowL2W);
+            PlaceClimbArm(g_shadowBody, h, w, FVector{ ts.t[0], ts.t[1], ts.t[2] }, toward, F, R, U);
+        }
+        if (g_shadowArms) PlaceClimbArm(g_shadowArms, h, w, T, toward, F, R, U);
+    }
+    g_climbHandsOn = true;
+    static DWORD lastLog = 0;
+    if (GetTickCount() - lastLog > 250) {
+        lastLog = GetTickCount();
+        Log("climb hands: speed %.0f reach %.2f s | L %s %.0f  R %s %.0f (grip height vs eyes) | chain %.0f fwd %.0f left | skin %d",
+            g_climbVz, reachDur, hs[0].holding ? "hold" : "reach", (hs[0].holding ? hs[0].grip.Z : eyeZ + hs[0].toRel) - eyeZ,
+            hs[1].holding ? "hold" : "reach", (hs[1].holding ? hs[1].grip.Z : eyeZ + hs[1].toRel) - eyeZ,
+            g_cfg.climbChainForward, g_cfg.climbSideShift, skin ? 1 : 0);
+    }
+}
+
+// The holstered body's arms. A raised side: the forearm (and the hand under it) folded to the elbow, the upper arm scaled
+// about the shoulder joint by CastHolsterUpperArm - the holstered shoulder and upper arm stay in the shadow beside the
+// casting body's raised arm. A free side: the whole arm folded into the shoulder joint (18:0x, user: two sets of arm
+// shadows when holstered) - the casting body draws that arm, and this body adds nothing there whatever poses it.
+// Runs after UpdateJumpHands / UpdateCoat (they write the same controls) and before the frame's pose update.
+static void UpdateHolsterShoulders() {
+    if (!g_holsterCast) return;
+    static int mode[2] = { -1, -1 };   // (for the log) 0 folded away, 1 holstered shoulder kept
+    for (int h = 0; h < 2; ++h) {
+        auto* upperCtl = static_cast<USkelControlSingleBone*>(g_holsterCast->FindSkelControl(FName(kUpperArmBones[h])));
+        auto* lowerCtl = static_cast<USkelControlSingleBone*>(g_holsterCast->FindSkelControl(FName(kLowerArmBones[h])));
+        if (!upperCtl || !lowerCtl) continue;
+        upperCtl->bIgnoreWhenNotRendered = 0;
+        lowerCtl->bIgnoreWhenNotRendered = 0;
+        float s = g_castS[h];   // (the casting reach's own strength: when its reach is off the arm is down, so is this)
+        bool keep = s > 0.02f;
+        upperCtl->bApplyRotation = 0;
+        upperCtl->bApplyTranslation = 0;
+        upperCtl->BoneScale = keep ? 1.0f + (Clamp(g_cfg.castHolsterUpperArm, 0.05f, 1.0f) - 1.0f) * Clamp(s, 0.0f, 1.0f) : 0.001f;
+        upperCtl->ControlStrength = upperCtl->StrengthTarget = 1.0f;
+        lowerCtl->bApplyRotation = 0;
+        lowerCtl->bApplyTranslation = 0;
+        lowerCtl->BoneScale = 0.001f;
+        lowerCtl->ControlStrength = lowerCtl->StrengthTarget = 1.0f;
+        int m = keep ? 1 : 0;
+        if (m != mode[h]) Log("holstered shoulders: %s arm %s", h ? "right" : "left", keep ? "raised - holstered shoulder kept, forearm folded" : "free - folded away (the casting body draws it)");
+        mode[h] = m;
+    }
+}
+
+static void UpdateCastingArmReach(ADishonoredPlayerPawn* pawn) {
+    if (!g_shadowArms) return;
+    USkeletalMeshComponent* arms = pawn ? pawn->Mesh : nullptr;
+    static LONGLONG qpcC = 0;
+    float dtC = QpcDt(qpcC);
+    Xf frame, inv, L1;
+    bool on = arms && arms->SkeletalMesh && g_shadowArms->SkeletalMesh && GetTickCount() - g_viewLocTick < 500 &&
+              CopyFrameXf(pawn, g_shadowArms->Translation, g_shadowArms->Rotation, g_shadowArms->Scale, frame);
+    // (14:02 log: the hand missed the drawn 1P hand by a steady 51 uu and sat twisted - the target was built without the
+    // body mesh's own Origin / RotOrigin, which sit between the bones' space and the component's. The skin frame, which
+    // lands its hand 0.1 uu off, is meshOrigin x component x owner; this is the same for the casting body.)
+    if (on) { frame = XfMul(MeshOriginXf(g_shadowArms->SkeletalMesh), frame); on = XfInv(frame, inv); }
+    Xf camA, camW;
+    bool haveCam = false;
+    if (on) {
+        L1 = XfFromMatrix(arms->LocalToWorld);
+        camW = L1;
+        haveCam = BoneAtomXf(arms, "camera_jnt", camA);
+        if (haveCam) camW = XfMul(camA, L1);
+    }
+    auto drawn = [&](Xf wx) {
+        if (haveCam) { wx.t[0] += g_viewLoc.X - camW.t[0]; wx.t[1] += g_viewLoc.Y - camW.t[1]; wx.t[2] += g_viewLoc.Z - camW.t[2]; }
+        return wx;
+    };
+    for (int h = 0; h < 2; ++h) {
+        auto* ik = static_cast<USkelControlLimb*>(g_shadowArms->FindSkelControl(FName(kHandBones[h])));
+        if (!ik) continue;
+        ik->bIgnoreWhenNotRendered = 0;   // (see SyncTransform: this body is never rendered)
+        ik->bAllowStretching = 0;         // (15:00 clip: stretching pushes the child bone out and the mesh between the joints thins - "thin wrists, thin shoulder joins"; a hand ~5 uu short is invisible in a shadow)
+        auto* wrist = static_cast<USkelControlSingleBone*>(g_shadowArms->FindSkelControl(FName(kWristControlNames[h])));
+        if (wrist) wrist->bIgnoreWhenNotRendered = 0;
+        // Put away (14:45 clip: blocking with the sword - the game tucks the off-hand's item away and pulls that 1P hand out
+        // of the view while the hand stays "busy"): after CastHoldAwayMs out of view the arm eases back to the standing
+        // pose, and comes back when the hand does. Not while looking up (the hands drop out of the view then too) or
+        // mid-draw. The item copy follows g_castHold (UpdateItemShadows).
+        {
+            // (15:05: the idle 1P SWORD hand sits below the bottom of the screen, so an out-of-view rule put the sword
+            // arm to sleep whenever it was held still - the off-hand only, and by the game's own block state.)
+            bool busyH = h ? g_rightHandBusy : g_leftHandBusy;
+            bool away = false;
+            if (h == 0 && busyH) {
+                int bs = BlockContextState();
+                float bw = static_cast<float>(bs);   // (for the log line)
+                if (bs >= 0) away = bs == 1 || bs == 2;   // Blocking / Block_Parry
+                else {
+                    bool lookingUp = g_viewPitchDeg > g_cfg.armSkinReachMaxPitch;
+                    away = !g_onePHandOnScreen[h] && !g_handDrawing[h] && !lookingUp &&
+                           g_onePHandOffMs[h] > static_cast<DWORD>(g_cfg.castHoldAwayMs);
+                }
+                static DWORD lastAwayLog = 0;
+                if (away && GetTickCount() - lastAwayLog > 1000) { lastAwayLog = GetTickCount(); Log("block: off-hand put away (block node weight %.2f)", bw); }
+            }
+            g_castHold[h] += Clamp((away ? 0.0f : 1.0f) - g_castHold[h], -dtC * 6.0f, dtC * 6.0f);
+        }
+        // Climbing (18:45): the game animates only the first-person hands on a chain/ladder - hand over hand. The
+        // shadow's hands follow them like a weapon hand (same reach, elbow pole, wrist and finger grip), so the shadow
+        // climbs in time with the game's own animation.
+        float sW = on ? g_weaponRaise[h] * g_castHold[h] : 0.0f;
+        float sC = (on && g_cfg.climbShadowArms && !g_cfg.climbHands) ? g_climbAmount : 0.0f;   // (ClimbHands poses it instead)
+        float s = sW > sC ? sW : sC;
+        g_castS[h] = sW;   // (UpdateHolsterShoulders: weapon raises only - an arm up on a chain gets no hanging holstered stub beside it)
+        ik->ControlStrength = ik->StrengthTarget = s;
+        if (g_shoulderBlob[h] && s <= 0.02f) g_shoulderBlob[h]->SetScale(0.0001f);   // (arm down: no blob)
+        auto* clav = static_cast<USkelControlSingleBone*>(g_shadowArms->FindSkelControl(FName(kArmBones[h])));
+        // (18:0x, user: two sets of arm shadows inside each other when holstered - this zeroed UpdateCoat's shoulder pose
+        // (stand spread, jump raise) on the casting body only, a leftover of the collar-bone experiments; the holstered
+        // body kept it. Only those experiments, when on, own this control.)
+        if (clav && s <= 0.0f && (g_cfg.castClavicle > 0.0f || g_cfg.castClavicleFollow > 0.0f)) clav->ControlStrength = clav->StrengthTarget = 0.0f;
+        {   // the hinge learner samples an arm the IK has left alone for a few frames, in first person, weapon fully down
+            ArmRoll& r = g_armRoll[h];
+            bool quiet = s <= 0.0f && g_weaponRaise[h] <= 0.0f && g_bodyVisible && JumpArmAmount(h) <= 0.0f && g_slideAmount <= 0.01f && g_climbAmount <= 0.0f;
+            r.offFrames = quiet ? r.offFrames + 1 : 0;
+            if (g_cfg.castArmRoll && r.offFrames >= 3) LearnArmHinge(h);
+        }
+        if (g_cfg.castArmRoll) {   // the hinge the right way round (see ArmRoll)
+            ArmRoll& r = g_armRoll[h];
+            // Before anything is learned: 1 (17:28 log - both arms read a half turn with 0, PlaceJumpArm's reset).
+            bool inv = g_cfg.castArmRollInvert >= 0 ? g_cfg.castArmRollInvert != 0 : r.learned ? r.invert : true;
+            if (r.flips & 1) inv = !inv;   // the result check overruled it
+            ik->JointAxis = EAxis::AXIS_Y;
+            ik->bInvertJointAxis = inv ? 1 : 0;
+            float rest = UpperArmFromRest(h);
+            if (!r.learned && !r.checkOff && g_cfg.castArmRollInvert < 0 && s >= 0.95f && rest >= 0.0f) {   // (only before a sign is learned: a bend-plane flip read as a half turn would otherwise flip a right answer)
+                r.halfTurnFrames = rest > 155.0f ? r.halfTurnFrames + 1 : 0;
+                if (r.halfTurnFrames >= 45) {
+                    r.halfTurnFrames = 0;
+                    if (r.flips < 2) {
+                        r.flips++;
+                        Log("arm hinge %s: the IK'd upper arm reads %.0f deg from rest (a half turn) - flipping its hinge (%d of 2)", h ? "right" : "left", rest, r.flips);
+                    }
+                    if (r.flips >= 2) { r.checkOff = true; Log("arm hinge %s: both ways read a half turn - the check stands down, back on the first answer", h ? "right" : "left"); }
+                }
+            } else if (s < 0.95f) r.halfTurnFrames = 0;
+            static bool rigLogged[2] = { false, false };
+            if (!rigLogged[h]) {   // the rig, once (review: the forearm shares this hinge only if its rest rotation is a pure Y turn; a -X bone would need bInvertBoneAxis)
+                rigLogged[h] = true;
+                float ql[4] = { 0, 0, 0, 1 }, pl[3] = { 0, 0, 0 }, ph[3] = { 0, 0, 0 };
+                bool okq = RefLocalQuat(g_shadowArms, kLowerArmBones[h], ql);
+                bool okp = RefLocalPos(g_shadowArms, kLowerArmBones[h], pl) && RefLocalPos(g_shadowArms, kHandBones[h], ph);
+                Log("arm hinge %s rig: forearm rest rotation (%.3f %.3f %.3f %.3f)%s | upper arm runs (%.1f %.1f %.1f), forearm runs (%.1f %.1f %.1f) in their own frames%s",
+                    h ? "right" : "left", ql[0], ql[1], ql[2], ql[3], okq ? (fabsf(ql[0]) < 0.05f && fabsf(ql[2]) < 0.05f ? " = a pure Y turn: the forearm shares the hinge" : " - NOT a pure Y turn: the forearm will be rolled") : " (unreadable)",
+                    pl[0], pl[1], pl[2], ph[0], ph[1], ph[2], okp ? (pl[0] > 0.0f && ph[0] > 0.0f ? "" : " - a bone runs along -X: bInvertBoneAxis needed") : " (unreadable)");
+            }
+            static DWORD lastRollLog[2] = { 0, 0 };
+            if (s >= 0.5f && GetTickCount() - lastRollLog[h] > 1000) {
+                lastRollLog[h] = GetTickCount();
+                Log("arm hinge %s: IK bInvertJointAxis %d (%s%s) | upper arm %.0f deg from rest (a half turn reads ~180)", h ? "right" : "left",
+                    ik->bInvertJointAxis ? 1 : 0, g_cfg.castArmRollInvert >= 0 ? "ini override" : r.learned ? "learned off the animated arm" : "default 1",
+                    (r.flips & 1) ? ", flipped by the result check" : "", rest);
+            }
+        }
+        Xf a1;
+        if (s <= 0.0f || !BoneAtomXf(arms, kHandBones[h], a1)) {
+            if (wrist && s <= 0.0f && JumpArmAmount(h) <= 0.0f && SlideArmAmount(h) <= 0.0f) wrist->ControlStrength = wrist->StrengthTarget = 0.0f;
+            continue;
+        }
+        Xf w1 = drawn(XfMul(a1, L1));
+        // Keep an elbow: pull a target beyond CastReachMax of the arm's length back toward the shoulder (this body's
+        // upper arm + forearm, measured off its own bones; constant now that nothing stretches them).
+        if (g_cfg.castReachMax > 0.0f && g_cfg.castReachMax < 1.0f) {
+            FVector S = g_shadowArms->GetBoneLocation(FName(kUpperArmBones[h]), 0);
+            FVector E = g_shadowArms->GetBoneLocation(FName(kLowerArmBones[h]), 0);
+            FVector Hn = g_shadowArms->GetBoneLocation(FName(kHandBones[h]), 0);
+            float l1 = sqrtf((E.X - S.X) * (E.X - S.X) + (E.Y - S.Y) * (E.Y - S.Y) + (E.Z - S.Z) * (E.Z - S.Z));
+            float l2 = sqrtf((Hn.X - E.X) * (Hn.X - E.X) + (Hn.Y - E.Y) * (Hn.Y - E.Y) + (Hn.Z - E.Z) * (Hn.Z - E.Z));
+            float maxR = (l1 + l2) * g_cfg.castReachMax;
+            float dx = w1.t[0] - S.X, dy = w1.t[1] - S.Y, dz = w1.t[2] - S.Z;
+            float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (l1 > 5.0f && l2 > 5.0f && dist > maxR && dist > 1e-3f) {
+                float k = maxR / dist;
+                w1.t[0] = S.X + dx * k; w1.t[1] = S.Y + dy * k; w1.t[2] = S.Z + dz * k;
+            }
+        }
+        Xf c1 = XfMul(w1, inv);   // the 1P hand as drawn -> this body's component space
+        ik->EffectorLocationSpace = EBoneControlSpace::BCS_ComponentSpace;
+        ik->EffectorLocation = FVector{ c1.t[0], c1.t[1], c1.t[2] };
+        {
+            static DWORD lastLog[2] = { 0, 0 };
+            if (s > 0.5f && GetTickCount() - lastLog[h] > 500) {
+                lastLog[h] = GetTickCount();
+                FVector k = g_shadowArms->GetBoneLocation(FName(kHandBones[h]), 0);
+                float dx = k.X - w1.t[0], dy = k.Y - w1.t[1], dz = k.Z - w1.t[2];
+                Log("casting reach: %s strength %.2f (ik ignoreNR %d, body recentlyRendered %d) | casting hand - drawn 1P hand %.1f uu "
+                    "| effector comp (%.0f %.0f %.0f) | camera_jnt %s", h ? "right" : "left", ik->ControlStrength,
+                    ik->bIgnoreWhenNotRendered ? 1 : 0, g_shadowArms->bRecentlyRendered ? 1 : 0, sqrtf(dx * dx + dy * dy + dz * dz),
+                    c1.t[0], c1.t[1], c1.t[2], haveCam ? "found" : "MISSING");
+            }
+        }
+        // Elbow (14:27 clip: the arm's join to the shoulder looked "squeezed"): the 1P arms are built for the camera's
+        // view - their elbows sit up beside the head, out of frame - so steering this body's elbow at the 1P elbow
+        // folded the upper arm up toward the ear and it foreshortened into a stub at the shoulder in the silhouette.
+        // A third-person elbow instead: out to the side and down from the shoulder-hand line, in actor space.
+        {
+            Xf own = OwnerXf(pawn), ownInv;
+            if (XfInv(own, ownInv)) {
+                FVector sw = g_shadowArms->GetBoneLocation(FName(kUpperArmBones[h]), 0);   // this body's shoulder joint (world)
+                Xf sx = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { sw.X, sw.Y, sw.Z } };
+                Xf hx = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { w1.t[0], w1.t[1], w1.t[2] } };
+                Xf sa = XfMul(sx, ownInv), ha = XfMul(hx, ownInv);   // -> actor space (X forward, Y right, Z up)
+                float side = h == 0 ? -1.0f : 1.0f;
+                // The solver bends the arm in the plane through shoulder, hand and pole; its normal is (hand dir) x (pole
+                // dir). A pole near the hand's line makes that normal swing round as the hand moves past it (18:15 clip:
+                // the right arm spun while walking - the lowered sword hand bobs down-out from the shoulder, right where
+                // the old pole sat; log: right upper arm 172-179 deg from rest for moments). So: the pole goes behind the
+                // shoulder (CastElbowBack), out of any drawn hand's reach, and the plane may turn only so fast.
+                g_climbHandUp[h] = ha.t[2] - sa.t[2];
+                float D[3] = { ha.t[0] - sa.t[0], ha.t[1] - sa.t[1], ha.t[2] - sa.t[2] };
+                float dl = sqrtf(D[0] * D[0] + D[1] * D[1] + D[2] * D[2]);
+                if (dl > 1.0f) { D[0] /= dl; D[1] /= dl; D[2] /= dl; } else { D[0] = 1.0f; D[1] = 0.0f; D[2] = 0.0f; }
+                float P[3] = { -g_cfg.castElbowBack, side * g_cfg.castElbowOut, -g_cfg.castElbowDown };
+                float pl = sqrtf(P[0] * P[0] + P[1] * P[1] + P[2] * P[2]);
+                if (pl < 1.0f) { P[0] = 0.0f; P[1] = side; P[2] = -1.0f; pl = sqrtf(2.0f); }
+                for (float& v : P) v /= pl;
+                float pd = P[0] * D[0] + P[1] * D[1] + P[2] * D[2];
+                float B[3] = { P[0] - D[0] * pd, P[1] - D[1] * pd, P[2] - D[2] * pd };   // the bend direction the pole asks for
+                float margin = sqrtf(B[0] * B[0] + B[1] * B[1] + B[2] * B[2]);           // sin(hand line, pole line): 0 = degenerate
+                float N[3] = { D[1] * B[2] - D[2] * B[1], D[2] * B[0] - D[0] * B[2], D[0] * B[1] - D[1] * B[0] };   // plane normal
+                float nl = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+                static float prevN[2][3];
+                static bool havePrevN[2] = { false, false };
+                static int clamps[2] = { 0, 0 };
+                static float minMargin[2] = { 1.0f, 1.0f };
+                if (margin < minMargin[h]) minMargin[h] = margin;
+                if (nl > 1e-4f) {
+                    for (float& v : N) v /= nl;
+                    if (havePrevN[h] && g_cfg.castElbowTurnRate > 0.0f) {
+                        // keep the previous normal's continuity: re-project it onto the plane normal to D, then turn it
+                        // toward the new one by at most TurnRate x dt
+                        float* q = prevN[h];
+                        float qd = q[0] * D[0] + q[1] * D[1] + q[2] * D[2];
+                        float Q[3] = { q[0] - D[0] * qd, q[1] - D[1] * qd, q[2] - D[2] * qd };
+                        float ql = sqrtf(Q[0] * Q[0] + Q[1] * Q[1] + Q[2] * Q[2]);
+                        if (ql > 1e-3f) {
+                            for (float& v : Q) v /= ql;
+                            float c = Clamp(Q[0] * N[0] + Q[1] * N[1] + Q[2] * N[2], -1.0f, 1.0f);
+                            float ang = acosf(c);
+                            float maxStep = g_cfg.castElbowTurnRate * 0.0174533f * (dtC > 0.0f ? (dtC < 0.1f ? dtC : 0.1f) : 0.016f);
+                            if (ang > maxStep) {
+                                // rotate Q about D (both are perpendicular to D) toward N by maxStep
+                                float W[3] = { D[1] * Q[2] - D[2] * Q[1], D[2] * Q[0] - D[0] * Q[2], D[0] * Q[1] - D[1] * Q[0] };   // D x Q
+                                float sgn = (W[0] * N[0] + W[1] * N[1] + W[2] * N[2]) >= 0.0f ? 1.0f : -1.0f;
+                                float cs = cosf(maxStep), sn = sinf(maxStep) * sgn;
+                                for (int i = 0; i < 3; ++i) N[i] = Q[i] * cs + W[i] * sn;
+                                ++clamps[h];
+                            }
+                        }
+                    }
+                    prevN[h][0] = N[0]; prevN[h][1] = N[1]; prevN[h][2] = N[2];
+                    havePrevN[h] = true;
+                    // the bend direction for this normal: N x D (so that D x (N x D) ... = the plane the solver builds)
+                    float Bd[3] = { N[1] * D[2] - N[2] * D[1], N[2] * D[0] - N[0] * D[2], N[0] * D[1] - N[1] * D[0] };
+                    float reach = 0.5f * (dl > 1.0f ? dl : 1.0f);
+                    ik->JointTargetLocationSpace = EBoneControlSpace::BCS_ActorSpace;
+                    ik->JointTargetLocation = FVector{ sa.t[0] + D[0] * reach + Bd[0] * 50.0f,
+                                                       sa.t[1] + D[1] * reach + Bd[1] * 50.0f,
+                                                       sa.t[2] + D[2] * reach + Bd[2] * 50.0f };
+                }
+                static DWORD lastPoleLog[2] = { 0, 0 };
+                if (GetTickCount() - lastPoleLog[h] > 1000) {
+                    lastPoleLog[h] = GetTickCount();
+                    Log("elbow plane %s: hand dir (%.2f %.2f %.2f) from the shoulder (actor) | pole margin now %.2f, lowest %.2f this second | plane turns clamped %d frames",
+                        h ? "right" : "left", D[0], D[1], D[2], margin, minMargin[h], clamps[h]);
+                    clamps[h] = 0;
+                    minMargin[h] = 1.0f;
+                }
+                // The shoulder blob on this joint, grown with the arm's raise. (15:37 clip: two little heads floated at head
+                // height - the head mesh is not pivoted at the neck: it shares the body's skeleton space, its geometry
+                // ~150 uu above its pivot, which is how the head shadow sits at the body root. So the blob's pivot goes
+                // down by the head's offset from the root, scaled, and the scaled head lands on the joint.)
+                if (g_shoulderBlob[h] && s > 0.02f) {
+                    float sc = g_cfg.castShoulderBlob * s * (g_shadowArms->Scale > 0.0f ? g_shadowArms->Scale : 1.0f);
+                    FVector hw = g_shadowArms->GetBoneLocation(FName("head_jnt"), 0);
+                    Xf hx2 = { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } }, { hw.X, hw.Y, hw.Z } };
+                    Xf hac = XfMul(hx2, ownInv);   // the head bone in actor space
+                    FVector rootA = g_shadowArms->Translation;   // the casting body's pivot (actor space)
+                    float offX = hac.t[0] - rootA.X, offY = hac.t[1] - rootA.Y, offZ = hac.t[2] - rootA.Z + 8.0f;   // (+8: the head's centre above head_jnt)
+                    // A dome, not a head (17:11 clip: "two heads at the shoulders"): the head's face points DOWN into the
+                    // shoulder and its crown OUT to the arm's side, so from the front and the side the silhouette is the
+                    // back of the skull - a deltoid - with the neck and chin inside the body. The head's offset from the
+                    // mesh root goes through the same orientation so the centre still lands where it is aimed.
+                    FVector ax{ 0.0f, 0.0f, -1.0f };   // the mesh's forward (face) -> down
+                    FVector az{ 0.0f, side, 0.0f };    // its up (crown) -> out
+                    FVector ay{ -side, 0.0f, 0.0f };   // Z x X
+                    float ox = offX * ax.X + offY * ay.X + offZ * az.X;
+                    float oy = offX * ax.Y + offY * ay.Y + offZ * az.Y;
+                    float oz = offX * ax.Z + offY * ay.Z + offZ * az.Z;
+                    g_shoulderBlob[h]->SetTranslation(FVector{ sa.t[0] - ox * sc + g_cfg.castShoulderBlobFwd,
+                                                               sa.t[1] - oy * sc + side * g_cfg.castShoulderBlobOut,
+                                                               sa.t[2] - oz * sc + g_cfg.castShoulderBlobUp });
+                    g_shoulderBlob[h]->SetRotation(AxesToRotator(ax, ay, az));
+                    g_shoulderBlob[h]->SetScale(sc);
+                    static DWORD lastBlobLog[2] = { 0, 0 };
+                    if (GetTickCount() - lastBlobLog[h] > 1000) {
+                        lastBlobLog[h] = GetTickCount();
+                        FVector bt = g_shoulderBlob[h]->Translation;
+                        Log("blob %s: pivot (%.0f %.0f %.0f) joint (%.0f %.0f %.0f) head-root off (%.0f %.0f %.0f) scale %.2f -> centre (%.0f %.0f %.0f)",
+                            h ? "right" : "left", bt.X, bt.Y, bt.Z, sa.t[0], sa.t[1], sa.t[2], offX, offY, offZ, sc,
+                            bt.X + ox * sc, bt.Y + oy * sc, bt.Z + oz * sc);
+                    }
+                }
+                // The shoulder follows the raised arm - by measurement (17:14: every guessed-axis roll was a shrug or a
+                // hump, and the blobs read as shoulder pads). The upper arm's rotation relative to the collar bone now
+                // (both bones' component atoms) against the rotation the animation gave it this frame (its LocalAtoms
+                // atom; the bind pose if that is unreadable) is exactly what the IK swung the arm through, in the collar
+                // bone's own frame; the collar bone turns CastClavicleFollow of that about the same axis, as a real
+                // shoulder does (bone-space additive). The IK re-solves from the moved joint, and the measured swing
+                // shrinks: it settles at follow/(1+follow) of the raise.
+                float qc[4], qu[4], ref[4];
+                bool refIsAnim = BoneAnimLocalQuat(g_shadowArms, kUpperArmBones[h], ref);
+                if (clav && g_cfg.castClavicleFollow > 0.0f && s > 0.0f &&
+                    BoneQuat(g_shadowArms, kArmBones[h], qc) && BoneQuat(g_shadowArms, kUpperArmBones[h], qu) &&
+                    (refIsAnim || RefLocalQuat(g_shadowArms, kUpperArmBones[h], ref))) {
+                    float qcInv[4] = { -qc[0], -qc[1], -qc[2], qc[3] }, refInv[4] = { -ref[0], -ref[1], -ref[2], ref[3] };
+                    float local[4], delta[4], part[4];
+                    QuatMul(qcInv, qu, local);      // the upper arm relative to the collar bone, now (comp = parent * local)
+                    QuatMul(local, refInv, delta);  // ...less the animation's: the IK's swing, in the collar bone's frame
+                    float ang = 2.0f * acosf(Clamp(fabsf(delta[3]), 0.0f, 1.0f)) * 57.29578f;
+                    float t = Clamp(g_cfg.castClavicleFollow, 0.0f, 1.0f);
+                    if (ang > 0.5f && t * ang > g_cfg.castClavicleFollowMax) t = g_cfg.castClavicleFollowMax / ang;
+                    const float ident[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                    QuatSlerp(ident, delta, t, part);
+                    clav->bApplyRotation = 1;
+                    clav->bAddRotation = 1;
+                    clav->BoneRotationSpace = EBoneControlSpace::BCS_BoneSpace;
+                    clav->BoneRotation = QuatToRotator(part);
+                    clav->BoneScale = 1.0f;
+                    clav->ControlStrength = clav->StrengthTarget = s;
+                    static DWORD lastClavLog[2] = { 0, 0 };
+                    if (GetTickCount() - lastClavLog[h] > 1000) {
+                        lastClavLog[h] = GetTickCount();
+                        float bind[4], animVsBind = -1.0f;
+                        if (refIsAnim && RefLocalQuat(g_shadowArms, kUpperArmBones[h], bind)) {
+                            float bindInv[4] = { -bind[0], -bind[1], -bind[2], bind[3] }, d2[4];
+                            QuatMul(ref, bindInv, d2);
+                            animVsBind = 2.0f * acosf(Clamp(fabsf(d2[3]), 0.0f, 1.0f)) * 57.29578f;
+                        }
+                        static bool parentLogged[2] = { false, false };
+                        if (!parentLogged[h] && g_refStride > 0) {   // the skeleton's own word on who the upper arm hangs from
+                            parentLogged[h] = true;
+                            auto* rs = reinterpret_cast<RawArray*>(&g_shadowArms->SkeletalMesh->RefSkeleton);
+                            int iu = g_shadowArms->MatchRefBone(FName(kUpperArmBones[h])), ic = g_shadowArms->MatchRefBone(FName(kArmBones[h]));
+                            int parentOff = g_refNameOff + g_refQuatOff + 44;   // FMeshBone: ...VJointPos{quat, pos, length, size} then ParentIndex
+                            int parent = -1;
+                            if (rs->Data && iu >= 0 && parentOff + 4 <= g_refStride)
+                                parent = *reinterpret_cast<const int32_t*>(static_cast<uint8_t*>(rs->Data) + iu * g_refStride + parentOff);
+                            Log("clavicle %s: %s is bone %d, its parent index reads %d; %s is bone %d (%s)", h ? "right" : "left",
+                                kUpperArmBones[h], iu, parent, kArmBones[h], ic, parent == ic ? "the collar bone: good" : "NOT the collar bone, or the layout guess is off");
+                        }
+                        FRotator r = clav->BoneRotation;
+                        Log("clavicle %s: IK swing %.0f deg over the %s pose (anim vs bind %.0f deg) -> collar bone turns %.0f deg: +(%d %d %d) pitch yaw roll, at %.2f",
+                            h ? "right" : "left", ang, refIsAnim ? "animated" : "bind", animVsBind, ang * t, r.Pitch, r.Yaw, r.Roll, s);
+                    }
+                }
+                if (clav && g_cfg.castClavicle > 0.0f) {
+                    float dx = ha.t[0] - sa.t[0], dy = ha.t[1] - sa.t[1], dz = ha.t[2] - sa.t[2];
+                    float horiz = sqrtf(dx * dx + dy * dy);
+                    float elevDeg = atan2f(dz, horiz > 1.0f ? horiz : 1.0f) * 57.29578f;   // -90 hanging .. +90 straight up
+                    float raiseDeg = Clamp(g_cfg.castClavicle * (elevDeg + 70.0f), 0.0f, g_cfg.castClavicleMax);
+                    clav->bApplyRotation = 1;
+                    clav->bAddRotation = 1;
+                    clav->BoneRotationSpace = EBoneControlSpace::BCS_ActorSpace;
+                    clav->BoneRotation = FRotator{ static_cast<int>(g_cfg.leanSign * raiseDeg * 65536.0f / 360.0f), 0, 0 };
+                    clav->BoneScale = 1.0f;
+                    clav->ControlStrength = clav->StrengthTarget = s;
+                }
+            }
+        }
+        if (wrist && JumpArmAmount(h) <= 0.0f) {   // (UpdateJumpHands zeroed it this frame; the jump pose owns a free arm)
+            FVector l; FRotator r; float sc;
+            XfDecompose(c1, l, r, sc);
+            wrist->BoneRotationSpace = EBoneControlSpace::BCS_ComponentSpace;
+            wrist->bAddRotation = 0;
+            wrist->bApplyRotation = 1;
+            wrist->BoneRotation = r;
+            wrist->ControlStrength = wrist->StrengthTarget = s;
+        }
+        // Fingers (14:34 clip: the Heart "floated" in an open shadow hand - a busy hand got no finger pose): the real
+        // hand's grip, joint by joint, from the 1P arms' finger bones (their parent-space rotation, as CapturePowerHand
+        // reads the power pose) onto this body's fingers. A free hand is re-posed by UpdateJumpHands every frame.
+        {
+            auto* bases1 = reinterpret_cast<RawArray*>(&arms->SpaceBases);
+            auto rows = [&](int idx, FVector r[3]) {
+                const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(bases1->Data) + idx * 32);
+                float x = a[0], y = a[1], z = a[2], w = a[3];
+                r[0] = { 1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y) };
+                r[1] = { 2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x) };
+                r[2] = { 2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y) };
+            };
+            auto dot3 = [](const FVector& a, const FVector& b) { return a.X * b.X + a.Y * b.Y + a.Z * b.Z; };
+            for (int j = 0; j < 14 && bases1->Data; ++j) {
+                auto* fc = static_cast<USkelControlSingleBone*>(g_shadowArms->FindSkelControl(FName(kFingerBones[h][j])));
+                if (!fc) continue;
+                FName fn(kFingerBones[h][j]);
+                int idx = fn.FNameEntryId >= 0 ? arms->MatchRefBone(fn) : -1;
+                int par = idx >= 0 ? arms->MatchRefBone(arms->GetParentBone(fn)) : -1;
+                if (idx < 0 || par < 0 || idx >= bases1->Num || par >= bases1->Num) continue;
+                FVector c[3], pp[3], l[3];
+                rows(idx, c);
+                rows(par, pp);
+                for (int i = 0; i < 3; ++i) l[i] = { dot3(c[i], pp[0]), dot3(c[i], pp[1]), dot3(c[i], pp[2]) };
+                fc->BoneRotationSpace = EBoneControlSpace::BCS_ParentBoneSpace;
+                fc->bAddRotation = 0;
+                fc->bApplyRotation = 1;
+                fc->bApplyTranslation = 0;
+                fc->BoneRotation = AxesToRotator(l[0], l[1], l[2]);
+                fc->ControlStrength = fc->StrengthTarget = s;
+            }
+        }
     }
 }
 
@@ -1703,14 +4505,64 @@ static bool ArmsCopyBoneXf(ADishonoredPlayerPawn* pawn, const char* bone, Xf& ou
     return true;
 }
 
+// A held item's model as the shadow copy will draw it: the source component's shadow flags, each LOD's per-section
+// shadow-casting switches (FSkeletalMeshLODInfo::bEnableShadowCasting - read when a component's render proxy is made),
+// and its materials (blend mode, world position offset: a masked/translucent or vertex-offset material casts
+// differently). With ItemModelsCastShadow every section's switch is turned on (once per mesh), and the real 1P
+// component - which must never cast from where it is drawn - gets CastShadow / bCastDynamicShadow off; both take effect
+// at each component's next proxy rebuild, so the 1P item never starts casting.
+static void PrepareItemMeshShadow(int h, USkeletalMeshComponent* src) {
+    USkeletalMesh* m = src ? src->SkeletalMesh : nullptr;
+    if (!m) return;
+    static USkeletalMesh* done[16] = {};
+    bool seen = false;
+    for (USkeletalMesh* d : done) if (d == m) { seen = true; break; }
+    auto* lods = reinterpret_cast<RawArray*>(&m->LODInfo);
+    std::string flags;
+    int off = 0, total = 0;
+    for (int l = 0; lods->Data && l < lods->Num && l < 6; ++l) {
+        auto* li = reinterpret_cast<FSkeletalMeshLODInfo*>(static_cast<uint8_t*>(lods->Data) + l * sizeof(FSkeletalMeshLODInfo));
+        auto* sc = reinterpret_cast<RawArray*>(&li->bEnableShadowCasting);
+        flags += " LOD" + std::to_string(l) + ":";
+        for (int j = 0; sc->Data && j < sc->Num && j < 12; ++j) {
+            uint32_t* v = static_cast<uint32_t*>(sc->Data) + j;
+            flags += *v ? "1" : "0";
+            ++total;
+            if (!*v) { ++off; if (g_cfg.itemMeshCastShadow) *v = 1; }
+        }
+        if (!sc->Data || sc->Num <= 0) flags += "(none)";
+    }
+    std::string mats;
+    auto* mm = reinterpret_cast<RawArray*>(&m->Materials);
+    for (int i = 0; mm->Data && i < mm->Num && i < 6; ++i) {
+        UMaterialInterface* mi = src->GetMaterial(i);
+        if (!mi) { mats += " [none]"; continue; }
+        UMaterial* base = mi->GetMaterial();
+        int blend = base ? static_cast<int>(base->BlendMode) : -1;
+        bool wpo = base && *reinterpret_cast<void**>(&base->WorldPositionOffset) != nullptr;
+        mats += " [" + mi->GetName() + " blend " + std::to_string(blend) + (wpo ? " +WPO" : "") + "]";
+    }
+    if (!seen) {
+        for (USkeletalMesh*& d : done) if (!d) { d = m; break; }
+        Log("item model (%s hand) %s: 1P component CastShadow %d dynamic %d hidden %d | section shadow casting%s -> %d of %d were off%s | materials%s",
+            h ? "right" : "left", m->GetName().c_str(), src->CastShadow ? 1 : 0, src->bCastDynamicShadow ? 1 : 0, src->HiddenGame ? 1 : 0,
+            flags.c_str(), off, total, (off && g_cfg.itemMeshCastShadow) ? ", switched on" : "", mats.c_str());
+    }
+    if (g_cfg.itemMeshCastShadow && src->CastShadow && src->bCastDynamicShadow) {   // (only if it would cast: the sword's and crossbow's are CastShadow 0 already - leave the game's component alone)
+        src->CastShadow = 0;   // (the real first-person item never casts: it is drawn at the camera)
+        src->bCastDynamicShadow = 0;
+    }
+}
+
 static void UpdateItemShadows(ADishonoredPlayerPawn* pawn) {
     static USkeletalMesh* lastMesh[2] = { nullptr, nullptr };
     for (int h = 0; h < 2; ++h) {
         USkeletalMeshComponent*& copy = g_itemShadow[h];
         auto* item = static_cast<UDishonoredInventoryItem*>(g_handItem[h]);
         USkeletalMeshComponent* src = item ? item->m_pPlayerMesh : nullptr;
-        bool want = g_cfg.itemShadows && g_cfg.fpArmShadow && g_armsShadow && pawn && pawn->Mesh && g_bodyVisible &&
-                    src && src->SkeletalMesh && (h ? g_rightHandBusy : g_leftHandBusy);
+        USkeletalMeshComponent* caster = g_shadowArms ? g_shadowArms : g_shadowBody;
+        bool want = g_cfg.itemShadows && caster && pawn && pawn->Mesh && g_bodyVisible &&
+                    src && src->SkeletalMesh && (h ? g_rightHandBusy : g_leftHandBusy) && g_castHold[h] > 0.5f;   // (put away: see UpdateCastingArmReach)
         if (!want) {
             if (copy) copy->SetScale(0.0001f);   // keep it (attached to the pawn), just cast nothing
             continue;
@@ -1720,21 +4572,43 @@ static void UpdateItemShadows(ADishonoredPlayerPawn* pawn) {
                 StaticConstructObject(USkeletalMeshComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
             if (!copy) continue;
             copy->bUpdateSkelWhenNotRendered = 1;
-            if (pawn->Mesh->LightEnvironment) copy->SetLightEnvironment(pawn->Mesh->LightEnvironment);
+            if (g_castLightEnv) copy->SetLightEnvironment(g_castLightEnv);
+            else if (pawn->Mesh->LightEnvironment) copy->SetLightEnvironment(pawn->Mesh->LightEnvironment);
             copy->HiddenGame = 1;
             copy->CastShadow = 1;
             copy->bCastDynamicShadow = 1;
             copy->bCastHiddenShadow = 1;
+            USkeletalMeshComponent* sp = g_cfg.castOneShadow ? ShadowCasterComp() : nullptr;
+            if (sp) copy->SetShadowParent(sp);   // one shadow with the body (18:1x: darker where the item crossed it under lamps)
             pawn->AttachComponent(copy);
             copy->SetHidden(true);
             lastMesh[h] = nullptr;
-            Log("item shadow component created for the %s hand", h ? "right" : "left");
+            Log("item shadow component created for the %s hand (shadow parent %p)", h ? "right" : "left", sp);
+        }
+        {   // (user, clean V3.0 install: "when changing body the weapons' shadows disappear") A body change rebuilds the casting
+            // body and its light environment, but this copy is kept - it stayed in the OLD casting body's shadow group (now
+            // detached, so nothing drew it) and the old light environment. Follow the current ones.
+            USkeletalMeshComponent* sp = g_cfg.castOneShadow ? ShadowCasterComp() : nullptr;
+            ULightEnvironmentComponent* le = g_castLightEnv ? static_cast<ULightEnvironmentComponent*>(g_castLightEnv) : pawn->Mesh->LightEnvironment;
+            if (copy->ShadowParent != sp || (le && copy->LightEnvironment != le)) {
+                if (le && copy->LightEnvironment != le) copy->SetLightEnvironment(le);
+                if (copy->ShadowParent != sp) copy->SetShadowParent(sp);
+                Log("item shadow (%s hand): now in the current body's shadow (parent %p, light env %p)", h ? "right" : "left", sp, le);
+            }
         }
         if (lastMesh[h] != src->SkeletalMesh) {
+            PrepareItemMeshShadow(h, src);
+            copy->ForcedLodModel = 1;   // (LOD0: a never-rendered component's LOD pick is meaningless)
             copy->SetSkeletalMesh(src->SkeletalMesh, false);
             // The item's own skeleton is animated (the blade's place comes from it); copy that pose, or the ref pose
             // left the sword shadow floating in the air (video 17-08-39).
             copy->SetParentAnimComponent(src);
+            // (14:08 clip + log: the casting hand sat 0.2 uu on the real hand yet the sword copy was a streak beside it.
+            // Same engine fact as the arm skin: with a ParentAnimComponent the copy is drawn from the PARENT's (the real
+            // item's, 1P-frame) LocalToWorld with our Translation/Rotation applied in its raw mesh axes - which is what
+            // "floated" every item shadow since build 82. Off: placed from the pawn + its own Translation/Rotation/Scale.)
+            copy->bTransformFromAnimParent = 0;
+            copy->m_bReallyInheritTransformFromAnimParent = 0;
             copy->UpdateParentBoneMap();
             lastMesh[h] = src->SkeletalMesh;
             Log("item shadow (%s hand): %s", h ? "right" : "left", src->SkeletalMesh->GetName().c_str());
@@ -1763,40 +4637,46 @@ static void UpdateItemShadows(ADishonoredPlayerPawn* pawn) {
             Log("item shadow (%s hand): attached to %s at (%.1f %.1f %.1f) rot (%d %d %d)", h ? "right" : "left", bn.ToString().c_str(),
                 found->RelLoc.X, found->RelLoc.Y, found->RelLoc.Z, found->RelRot.Pitch, found->RelRot.Yaw, found->RelRot.Roll);
         }
+        // The sword / pistol / crossbow / Heart copy rides the CASTING body's hand. (13:48 clip: attached to the game's
+        // attachment bone it sat off the hand - on the BODY skeleton handAttachment_X is the coat-cuff carrier, moved off
+        // the forearm by a control.) So: the item's pose RELATIVE TO THE 1P HAND, from the 1P arms themselves (attachment
+        // bone x RelLoc/RelRot/RelScale, then into the 1P hand's frame - same component, the mesh origin cancels, no
+        // LocalToWorld), put onto the casting body's hand, which the reach IK holds at the drawn 1P hand
+        // (UpdateCastingArmReach) with the 1P hand's rotation: the copy sits where the real item is and follows the swing.
         FName boneName; boneName.FNameEntryId = found->boneIndex; boneName.InstanceNumber = found->boneNumber;
-        int idx = pawn->Mesh->MatchRefBone(boneName);
-        auto* bases = reinterpret_cast<RawArray*>(&pawn->Mesh->SpaceBases);
-        if (idx < 0 || !bases->Data || idx >= bases->Num) { copy->SetScale(0.0001f); continue; }
-        Xf boneComp;
-        {
-            const char* nm = nullptr;   // reuse CompBoneXf by index: build the atom directly
-            (void)nm;
-            Xf world, invL;
-            const float* a = reinterpret_cast<const float*>(static_cast<uint8_t*>(bases->Data) + idx * 32);
-            float x = a[0], y = a[1], z = a[2], wq = a[3], s = (a[7] > 0.0f && a[7] < 100.0f) ? a[7] : 1.0f;
-            float x2 = x + x, y2 = y + y, z2 = z + z, xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2;
-            float wx = wq * x2, wy = wq * y2, wz = wq * z2;
-            Xf atom;
-            atom.m[0][0] = (1 - (yy + zz)) * s; atom.m[0][1] = (xy + wz) * s; atom.m[0][2] = (xz - wy) * s;
-            atom.m[1][0] = (xy - wz) * s; atom.m[1][1] = (1 - (xx + zz)) * s; atom.m[1][2] = (yz + wx) * s;
-            atom.m[2][0] = (xz + wy) * s; atom.m[2][1] = (yz - wx) * s; atom.m[2][2] = (1 - (xx + yy)) * s;
-            atom.t[0] = a[4]; atom.t[1] = a[5]; atom.t[2] = a[6];
-            boneComp = XfMul(atom, XfFromRotator(pawn->Mesh->SkeletalMesh->RotOrigin, pawn->Mesh->SkeletalMesh->Origin));
-        }
+        Xf atomB1, atomH1, invH1, atomHc;
+        bool ok = caster->SkeletalMesh && BoneAtomXf(pawn->Mesh, boneName.ToString().c_str(), atomB1) &&
+                  BoneAtomXf(pawn->Mesh, kHandBones[h], atomH1) && XfInv(atomH1, invH1) && BoneAtomXf(caster, kHandBones[h], atomHc);
+        if (!ok) { copy->SetScale(0.0001f); continue; }
         Xf rel = XfFromRotator(found->RelRot, found->RelLoc);
         float rs3[3] = { found->RelScale.X, found->RelScale.Y, found->RelScale.Z };
         for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) rel.m[i][j] *= (rs3[i] > 0.0f ? rs3[i] : 1.0f);
-        Xf copyLocal = XfFromRotator(pawn->Mesh->Rotation, g_armsShadowT);   // copy component -> actor
-        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) copyLocal.m[i][j] *= pawn->Mesh->Scale;
-        Xf itemActor = XfMul(XfMul(rel, boneComp), copyLocal);
+        Xf itemInHand = XfMul(XfMul(rel, atomB1), invH1);   // the item in the 1P hand's frame
+        Xf boneComp = XfMul(atomHc, MeshOriginXf(caster->SkeletalMesh));   // (the skin frame's origin order; see MeshOriginXf)
+        Xf compLocal = XfFromRotator(caster->Rotation, caster->Translation);   // casting body component -> actor
+        for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) compLocal.m[i][j] *= caster->Scale;
+        Xf itemActor = XfMul(XfMul(itemInHand, boneComp), compLocal);
         FVector loc; FRotator rot; float scale;
         XfDecompose(itemActor, loc, rot, scale);
+        // Not the hand bone's scale: the IK's stretch scales the arm bones and the sword copy pulsed with it (14:16 clip,
+        // "flickering"). The copy's size is the attachment's RelScale under the casting body's own scale.
+        scale = caster->Scale * (rs3[0] > 0.0f ? rs3[0] : 1.0f);
         if (!(scale > 0.01f && scale < 100.0f) || !(fabsf(loc.X) < 500.0f && fabsf(loc.Y) < 500.0f && fabsf(loc.Z) < 500.0f)) {
             copy->SetScale(0.0001f);
             continue;
-        }        copy->SetTranslation(loc);
+        }
+        copy->SetTranslation(loc);
         copy->SetRotation(rot);
         copy->SetScale(scale);
+        static DWORD lastPlaceLog[2] = { 0, 0 };
+        if (GetTickCount() - lastPlaceLog[h] > 2000) {
+            lastPlaceLog[h] = GetTickCount();
+            Xf handActor = XfMul(boneComp, compLocal);
+            float dx = loc.X - handActor.t[0], dy = loc.Y - handActor.t[1], dz = loc.Z - handActor.t[2];
+            Log("item shadow (%s hand) %s: %.0f uu from the casting hand, scale %.2f, cast %d/%d/%d, bounds r %.0f, shadow parent %p",
+                h ? "right" : "left", src->SkeletalMesh->GetName().c_str(), sqrtf(dx * dx + dy * dy + dz * dz), scale,
+                copy->CastShadow ? 1 : 0, copy->bCastDynamicShadow ? 1 : 0, copy->bCastHiddenShadow ? 1 : 0, copy->Bounds.SphereRadius, copy->ShadowParent);
+        }
     }
 }
 // View guard (build 184): strafing put a shoulder/collar piece of Daud's body in the bottom corners for ~0.2 s, and
@@ -1822,7 +4702,7 @@ static float NeededViewGuardBack(ADishonoredPlayerPawn* pawn, bool* logIt) {
     float tanV = tanH * 9.0f / 16.0f;
     float pyaw = pawn->Rotation.Yaw * kRad;
     FVector back{ -cosf(pyaw), -sinf(pyaw), 0.0f };
-    bool armsToo = pitch * 57.29578f > -25.0f && g_jumpAmount <= 0.0f;
+    bool armsToo = pitch * 57.29578f > -25.0f && g_jumpAmount <= 0.0f && !(g_cfg.climbArms && g_climbAmount > 0.0f);
     FVector pts[9];
     float margins[9];
     const char* names[9];
@@ -1870,7 +4750,8 @@ static float NeededViewGuardBack(ADishonoredPlayerPawn* pawn, bool* logIt) {
 static void UpdateViewGuard(ADishonoredPlayerPawn* pawn, bool firstPerson) {
     static DWORD last = 0, lastLog = 0;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc3 = 0;
+    float dt = QpcDt(qpc3);   // (frame-accurate; was GetTickCount steps)
     last = now;
     int phys = static_cast<int>(pawn->Physics);
     bool active = g_cfg.viewGuard && firstPerson && g_body && g_bodyAnimated && now - g_viewLocTick < 500 &&
@@ -1995,6 +4876,11 @@ static void UpdateVisibility(ADishonoredPlayerPawn* pawn) {
         // Also when the camera drops far below (log: ~110 down while the pawn climbs), and once started, held until
         // landed - "mantle end" fired mid-air and the body grew back while the camera was still low (video 22-17-32).
         if (!justLanded && static_cast<int>(pawn->Physics) != 1 && airDz < -g_cfg.mantleHideUp) on = true;
+        // The height tests alone also fired on plain jumps - running down stairs and jumping, high (power) jumps:
+        // 'camera height offset 47/49' with the camera barely pulled back (back 1 / 0 / 7) - and the body shrank away
+        // until landing (user, 2026-10-10). A real mantle pulls the camera back too (log: back 36); the game's mantle
+        // state and its mantle camera influences (below) catch the rest. Height alone no longer counts.
+        if (on && back <= 12.0f && !(back > (mantling ? 15.0f : g_cfg.mantleHideBack))) on = false;
         if (on && !mantling) Log("mantle test: back %.0f, camera height offset %.0f (%.0f since take-off)%s", back, g_stairDz, airDz, justLanded ? ", just landed" : "");
         mantling = (off && on) || (mantling && static_cast<int>(pawn->Physics) != 1);
         // Not for slides (physics 14): the slide start pulls the camera too, and holding until "landed" hid the
@@ -2084,7 +4970,12 @@ static void UpdateVisibility(ADishonoredPlayerPawn* pawn) {
     g_body->SetHidden(!firstPerson);
     // The head is always hidden but casts a shadow; take it off the pawn entirely during cutscenes.
     if (g_shadowBody) { if (firstPerson) pawn->AttachComponent(g_shadowBody); else pawn->DetachComponent(g_shadowBody); }
+    if (g_shadowArms) { if (firstPerson) pawn->AttachComponent(g_shadowArms); else pawn->DetachComponent(g_shadowArms); }
+    if (g_holsterCast) { if (firstPerson) pawn->AttachComponent(g_holsterCast); else pawn->DetachComponent(g_holsterCast); }
     if (g_head) { if (firstPerson) pawn->AttachComponent(g_head); else pawn->DetachComponent(g_head); }
+    for (int h = 0; h < 2; ++h) if (g_shoulderBlob[h]) { if (firstPerson) pawn->AttachComponent(g_shoulderBlob[h]); else pawn->DetachComponent(g_shoulderBlob[h]); }
+    // (18:1x) the item copies join the casting body's shadow (OneShadow): they come and go with it
+    for (int h = 0; h < 2; ++h) if (g_itemShadow[h]) { if (firstPerson) pawn->AttachComponent(g_itemShadow[h]); else pawn->DetachComponent(g_itemShadow[h]); }
     g_bodyVisible = firstPerson;
     if (strcmp(why, "take-off") != 0 && !(firstPerson && g_lastHideWhy && strcmp(g_lastHideWhy, "take-off") == 0))
         Log("body %s%s%s", firstPerson ? "shown" : "hidden (", why, firstPerson ? "" : ")");
@@ -2128,7 +5019,8 @@ static void UpdateFootIK(ADishonoredPlayerPawn* pawn) {
         static int lastPhys = 1;
         static bool easing = false;
         DWORD nowT = GetTickCount();
-        float dt = lastT ? Clamp((nowT - lastT) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+        static LONGLONG qpc11 = 0;
+        float dt = QpcDt(qpc11);   // (frame-accurate; was GetTickCount steps)
         lastT = nowT;
         int phys = static_cast<int>(pawn->Physics);
         if (phys == 1 && lastPhys == 2) landT = nowT;
@@ -2156,7 +5048,7 @@ static void UpdateFootIK(ADishonoredPlayerPawn* pawn) {
     }
     g_footLift = lift;
     static const char* feet[2] = { "foot_L_jnt", "foot_R_jnt" };
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };   // same lift for the shadow body
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };   // same lift for the shadow body
     for (USkeletalMeshComponent* comp : comps)
     for (const char* foot : feet) {
         if (!comp) break;
@@ -2203,11 +5095,31 @@ static void UpdateSlide() {
     static DWORD last = 0;
     static float amount = 0.0f;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc4 = 0;
+    float dt = QpcDt(qpc4);   // (frame-accurate; was GetTickCount steps)
     last = now;
-    // Out over ~0.4 s (in at 6/s): ending in 0.17 s snapped legs, feet and camera at once (user: janky).
-    amount += Clamp((g_isSliding ? 1.0f : 0.0f) - amount, -dt * 2.5f, dt * 6.0f);
+    // Get-up progress (0..1 after the slide ends; 1 = done), the ONE clock for the way out (user 01:20: the slide ->
+    // crouch legs were janky - the legs faded over 0.6 s, the pose/raise/recline over a linear 0.4 s, the sink at 90
+    // uu/s and the camera over 0.4 s, all stepping on GetTickCount): the amount now follows the same smoothstep as the
+    // legs, and SyncTransform lifts the sink on it too. In at 6/s as before.
+    static float getUp = 1.0f;
+    if (g_isSliding) getUp = 0.0f;
+    else if (getUp < 1.0f) getUp = Clamp(getUp + dt / (g_cfg.slideGetUpTime > 0.05f ? g_cfg.slideGetUpTime : 0.05f), 0.0f, 1.0f);
+    if (g_isSliding) amount = Clamp(amount + dt * 6.0f, 0.0f, 1.0f);
+    else { float ss = 1.0f - getUp * getUp * (3.0f - 2.0f * getUp); if (ss < amount) amount = ss; }
     g_slideAmount = amount;
+    // The camera raise comes off at the rate the game lifts its own camera out of the slide (~42 uu in ~0.16 s, log
+    // 00:29) - on the slow get-up curve the view went up and back down.
+    static float camW = 0.0f;
+    // (08:30: the game lifts its camera out of the slide on an exponential - 00:29 log: +3,3,2,2,3,1,2,2,2,1,1,1 uu
+    // per 7.5 ms frame, ~0.1 s time constant - while ours came off linearly in 0.17 s: a ~10 uu dip and rise.)
+    // (10:40: only holstered - with a weapon out the game's 1P arms are the arms, and shifting them to follow a raised
+    // view fought the game's own easing of their height at the slide end: bounces. Weapon slides keep the game's camera.)
+    bool raiseWant = g_isSliding;   // (10:50: every slide - the user wants the same height with a weapon out; the 1P arms are lifted with it)
+    if (raiseWant) camW = Clamp(camW + dt * 6.0f, 0.0f, 1.0f);
+    else camW += (0.0f - camW) * Clamp(dt * 10.0f, 0.0f, 1.0f);
+    if (camW < 0.002f) camW = 0.0f;
+    g_slideCamW = camW;
     static int logged = -1;
     if ((g_isSliding ? 1 : 0) != logged) {
         Log("slide %s", g_isSliding ? "started" : "ended");
@@ -2219,13 +5131,17 @@ static void UpdateSlide() {
     // While sliding the legs hold still: the speed blend would pick the walk/run cycle from the slide's speed and the
     // pose was layered on stepping legs (video 17-30-00). Raise its walk threshold so it plays the idle instead.
     {
-        static USkeletalMeshComponent* setFor[2] = { nullptr, nullptr };
-        static int state[2] = { -1, -1 };
-        USkeletalMeshComponent* cs[2] = { g_body, g_shadowBody };
-        for (int ci = 0; ci < 2; ++ci) {
+        // (14:33/14:44 logs: with the casting body added these two stayed at [2] - state[2] = want wrote a zero four bytes
+        // past the array every frame, straight onto UpdateClimb's static (the "physics 0 -> 1" every frame), and setFor[2]
+        // wrote a pointer past its end onto whatever followed. Moving the victim made the symptom vanish; this is the cause.)
+        static USkeletalMeshComponent* setFor[4] = { nullptr, nullptr, nullptr, nullptr };
+        static int state[4] = { -1, -1, -1, -1 };
+        USkeletalMeshComponent* cs[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
+        for (int ci = 0; ci < 4; ++ci) {
             if (!cs[ci]) continue;
             if (setFor[ci] != cs[ci]) { setFor[ci] = cs[ci]; state[ci] = -1; }
-            int want = (g_isSliding || g_slideLegW > 0.15f || g_swimAmount > 0.0f || g_climbAmount > 0.0f) ? 1 : 0;   // legs still until the pose has mostly faded; swimming paddles instead
+            int want = (g_isSliding || g_slideLegW > 0.55f || g_swimAmount > 0.0f || g_climbAmount > 0.0f ||
+                        (g_cfg.jumpIdleLegs && g_jumpAmount > 0.2f)) ? 1 : 0;   // legs still until the pose is half faded (08:30: released at 0.15 the stepping snapped on at the end); swimming paddles instead; jumps tuck from the idle
             if (want == state[ci]) continue;
             auto* speedNode = ChildAnim(ChildAnim(cs[ci]->Animations, 0), 0);
             if (!speedNode) continue;
@@ -2237,11 +5153,14 @@ static void UpdateSlide() {
     static bool wrote = false;
     if (amount <= 0.0f && !g_isSliding && g_slideLegW <= 0.0f) {   // hand the leg controls back cleanly (to the crouch/jump code)
         if (wrote) {
-            USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+            USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
             for (USkeletalMeshComponent* comp : comps) {
                 if (!comp) continue;
                 for (int i = 0; i < 4; ++i)
                     if (auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kLegBones[i])))) SetLegRotation(ctl, 0.0f, 0.0f);
+                FName toe("foot_R_jnt");
+                toe.InstanceNumber = 1;
+                if (auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(toe))) SetLegRotation(ctl, 0.0f, 0.0f);
             }
             wrote = false;
         }
@@ -2257,9 +5176,6 @@ static void UpdateSlide() {
     // Get-up motion (user: "one fluid motion"): over SlideGetUpTime the legs are drawn in - the straight right leg
     // pulls its knee up and in, the folded left leg comes forward under the body - then the pose hands over to the
     // crouch legs (foot IK) over the second half.
-    static float getUp = 1.0f;   // 0..1 progress after the slide ends (1 = done)
-    if (g_isSliding) getUp = 0.0f;
-    else if (getUp < 1.0f) getUp = Clamp(getUp + dt / (g_cfg.slideGetUpTime > 0.05f ? g_cfg.slideGetUpTime : 0.05f), 0.0f, 1.0f);
     float legW;
     if (g_isSliding) {
         legW = amount;
@@ -2277,7 +5193,7 @@ static void UpdateSlide() {
         legW = 1.0f - b * b * (3.0f - 2.0f * b);
     }
     g_slideLegW = legW;
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         for (int i = 0; i < 4; ++i) {
@@ -2291,7 +5207,17 @@ static void UpdateSlide() {
             // ...and swing it in toward the middle so it points straight ahead (user: it pointed off to the right).
             if (ctl && i == 1 && g_cfg.slideFrontInward != 0.0f)
                 ctl->BoneRotation.Yaw = static_cast<int>(g_cfg.slideFrontInward * 65536.0f / 360.0f);
+            // The other (left) leg, now also straight out (user sketch 00:52): its own twist and swing.
+            if (ctl && i == 0 && g_cfg.slideBackTwist != 0.0f)
+                ctl->BoneRotation.Roll = static_cast<int>(g_cfg.slideBackTwist * 65536.0f / 360.0f);
+            if (ctl && i == 0 && g_cfg.slideBackInward != 0.0f)
+                ctl->BoneRotation.Yaw = static_cast<int>(g_cfg.slideBackInward * 65536.0f / 360.0f);
         }
+        // The extended right foot: toes pointed (user 01:20), on the toe control the hover pose uses.
+        FName toe("foot_R_jnt");
+        toe.InstanceNumber = 1;
+        if (auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(toe)))
+            SetLegRotation(ctl, g_cfg.kneeSign * g_cfg.slideFootPoint, legW);
     }
 }
 
@@ -2301,21 +5227,34 @@ static void UpdateSlide() {
 static void UpdateClimb(ADishonoredPlayerPawn* pawn) {
     static DWORD last = 0;
     static float amount = 0.0f, phase = 0.0f, moveBlend = 0.0f;
-    static int lastPhys = -1;
     static bool wrote = false;
     if (!pawn) return;
     int phys = static_cast<int>(pawn->Physics);
-    if (phys != lastPhys) { Log("physics %d -> %d", lastPhys, phys); lastPhys = phys; }
+    static bool addrLogged = false;
+    if (!addrLogged) { addrLogged = true; Log("probe: physLast at %p (UpdateClimb)", static_cast<void*>(&g_physLast)); }
+    if (phys != g_physLast) { Log("physics %d -> %d", g_physLast, phys); g_physLast = phys; }
+    g_physLastSet = g_physLast;
     g_isClimbing = phys == g_cfg.climbPhysics;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc5 = 0;
+    float dt = QpcDt(qpc5);   // (frame-accurate; was GetTickCount steps)
     last = now;
     // Grab/let go eased over ~0.25 s so the legs swing onto the chain instead of snapping.
     amount += Clamp((g_isClimbing ? 1.0f : 0.0f) - amount, -dt * 4.0f, dt * 4.0f);
     g_climbAmount = amount;
+    {   // (18:54 log: Velocity.Z read 0 the whole climb - the chain moves the pawn without a velocity) speed from its height
+        static float lastZ = 0.0f;
+        static bool haveZ = false;
+        float z = pawn->Location.Z;
+        if (haveZ && dt > 0.0005f && g_isClimbing) {
+            float v = Clamp((z - lastZ) / dt, -800.0f, 800.0f);
+            g_climbVz += (v - g_climbVz) * Clamp(dt * 8.0f, 0.0f, 1.0f);
+        } else if (!g_isClimbing) g_climbVz = 0.0f;
+        lastZ = z; haveZ = true;
+    }
     if (amount <= 0.0f && !g_isClimbing) {
         if (wrote) {   // hand the leg controls back cleanly
-            USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+            USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
             for (USkeletalMeshComponent* comp : comps) {
                 if (!comp) continue;
                 for (int i = 0; i < 4; ++i)
@@ -2324,6 +5263,8 @@ static void UpdateClimb(ADishonoredPlayerPawn* pawn) {
             wrote = false;
         }
         phase = 0.0f;
+        g_climbLegPhase = 0.0f;   // (each grab starts its cycle at the bottom - review)
+        g_climbLegMove = 0.0f;
         return;
     }
     wrote = true;
@@ -2364,6 +5305,39 @@ static void UpdateClimb(ADishonoredPlayerPawn* pawn) {
         // ankles around the chain - both hips turned in by ClimbCross (the right a little more, so it crosses over).
         hL = g_cfg.climbGripHip + swing[0]; kL = knee[0]; rL = g_cfg.climbCross - side[0];
         hR = g_cfg.climbGripHip + swing[1]; kR = knee[1]; rR = -g_cfg.climbCross * 1.3f + side[1];
+        // Climbing (18:45, user: a climbing animation for the legs too): the foot lock - the crossed legs draw the knees
+        // up quickly (the hands hold), then push down slowly (standing on the lock while the hands reach), once per
+        // ClimbLegStride climbed; run backwards going down. Eased in with the climbing speed; the still grip and its
+        // sway when hanging on the chain.
+        float& legPhase = g_climbLegPhase;
+        float& legMove = g_climbLegMove;
+        static DWORD lastClimbLog = 0;
+        float bend = 0.0f;
+        if (g_cfg.climbLegCycle) {
+            float vzc = g_isClimbing ? g_climbVz : 0.0f, speedc = fabsf(vzc);   // (letting go: no more cycle - review)
+            legMove += Clamp(Clamp((speedc - 8.0f) / 50.0f, 0.0f, 1.0f) - legMove, -dt * 3.0f, dt * 5.0f);
+            float stride = g_cfg.climbLegStride > 5.0f ? g_cfg.climbLegStride : 5.0f;
+            legPhase += (vzc >= 0.0f ? 1.0f : -1.0f) * speedc * dt / stride;   // in cycles
+            legPhase -= floorf(legPhase);
+            auto smooth = [](float x) { x = Clamp(x, 0.0f, 1.0f); return x * x * (3.0f - 2.0f * x); };
+            auto bendAt = [&](float u) { u -= floorf(u); return u < 0.35f ? smooth(u / 0.35f) : 1.0f - smooth((u - 0.35f) / 0.65f); };
+            float bL = bendAt(legPhase), bR = bendAt(legPhase - 0.06f);   // (the right a touch behind: not one rigid block)
+            bend = bL;
+            float cHL = g_cfg.climbLegPushHip + (g_cfg.climbLegBendHip - g_cfg.climbLegPushHip) * bL;
+            float cKL = g_cfg.climbLegPushKnee + (g_cfg.climbLegBendKnee - g_cfg.climbLegPushKnee) * bL;
+            float cHR = g_cfg.climbLegPushHip + (g_cfg.climbLegBendHip - g_cfg.climbLegPushHip) * bR;
+            float cKR = g_cfg.climbLegPushKnee + (g_cfg.climbLegBendKnee - g_cfg.climbLegPushKnee) * bR;
+            hL += (cHL - hL) * legMove; kL += (cKL - kL) * legMove;
+            hR += (cHR - hR) * legMove; kR += (cKR - kR) * legMove;
+            rL = g_cfg.climbCross - side[0] * (1.0f - legMove);           // (still crossed; the sideways sway fades while climbing)
+            rR = -g_cfg.climbCross * 1.3f + side[1] * (1.0f - legMove);
+        }
+        if (g_isClimbing && (g_cfg.climbLegCycle || g_cfg.climbHands) && GetTickCount() - lastClimbLog > 250) {
+            lastClimbLog = GetTickCount();
+            Log("climb: speed %.0f (velocity z %.0f) | legs moving %.2f phase %.2f bend %.2f (hip %.0f knee %.0f) | hands %s, grip L %.2f R %.2f | busy L %d R %d",
+                g_climbVz, pawn->Velocity.Z, legMove, legPhase, bend, hL, kL, g_climbHandsOn ? "climbing" : "off", g_climbGrip[0], g_climbGrip[1],
+                g_leftHandBusy ? 1 : 0, g_rightHandBusy ? 1 : 0);
+        }
     } else {
         // Ladder steps: the stepping leg lifts its knee to the next rung while the other stays straight underneath.
         float vz = pawn->Velocity.Z;
@@ -2383,7 +5357,7 @@ static void UpdateClimb(ADishonoredPlayerPawn* pawn) {
         leg(sR, hR, kR);
     }
     float values[4] = { hL, hR, kL, kR };
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         for (int i = 0; i < 4; ++i) {
@@ -2410,7 +5384,8 @@ static void UpdateSwim(ADishonoredPlayerPawn* pawn) {
     static bool wrote = false;
     if (!pawn || !g_body || !g_bodyAnimated) return;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc6 = 0;
+    float dt = QpcDt(qpc6);   // (frame-accurate; was GetTickCount steps)
     last = now;
     bool swimming = g_cfg.swimPose && static_cast<int>(pawn->Physics) == g_cfg.swimPhysics;
     amount += Clamp((swimming ? 1.0f : 0.0f) - amount, -dt * 4.0f, dt * 4.0f);
@@ -2419,7 +5394,7 @@ static void UpdateSwim(ADishonoredPlayerPawn* pawn) {
     if ((swimming ? 1 : 0) != logged) { Log("swimming %s", swimming ? "started" : "ended"); logged = swimming ? 1 : 0; }
     if (amount <= 0.0f) {
         if (wrote) {
-            USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+            USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
             for (USkeletalMeshComponent* comp : comps) {
                 if (!comp) continue;
                 for (int i = 0; i < 4; ++i)
@@ -2441,7 +5416,7 @@ static void UpdateSwim(ADishonoredPlayerPawn* pawn) {
         -15.0f + g_cfg.swimKickHip * sR,
         20.0f + g_cfg.swimKickKnee * Clamp(sL, 0.0f, 1.0f),
         20.0f + g_cfg.swimKickKnee * Clamp(sR, 0.0f, 1.0f) };
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         for (int i = 0; i < 4; ++i)
@@ -2456,7 +5431,8 @@ static void UpdateJump(ADishonoredPlayerPawn* pawn) {
     static bool wasAir = false, wrote = false;
     if (!pawn || !g_body || !g_bodyAnimated) return;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc7 = 0;
+    float dt = QpcDt(qpc7);   // (frame-accurate; was GetTickCount steps)
     last = now;
     bool air = g_cfg.jumpPose && static_cast<int>(pawn->Physics) == 2 && !g_isClimbing && !g_isSliding;
     float vz = pawn->Velocity.Z;
@@ -2505,7 +5481,7 @@ static void UpdateJump(ADishonoredPlayerPawn* pawn) {
     float w = amount > hover ? amount : hover;
     if (w <= 0.0f) {
         if (wrote) {   // hand the leg controls back cleanly (crouch/slide/climb own them otherwise)
-            USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+            USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
             for (USkeletalMeshComponent* comp : comps) {
                 if (!comp) continue;
                 for (int i = 0; i < 4; ++i)
@@ -2545,11 +5521,36 @@ static void UpdateJump(ADishonoredPlayerPawn* pawn) {
     float toes[2] = { g_cfg.kneeSign * g_cfg.hoverToeDeg + sway * 0.6f * c, g_cfg.kneeSign * g_cfg.hoverToeDeg - sway * 0.6f * c };
     float values[4];
     for (int i = 0; i < 4; ++i) values[i] = (jumpPose[i] * amount + hoverPose[i] * hover) / w;
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    // Knee cap (11:10): the tuck is additive on the frozen stride, so a knee already bent in the run cycle at take-off
+    // folded through its thigh. From the drawn pose (hip / knee / foot positions, last frame) less what we added last
+    // frame = the animation's own bend; the tuck gets only the room left under JumpKneeMax.
+    static float addedKnee[2] = { 0.0f, 0.0f };
+    if (g_body && g_cfg.jumpKneeMax > 0.0f) {
+        static const char* kFt[2] = { "foot_L_jnt", "foot_R_jnt" };
+        for (int sd = 0; sd < 2; ++sd) {
+            FVector H = g_body->GetBoneLocation(FName(kLegBones[sd]), 0), K = g_body->GetBoneLocation(FName(kLegBones[2 + sd]), 0),
+                    Fo = g_body->GetBoneLocation(FName(kFt[sd]), 0);
+            FVector a{ H.X - K.X, H.Y - K.Y, H.Z - K.Z }, b{ Fo.X - K.X, Fo.Y - K.Y, Fo.Z - K.Z };
+            float la = sqrtf(a.X * a.X + a.Y * a.Y + a.Z * a.Z), lb = sqrtf(b.X * b.X + b.Y * b.Y + b.Z * b.Z);
+            if (la < 1.0f || lb < 1.0f) continue;
+            float cosv = Clamp((a.X * b.X + a.Y * b.Y + a.Z * b.Z) / (la * lb), -1.0f, 1.0f);
+            float flex = 180.0f - acosf(cosv) * 57.29578f;          // 0 = straight
+            float animFlex = flex - addedKnee[sd];
+            float allowed = Clamp(g_cfg.jumpKneeMax - animFlex, 0.0f, 180.0f);
+            if (values[2 + sd] > allowed) values[2 + sd] = allowed;
+            addedKnee[sd] = values[2 + sd] * w;
+        }
+    }
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         for (int i = 0; i < 4; ++i)
-            if (auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kLegBones[i])))) SetLegRotation(ctl, values[i], w);
+            if (auto* ctl = static_cast<USkelControlSingleBone*>(comp->FindSkelControl(FName(kLegBones[i])))) {
+                SetLegRotation(ctl, values[i], w);
+                // Hips: a little outward (bone-space yaw, same sense as the slide's inward swing - negative = out) so the
+                // tucked knees never pass through each other as the body sways in the air (10:55 clip).
+                if (i < 2 && g_cfg.jumpLegSpread != 0.0f) ctl->BoneRotation.Yaw = static_cast<int>(-g_cfg.jumpLegSpread * 65536.0f / 360.0f);
+            }
         static const char* kFeet[2] = { "foot_L_jnt", "foot_R_jnt" };
         for (int f = 0; f < 2; ++f) {
             FName toe(kFeet[f]);
@@ -2566,7 +5567,8 @@ static void UpdateCrouchLegs(ADishonoredPlayerPawn* pawn, bool crouched) {
     static float phase = 0.0f, strength = 0.0f;
     if (!g_body || !g_bodyAnimated || !pawn) return;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc8 = 0;
+    float dt = QpcDt(qpc8);   // (frame-accurate; was GetTickCount steps)
     last = now;
     FVector v = pawn->Velocity;
     float speed = sqrtf(v.X * v.X + v.Y * v.Y);
@@ -2703,15 +5705,16 @@ static UAnimNode* ChildAnim(UAnimNode* node, int i) {
 // Shadow body: an arm holding gear plays the idle pose instead of the walk/run swing (eased with g_weaponRaise);
 // first-person arms holding gear barely move (user).
 static void UpdateArmBlend() {
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
-    for (int ci = 0; ci < 2; ++ci) {
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
+    for (int ci = 0; ci < 4; ++ci) {
         if (!comps[ci]) continue;
         UAnimNode* outer = ChildAnim(ChildAnim(ChildAnim(comps[ci]->Animations, 0), 0), 1);   // per-bone R
         if (!outer || outer->Class != UAnimNodeBlendPerBone::StaticClass()) continue;
         UAnimNode* inner = ChildAnim(outer, 0);                                               // per-bone L
         float steady = Clamp(g_cfg.shadowArmSteady, 0.0f, 1.0f);
-        float r = ci == 1 ? g_weaponRaise[1] * steady : 0.0f;
-        float l = ci == 1 ? g_weaponRaise[0] * steady : 0.0f;
+        bool raises = ci >= 1;   // (18:2x review: the holstered body too - its upper-arm stub beside a raised arm hangs still instead of swinging with the walk; a free side is folded away anyway)
+        float r = raises ? g_weaponRaise[1] * steady : 0.0f;
+        float l = raises ? g_weaponRaise[0] * steady : 0.0f;
         auto* pr = static_cast<UAnimNodeBlend*>(outer);
         if (fabsf(pr->Child2WeightTarget - r) > 0.01f) pr->SetBlendTarget(r, 0.0f);
         if (inner && inner->Class == UAnimNodeBlendPerBone::StaticClass()) {
@@ -2805,7 +5808,7 @@ static void UpdateLocomotionBlend(ADishonoredPlayerPawn* pawn) {
     runRate *= 1.0f - 0.95f * g_jumpAmount;
 
     // Same values for the visible body and the shadow body, so the shadow moves with the legs you see.
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         UAnimNode* n = ChildAnim(ChildAnim(ChildAnim(comp->Animations, 0), 0), 1);
@@ -2849,7 +5852,7 @@ static void UpdateTurnInPlace(ADishonoredPlayerPawn* pawn) {
     else if (activeChild != 0 && still && now - lastTurning < 250) want = activeChild;   // hold briefly
     float playRate = Clamp(fabsf(rate) / (g_cfg.turnAnimDegPerSec > 1.0f ? g_cfg.turnAnimDegPerSec : 1.0f), 0.6f, 2.5f);
 
-    USkeletalMeshComponent* comps[2] = { g_body, g_shadowBody };
+    USkeletalMeshComponent* comps[4] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast };
     for (USkeletalMeshComponent* comp : comps) {
         if (!comp) continue;
         auto* list = static_cast<UAnimNodeBlendList*>(ChildAnim(ChildAnim(ChildAnim(comp->Animations, 0), 0), 0));
@@ -2996,6 +5999,14 @@ static void AttachBody(ADishonoredPlayerPawn* pawn) {
     }
 }
 
+// The component whose shadow the head, items and holstered shoulders join (OneShadow): the casting body, or the
+// shadow body while that one is the caster.
+static USkeletalMeshComponent* ShadowCasterComp() {
+    if (g_shadowArms) return g_shadowArms;
+    if (g_shadowBody && g_shadowBody->CastShadow) return g_shadowBody;
+    return nullptr;
+}
+
 // Head shadow: Corvo's masked head (DLC07_skm_Corvo_Mask, same skeleton) as a second component that copies the
 // body's pose (SetParentAnimComponent), is never rendered (HiddenGame) but still casts a shadow
 // (bCastHiddenShadow) - so the shadow on the floor has a head, and nothing can clip into the camera.
@@ -3006,11 +6017,13 @@ static void CreateHeadShadow(ADishonoredPlayerPawn* pawn, USkeletalMeshComponent
     if (!head) { Log("could not create the head shadow component"); return; }
     head->SetSkeletalMesh((g_builtChar == 1 && g_daudHeadMesh) ? g_daudHeadMesh : (g_builtChar == 2 && g_ovsHeadMesh) ? g_ovsHeadMesh : g_headMesh, false);
     head->bUpdateSkelWhenNotRendered = 1;   // it is never rendered, but its shadow still needs the pose
-    if (pawn->Mesh && pawn->Mesh->LightEnvironment) head->SetLightEnvironment(pawn->Mesh->LightEnvironment);
+    if (g_castLightEnv) head->SetLightEnvironment(g_castLightEnv);   // (CreateShadowArms runs first: the casters' own, shadow-casting environment)
+    else if (pawn->Mesh && pawn->Mesh->LightEnvironment) head->SetLightEnvironment(pawn->Mesh->LightEnvironment);
     head->HiddenGame = 1;
     head->CastShadow = 1;
     head->bCastDynamicShadow = 1;
     head->bCastHiddenShadow = 1;
+    if (g_cfg.castOneShadow) if (USkeletalMeshComponent* sp = ShadowCasterComp()) head->SetShadowParent(sp);   // one shadow with the body (18:1x)
     // No SetParentAnimComponent: the pose copy ran frames behind and the head shadow trailed 20-37 uu while
     // moving (test 41 diag). The head is rigid, so its reference pose under the same transform as the body is enough.
     pawn->AttachComponent(head);
@@ -3033,21 +6046,161 @@ static void CreateShadowBody(ADishonoredPlayerPawn* pawn) {
     // Never rendered, so by default its SkelControls (foot IK, crouch knees, slide/climb poses) were skipped and
     // the crouched shadow stood straight-legged into the ground (video 14-09-17).
     shadow->bIgnoreControllersWhenNotRendered = 0;
+    // Full detail always (16:46 clip: the arm skin, which copies this pose, stretched into spikes - never rendered,
+    // the shadow body fell to its lowest LOD and stopped updating the hand/finger bones). ForcedLodModel 1 = LOD 0.
+    shadow->ForcedLodModel = 1;
     if (pawn->Mesh && pawn->Mesh->LightEnvironment) shadow->SetLightEnvironment(pawn->Mesh->LightEnvironment);
     shadow->HiddenGame = 1;
-    shadow->CastShadow = 1;
-    shadow->bCastDynamicShadow = 1;
-    shadow->bCastHiddenShadow = 1;
+    shadow->CastShadow = g_cfg.playerShadows ? 1 : 0;   // with shadows off it only serves as the arm skin's pose
+    shadow->bCastDynamicShadow = g_cfg.playerShadows ? 1 : 0;
+    shadow->bCastHiddenShadow = g_cfg.playerShadows ? 1 : 0;
     pawn->AttachComponent(shadow);
-    if (!SetupBodyAnimation(shadow)) { Log("shadow body animation failed"); pawn->DetachComponent(shadow); return; }
+    int arrMark = g_ourArrayCount;
+    if (!SetupBodyAnimation(shadow)) {
+        Log("shadow body animation failed");
+        if (shadow->Animations) DetachNodeArrays(shadow->Animations, 0);
+        ForgetArraysSince(arrMark);
+        pawn->DetachComponent(shadow);
+        return;
+    }
     shadow->SetHidden(true);
     g_shadowBody = shadow;
     Log("shadow body created: %p", shadow);
 }
 
+// Casting body (13:05, user: "the shadows from the unholstered arms aren't showing"): the arm skin copies g_shadowBody's
+// pose, so UpdateArmSkin hides the visible skin arm on a weapon-drawn side by scaling g_shadowBody's shoulder to 0.001 -
+// which also took that arm out of the shadow, as g_shadowBody was the caster. One control can't both hide the skin arm
+// and cast it, so a second never-rendered body takes over the casting: it gets the same whole-body pose through the
+// comps loops (holstered it is identical to g_shadowBody), is never touched by the skin's shrink, and on a busy side its
+// arm is posed with ShadowArmPose (UpdateCoat) - the builds 72-81 weapon-arm shadow, driven from its own shoulder, no
+// 1P-arm transform (the source of the old floating). g_shadowBody is demoted to a pose source only on success.
+static void CreateShadowArms(ADishonoredPlayerPawn* pawn) {
+    if (!g_cfg.shadowBody || !g_bodyAnimated || !pawn || !g_shadowBody) return;
+    if (!g_cfg.playerShadows || !g_cfg.weaponArmShadow) return;   // nothing to cast / off: g_shadowBody keeps casting
+    auto* a = static_cast<USkeletalMeshComponent*>(
+        StaticConstructObject(USkeletalMeshComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+    if (!a) { Log("could not create the casting body; the shadow body stays the caster"); return; }
+    a->SetSkeletalMesh(ActiveBodyMesh(), false);
+    a->bUpdateSkelWhenNotRendered = 1;
+    a->bIgnoreControllersWhenNotRendered = 0;   // never rendered: its controls must still run (see CreateShadowBody)
+    a->ForcedLodModel = 1;
+    if (pawn->Mesh && pawn->Mesh->LightEnvironment) a->SetLightEnvironment(pawn->Mesh->LightEnvironment);
+    a->HiddenGame = 1;
+    a->CastShadow = 1;
+    a->bCastDynamicShadow = 1;
+    a->bCastHiddenShadow = 1;
+    pawn->AttachComponent(a);
+    int arrMark = g_ourArrayCount;
+    if (!SetupBodyAnimation(a)) {
+        Log("casting body animation failed; the shadow body stays the caster");
+        if (a->Animations) DetachNodeArrays(a->Animations, 0);
+        ForgetArraysSince(arrMark);
+        pawn->DetachComponent(a);
+        return;
+    }
+    a->SetHidden(true);
+    g_shadowArms = a;
+    ResetArmRoll();
+    // Light environment (15:37, user: only the sun casts the player's shadow): everything here borrowed the 1P arms'
+    // DynamicLightEnvironment, and first-person arms cast no shadow - so indoor lamps lit the body but never shadowed
+    // it; only the sun's whole-scene shadow showed. A character light environment of our own, with bCastShadows:
+    // the engine composites the lights around the player into one shadow-casting light, as it does for NPCs.
+    if (g_cfg.castLightEnv) {
+        auto* le = static_cast<UDynamicLightEnvironmentComponent*>(
+            StaticConstructObject(UDynamicLightEnvironmentComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+        if (le) {
+            UDynamicLightEnvironmentComponent* ref = (pawn->Mesh && pawn->Mesh->LightEnvironment && pawn->Mesh->LightEnvironment->IsA(UDynamicLightEnvironmentComponent::StaticClass()))
+                ? static_cast<UDynamicLightEnvironmentComponent*>(pawn->Mesh->LightEnvironment) : nullptr;
+            if (ref) {
+                Log("light env: 1P arms' - enabled %d dynamic %d castShadows %d compositeDyn %d synthDir %d synthSH %d character %d filter %d minAngle %.1f",
+                    ref->bEnabled ? 1 : 0, ref->bDynamic ? 1 : 0, ref->bCastShadows ? 1 : 0, ref->bCompositeShadowsFromDynamicLights ? 1 : 0,
+                    ref->bSynthesizeDirectionalLight ? 1 : 0, ref->bSynthesizeSHLight ? 1 : 0, ref->bIsCharacterLightEnvironment ? 1 : 0,
+                    static_cast<int>(ref->ShadowFilterQuality), ref->MinShadowAngle);
+                le->ShadowFilterQuality = ref->ShadowFilterQuality;
+                le->MinShadowAngle = ref->MinShadowAngle;
+                le->NumVolumeVisibilitySamples = ref->NumVolumeVisibilitySamples;
+            }
+            le->bEnabled = 1;
+            le->bDynamic = 1;
+            le->bCastShadows = 1;
+            le->bCompositeShadowsFromDynamicLights = 1;
+            le->bSynthesizeSHLight = 1;
+            le->bIsCharacterLightEnvironment = 1;
+            le->bForceNonCompositeDynamicLights = 0;
+            pawn->AttachComponent(le);
+            g_castLightEnv = le;
+            a->SetLightEnvironment(le);
+            Log("light env: ours created %p (castShadows 1, dynamic, composite) - on the casting body", le);
+        } else Log("light env: could not create one; the casters keep the 1P arms' environment");
+    }
+    g_shadowBody->CastShadow = 0;   // demoted: pose source for the arm skin only (no double shadow)
+    g_shadowBody->bCastDynamicShadow = 0;
+    g_shadowBody->bCastHiddenShadow = 0;
+    Log("casting body created: %p (sole shadow caster; the shadow body is the skin's pose source)", a);
+    // The holstered shoulders (user 17:38: "keep the shoulder shadows from the holstered arm shadows always on"): a second
+    // never-rendered casting body that gets every pose the casting body gets (legs, lean, slide, jump, coat) except the
+    // weapon arm, so its shoulders are always the holstered ones. UpdateHolsterShoulders folds its forearms and hands away
+    // on a raised side; its shadow joins the casting body's.
+    if (g_cfg.castHolsterShoulders) {
+        auto* hc = static_cast<USkeletalMeshComponent*>(
+            StaticConstructObject(USkeletalMeshComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+        if (hc) {
+            hc->SetSkeletalMesh(ActiveBodyMesh(), false);
+            hc->bUpdateSkelWhenNotRendered = 1;
+            hc->bIgnoreControllersWhenNotRendered = 0;
+            hc->ForcedLodModel = 1;
+            hc->SetLightEnvironment(a->LightEnvironment);
+            hc->HiddenGame = 1;
+            hc->CastShadow = 1;
+            hc->bCastDynamicShadow = 1;
+            hc->bCastHiddenShadow = 1;
+            if (g_cfg.castHolsterShadowParent) hc->SetShadowParent(a);
+            pawn->AttachComponent(hc);
+            int hcMark = g_ourArrayCount;
+            if (SetupBodyAnimation(hc)) {
+                hc->SetHidden(true);
+                g_holsterCast = hc;
+                Log("holstered-shoulder body created: %p (shadow parent %p, upper arm %.2f) | array registry %d of 1024", hc, g_cfg.castHolsterShadowParent ? a : nullptr, g_cfg.castHolsterUpperArm, g_ourArrayCount);
+            } else {
+                if (hc->Animations) DetachNodeArrays(hc->Animations, 0);
+                ForgetArraysSince(hcMark);
+                pawn->DetachComponent(hc);
+                Log("holstered-shoulder body: animation setup failed - off");
+            }
+        } else Log("holstered-shoulder body: could not create it - off");
+    }
+    // Shoulder blobs (user 15:25: "fill the gaps with a shadow"): when the IK raises an arm the rig's shoulder mass does
+    // not follow and a notch opens between the torso and the upper arm. A never-rendered, shadow-only copy of the head
+    // mesh, scaled to a deltoid, sits on that shoulder joint while the arm is up (placed in UpdateCastingArmReach).
+    USkeletalMesh* blobMesh = (g_builtChar == 1 && g_daudHeadMesh) ? g_daudHeadMesh : (g_builtChar == 2 && g_ovsHeadMesh) ? g_ovsHeadMesh : g_headMesh;
+    for (int h = 0; h < 2 && g_cfg.castShoulderBlob > 0.0f && blobMesh; ++h) {
+        auto* b = static_cast<USkeletalMeshComponent*>(
+            StaticConstructObject(USkeletalMeshComponent::StaticClass(), pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+        if (!b) break;
+        b->SetSkeletalMesh(blobMesh, false);
+        b->bUpdateSkelWhenNotRendered = 1;
+        if (g_castLightEnv) b->SetLightEnvironment(g_castLightEnv);
+        else if (pawn->Mesh && pawn->Mesh->LightEnvironment) b->SetLightEnvironment(pawn->Mesh->LightEnvironment);
+        b->HiddenGame = 1;
+        b->CastShadow = 1;
+        b->bCastDynamicShadow = 1;
+        b->bCastHiddenShadow = 1;
+        pawn->AttachComponent(b);
+        b->SetHidden(true);
+        b->SetScale(0.0001f);
+        g_shoulderBlob[h] = b;
+    }
+    if (g_shoulderBlob[0]) Log("shoulder blobs created (%s, scale %.2f)", blobMesh->GetName().c_str(), g_cfg.castShoulderBlob);
+}
+
 static void DetachBody() {
     if (g_head && g_bodyPawn) g_bodyPawn->DetachComponent(g_head);
+    for (int h = 0; h < 2; ++h) if (g_shoulderBlob[h] && g_bodyPawn) g_bodyPawn->DetachComponent(g_shoulderBlob[h]);
+    if (g_castLightEnv && g_bodyPawn) g_bodyPawn->DetachComponent(g_castLightEnv);
     if (g_shadowBody && g_bodyPawn) g_bodyPawn->DetachComponent(g_shadowBody);
+    if (g_shadowArms && g_bodyPawn) g_bodyPawn->DetachComponent(g_shadowArms);
+    if (g_holsterCast && g_bodyPawn) g_bodyPawn->DetachComponent(g_holsterCast);
     if (!g_body || !g_bodyPawn) return;
     if (g_bodyPawn->Mesh) g_bodyPawn->Mesh->DetachComponent(g_body);
     g_bodyPawn->DetachComponent(g_body);
@@ -3059,9 +6212,14 @@ static void DestroyBody() {
     Log("body removed");
     g_body = nullptr;
     g_head = nullptr;
+    g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+    g_castLightEnv = nullptr;
     g_shadowBody = nullptr;
+    g_shadowArms = nullptr;
+    g_holsterCast = nullptr;
     g_itemShadow[0] = g_itemShadow[1] = nullptr;   // owned by the pawn; dropped with it
         g_armsShadow = nullptr;
+        g_armSkin = nullptr;
     g_bodyPawn = nullptr;
 }
 
@@ -3092,6 +6250,7 @@ static void CreateBody(ADishonoredPlayerPawn* pawn) {
     }
     ApplyArmHiding();
     CreateShadowBody(pawn);
+    CreateShadowArms(pawn);
     CreateHeadShadow(pawn, g_shadowBody ? g_shadowBody : comp);
 
     Log("body created (%s): comp=%p mesh=%p parent=%p armsDepthGroup=%d armsLOD=%d", CharName(g_builtChar),
@@ -3123,6 +6282,13 @@ struct MeshSwap {
     int matCount = -1;                        // -1: nothing saved
 };
 static MeshSwap g_armsSwap, g_swordSwap, g_bowSwap;
+
+// Corvo's first-person arms model: the game's own (kept in g_armsSwap.orig while Daud's/the disguise's are shown).
+static USkeletalMesh* CorvoArmsMesh(ADishonoredPlayerPawn* pawn) {
+    if (g_armsSwap.orig) return g_armsSwap.orig;
+    if (g_armsChar == 0 && pawn && pawn->Mesh) return pawn->Mesh->SkeletalMesh;
+    return nullptr;
+}
 
 // A saved override is referenced by nothing once it is off the component (they are transient material instances),
 // so the next GC freed it and putting it back crashed in GetMaterialViewRelevance (build 153). Root it while held.
@@ -3169,6 +6335,9 @@ static void __cdecl OnOvsPackageLoaded(UObject* package, void*) {
         g_ovsHeadMesh = FindLoadedMesh("Skm_Overseer_Head2");
         g_ovsArmsMesh = FindLoadedMesh("DLC07_Skm_Player_DaudOverseer");
         g_ovsSwordMesh = FindLoadedMesh("OverseerSword");
+        g_ovsArmsMat = static_cast<UMaterialInterface*>(FindObjectByName("MaterialInstanceConstant", "DLC07_Player_DaudOverseer_inst"));
+        if (g_ovsArmsMat) Protect(g_ovsArmsMat);
+        Log("Overseer arms material: %s", g_ovsArmsMat ? g_ovsArmsMat->GetFullName().c_str() : "NOT FOUND");
     }
     for (USkeletalMesh* m : { g_ovsBodyMesh, g_ovsHeadMesh, g_ovsArmsMesh, g_ovsSwordMesh }) Protect(m);
     auto name = [](USkeletalMesh* m) { return m ? m->GetFullName() : std::string("NOT FOUND"); };
@@ -3179,6 +6348,7 @@ static void __cdecl OnOvsPackageLoaded(UObject* package, void*) {
 
 static void ForgetOverseer() {
     for (USkeletalMesh** m : { &g_ovsBodyMesh, &g_ovsHeadMesh, &g_ovsArmsMesh, &g_ovsSwordMesh }) { LetGo(*m); *m = nullptr; }
+    if (g_ovsArmsMat) { LetGo(g_ovsArmsMat); g_ovsArmsMat = nullptr; }
     if (g_ovsLoadState != LoadState::Loading) g_ovsLoadState = LoadState::Idle;
 }
 
@@ -3211,10 +6381,16 @@ static void RebuildBodyIfCharacterChanged(ADishonoredPlayerPawn* pawn) {
     DetachBody();
     // As on a pawn change: the old components are purged by a later GC, which must not free our buffers.
     if (g_shadowBody && g_shadowBody->Animations) DetachNodeArrays(g_shadowBody->Animations, 0);
+    if (g_shadowArms && g_shadowArms->Animations) DetachNodeArrays(g_shadowArms->Animations, 0);
+    if (g_holsterCast && g_holsterCast->Animations) DetachNodeArrays(g_holsterCast->Animations, 0);
     DetachOurArrays(g_body);
     g_body = nullptr;
     g_head = nullptr;
+    g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+    g_castLightEnv = nullptr;
     g_shadowBody = nullptr;
+    g_shadowArms = nullptr;
+    g_holsterCast = nullptr;
     g_bodyPawn = nullptr;
 }
 
@@ -3253,7 +6429,7 @@ static USkeletalMesh* ApplyMeshSwap(USkeletalMeshComponent* comp, USkeletalMesh*
         // The game set an override while an alternative mesh is on (e.g. blood on the blade): keep it off it.
         for (int i = 0; i < mats->Num && i < 8; ++i) {
             auto* m = static_cast<UMaterialInterface**>(mats->Data)[i];
-            if (!m) continue;
+            if (!m || m == g_ovsArmsMat) continue;   // (ours - the Overseer arms' own material, ApplyArmsCharacter)
             if (s.matCount < i + 1) { for (int k = s.matCount < 0 ? 0 : s.matCount; k <= i; ++k) s.mats[k] = nullptr; s.matCount = i + 1; }
             HoldMaterial(s, i, m);
             comp->SetMaterial(i, nullptr);
@@ -3424,6 +6600,164 @@ static void DumpSwordTweaks(ADishonoredPlayerPawn* pawn) {
 // Crossbow recon (build 179): Corvo's handheld crossbow vs Daud's wristbow - every crossbow item tweak in memory with
 // its prefix, sockets, player flags and player-specific anim setup, plus where the live crossbow item keeps its
 // tweaks pointer and what its first-person mesh component plays.
+// ---- Per-bow upgrades: DIAGNOSTICS (2026-10-12, user: Piero sells the active bow's upgrades; each bow upgraded on its
+// own). Read-only: what each bow supports, what every bow-related upgrade does (host class, attributes), what the player
+// owns, Piero's store list, and how a bow swap / a purchase changes the owned list and the attribute modifiers.
+static std::string FStr(const void* fstring) {
+    const RawArray* a = static_cast<const RawArray*>(fstring);
+    return (a->Data && a->Num > 0) ? Narrow(static_cast<const wchar_t*>(a->Data)) : std::string();
+}
+
+static std::string UpgName(UObject* u) { return u ? u->GetName() : std::string("null"); }
+
+static std::string DescribeUpgrade(UObject* u) {
+    if (!u) return "null";
+    uint8_t* b = reinterpret_cast<uint8_t*>(u);
+    UObject* host = *reinterpret_cast<UObject**>(b + 0x90);
+    std::string out = ObjName(u) + " | host " + (host ? host->GetName() : std::string("none")) + " | attrs";
+    auto* at = reinterpret_cast<RawArray*>(b + 0x9C);
+    for (int k = 0; at->Data && k < at->Num && k < 8; ++k) {
+        const uint8_t* e = static_cast<const uint8_t*>(at->Data) + k * 12;
+        const FName& n = *reinterpret_cast<const FName*>(e);
+        char v[32]; snprintf(v, sizeof(v), "%g", *reinterpret_cast<const float*>(e + 8));
+        out += " " + (n.IsValid() ? n.ToString() : std::string("?")) + "=" + v;
+    }
+    out += " | section " + std::to_string(static_cast<int>(b[0xD1]));
+    if (UObject* parent = *reinterpret_cast<UObject**>(b + 0xE0)) out += " | parent " + parent->GetName();
+    if (UObject* add = *reinterpret_cast<UObject**>(b + 0xE4)) out += " | adds-if-missing " + add->GetName();
+    auto* rv = reinterpret_cast<RawArray*>(b + 0xA8);
+    for (int k = 0; rv->Data && k < rv->Num && k < 6; ++k) out += " | reverts " + UpgName(static_cast<UObject**>(rv->Data)[k]);
+    if (UObject* am = *reinterpret_cast<UObject**>(b + 0x94)) out += " | attach " + am->GetName();
+    out += " | \"" + FStr(b + 0xB8) + "\"";
+    return out;
+}
+
+static std::string OwnedUpgrades(ADishonoredPlayerPawn* pawn) {
+    if (!pawn) return "-";
+    auto* a = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(pawn) + 0xB50);
+    std::string out = std::to_string(a->Data ? a->Num : 0) + ":";
+    for (int k = 0; a->Data && k < a->Num && k < 64; ++k) out += " " + UpgName(static_cast<UObject**>(a->Data)[k]);
+    return out;
+}
+
+static std::string AttrMods(UObject* attributes) {   // UDisAttributes::m_AttributesWithModifiers (+0x74, TArray<FName>)
+    if (!attributes || IsBadReadPtr(attributes, 0x80)) return "-";
+    auto* a = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(attributes) + 0x74);
+    std::string out;
+    for (int k = 0; a->Data && k < a->Num && k < 32; ++k) {
+        const FName& n = static_cast<const FName*>(a->Data)[k];
+        out += (k ? " " : "") + (n.IsValid() ? n.ToString() : std::string("?"));
+    }
+    return out.empty() ? std::string("none") : out;
+}
+
+static std::string ItemMods(UObject* item) { return item ? AttrMods(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(item) + 0xE4)) : std::string("-"); }
+static std::string PawnMods(ADishonoredPlayerPawn* pawn) { return pawn ? AttrMods(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(pawn) + 0x77C)) : std::string("-"); }
+
+static void DumpUpgradeData(ADishonoredPlayerPawn* pawn, const char* why) {
+    Log("=== per-bow upgrades (%s)", why);
+    struct Bow { const char* label; const char* cls; const char* name; } bows[] = {
+        { "Corvo's crossbow", "DisTweaks_WepCrossbow", "Twk_Inv_CrossbowCorvo" },
+        { "Daud's wristbow (DLC07)", "DisDLC06Tweaks_WepCrossbow", "DLC07_Inv_WristbowDaud" },
+        { "Daud's wristbow (DLC06)", "DisDLC06Tweaks_WepCrossbow", "DLC06_Inv_WristbowDaud" } };
+    for (const Bow& bw : bows) {
+        UObject* t = FindObjectByName(bw.cls, bw.name);
+        if (!t) { Log("  %s: tweaks %s not loaded", bw.label, bw.name); continue; }
+        uint8_t* tb = reinterpret_cast<uint8_t*>(t);
+        UObject* ps = *reinterpret_cast<UObject**>(tb + 0x104);
+        UObject* fb = *reinterpret_cast<UObject**>(tb + 0x88);
+        UObject* spawn = *reinterpret_cast<UObject**>(tb + 0x60);
+        Log("  %s: %s | spawns %s | fallback %s | player-specific %s", bw.label, ObjName(t).c_str(), spawn ? spawn->GetName().c_str() : "-",
+            ObjName(fb).c_str(), ObjName(ps).c_str());
+        if (!ps) continue;
+        auto* sup = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(ps) + 0x170);
+        if (!sup->Data || sup->Num <= 0) Log("    supports no upgrades");
+        for (int k = 0; sup->Data && k < sup->Num && k < 32; ++k) Log("    supports %s", DescribeUpgrade(static_cast<UObject**>(sup->Data)[k]).c_str());
+    }
+    // every upgrade object that sounds bow-related
+    auto* objects = UObject::GObjObjects();
+    int found = 0;
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->Class || o->Class->GetName().find("Tweaks_Upgrade") == std::string::npos) continue;
+        std::string n = o->GetName();
+        if (n.rfind("Default__", 0) == 0) continue;
+        std::string low = n;
+        for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        bool bowish = low.find("crossbow") != std::string::npos || low.find("wristbow") != std::string::npos || low.find("quiver") != std::string::npos ||
+                      low.find("sleep") != std::string::npos || low.find("bolt") != std::string::npos || low.find("arrow") != std::string::npos ||
+                      low.find("dart") != std::string::npos;
+        if (!bowish) continue;
+        ++found;
+        Log("  upgrade %s", DescribeUpgrade(o).c_str());
+    }
+    Log("  %d bow-related upgrade objects in memory", found);
+    if (pawn) {
+        UObject* pt = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(pawn) + 0x748);   // m_pPawnTweaks
+        Log("  pawn tweaks %s: crossbow range upgrade %s", ObjName(pt).c_str(), pt ? UpgName(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(pt) + 0x1C4)).c_str() : "-");
+    }
+    if (UObject* dpt = FindObjectByName("DisDLC07Tweaks_PlayerPawn", "DLC07_Twk_Player_Daud"))
+        Log("  Daud's pawn tweaks: crossbow range upgrade %s", UpgName(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(dpt) + 0x1C4)).c_str());
+    Log("  owned %s", OwnedUpgrades(pawn).c_str());
+    Log("  pawn modifiers: %s", PawnMods(pawn).c_str());
+    // stores
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->Class || o->Class->GetName() != "DisTweaks_Store") continue;
+        if (o->GetName().rfind("Default__", 0) == 0) continue;
+        auto* items = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(o) + 0xC4);
+        Log("  store %s: %d entries", ObjName(o).c_str(), items->Data ? items->Num : 0);
+        for (int k = 0; items->Data && k < items->Num && k < 64; ++k) {
+            uint8_t* e = static_cast<uint8_t*>(items->Data) + k * 0x88;
+            UObject* item = *reinterpret_cast<UObject**>(e + 0x5C);
+            auto* pre = reinterpret_cast<RawArray*>(e + 0x34);
+            std::string pres;
+            for (int q = 0; pre->Data && q < pre->Num && q < 6; ++q) pres += " " + UpgName(static_cast<UObject**>(pre->Data)[q]);
+            auto* cost = reinterpret_cast<RawArray*>(e + 0x28);
+            int price = (cost->Data && cost->Num > 0) ? *static_cast<int*>(cost->Data) : -1;
+            Log("    [%d] \"%s\" sub %d | item %s (%s) | needs%s | vis %d | cost %d", k, FStr(e).c_str(), *reinterpret_cast<int*>(e + 0x24),
+                UpgName(item).c_str(), item && item->Class ? item->Class->GetName().c_str() : "-", pres.empty() ? " -" : pres.c_str(),
+                *reinterpret_cast<int*>(e + 0x40), price);
+        }
+    }
+}
+
+// Once a second: what changed in the owned list (a purchase, a pickup, a load), with the bow in the slot at the time.
+static int CrossbowSlot(ADishonoredPlayerPawn* pawn);
+static UDishonoredInventoryItem*& SlotItem(ADishonoredPlayerPawn* pawn, int slot);
+static void CarryBowUpgrades(ADishonoredPlayerPawn* pawn, UDishonoredInventoryItem* item, const char* why);
+static void WatchOwnedUpgrades(ADishonoredPlayerPawn* pawn) {
+    static ADishonoredPlayerPawn* forPawn = nullptr;
+    static std::vector<UObject*> last;
+    static DWORD lastCheck = 0;
+    if (!pawn) return;
+    DWORD now = GetTickCount();
+    if (pawn == forPawn && now - lastCheck < 1000) return;
+    lastCheck = now;
+    auto* a = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(pawn) + 0xB50);
+    std::vector<UObject*> cur;
+    for (int k = 0; a->Data && k < a->Num && k < 256; ++k) cur.push_back(static_cast<UObject**>(a->Data)[k]);
+    if (pawn != forPawn) {
+        forPawn = pawn;
+        last = cur;
+        Log("upgrades: pawn %p owns %s", pawn, OwnedUpgrades(pawn).c_str());
+        return;
+    }
+    if (cur == last) return;
+    int slot = CrossbowSlot(pawn);
+    UObject* bow = slot >= 0 ? SlotItem(pawn, slot) : nullptr;
+    bool bowUpgradeGained = false;
+    for (UObject* u : cur) if (std::find(last.begin(), last.end(), u) == last.end()) {
+        Log("upgrades: GAINED %s | bow in slot %s | its modifiers: %s | pawn modifiers: %s", DescribeUpgrade(u).c_str(), ObjName(bow).c_str(), ItemMods(bow).c_str(), PawnMods(pawn).c_str());
+        std::string n = UpgName(u);
+        if (n.rfind("Twk_Upgrade_Crossbow_", 0) == 0) bowUpgradeGained = true;
+    }
+    if (bowUpgradeGained && bow) CarryBowUpgrades(pawn, static_cast<UDishonoredInventoryItem*>(bow), "bought");
+    for (UObject* u : last) if (std::find(cur.begin(), cur.end(), u) == cur.end())
+        Log("upgrades: LOST %s | bow in slot %s", UpgName(u).c_str(), ObjName(bow).c_str());
+    last = cur;
+}
+
 static void DumpCrossbowTweaks(ADishonoredPlayerPawn* pawn) {
     Log("=== crossbow tweaks");
     std::vector<UObject*> tweaks;
@@ -3490,7 +6824,7 @@ static void DumpPowersOnce(ADishonoredPlayerPawn* pawn) {
     static ADishonoredPlayerPawn* dumpedFor = nullptr;
     static bool daudDumped = false;
     if (pawn != dumpedFor && g_bodyBuiltTick && GetTickCount() - g_bodyBuiltTick > 8000) { dumpedFor = pawn; DumpPowers(pawn); }
-    if (!daudDumped && g_daudLoadState == LoadState::Loaded) { daudDumped = true; DumpDaudPowers(); DumpCrossbowTweaks(pawn); }
+    if (!daudDumped && g_daudLoadState == LoadState::Loaded) { daudDumped = true; DumpDaudPowers(); DumpCrossbowTweaks(pawn); DumpUpgradeData(pawn, "Daud's package loaded"); }
 }
 
 // ---- Power set. Each active power is a component in pawn->m_ActivePowers, instanced from the pawn's class templates
@@ -3576,6 +6910,17 @@ static void GrabDaudTweaks() {
 }
 
 static UDisTweaks_ActivePowerBase* DaudPowerTweaks(int which) {
+    // Without Better Powers: Blink, ForgetPowerSwaps lets go of the pawn tweaks on every new pawn (save load), but
+    // Daud's package often stays loaded, so nothing grabbed them again: "waiting for Daud's power tweaks (not found)"
+    // forever - his icons, Corvo's powers (2026-10-10, CorvoBody + loader only). Look them up again (every 2 s at most).
+    if (!g_daudPawnTweaks && g_daudLoadState == LoadState::Loaded) {
+        static DWORD lastTry = 0;
+        DWORD now = GetTickCount();
+        if (!lastTry || now - lastTry > 2000) {
+            lastTry = now;
+            if (FindObjectByName("DisDLC07Tweaks_PlayerPawn", "DLC07_Twk_Player_Daud")) GrabDaudTweaks();
+        }
+    }
     if (!g_daudPawnTweaks) return nullptr;
     Protect(g_daudPawnTweaks);
     switch (which) {
@@ -3608,10 +6953,25 @@ static void ForgetCorvoArmsMaterials();
 static void SetPullTarget(void* pawn, void* pull);
 static void ForgetBowItems();
 
+static bool BetterPowersBlinkLoaded();
+static void ForgetCorvoBlink();
+
 static void ForgetPowerSwaps() {
     for (auto& s : g_powerSwaps) { LetGo(s.orig); LetGo(s.daud); s.orig = s.daud = nullptr; s.daudPc = nullptr; }
-    LetGo(g_daudPawnTweaks);
-    g_daudPawnTweaks = nullptr;
+    // Our Corvo Blink and the mod's detached one reference the pawn: still rooted at a level change they kept the old
+    // world alive ("World ... not cleaned up by garbage collection", 15:32). Let go with the other swaps.
+    ForgetCorvoBlink();
+    // Better Powers: Blink keeps a pointer to Daud's Transversal tweaks (DLC06_Pwr_Transversal, reached from these
+    // pawn tweaks) and writes its baseline values through it. Letting go here freed Daud's package on every level
+    // change and the reload made a new tweaks object, so the mod then wrote 1400/400 into whatever reused the old
+    // memory and the next GC crashed (2026-10-08, 13:16). With that mod, keep Daud's tweaks rooted for the session:
+    // the reload then finds the same objects.
+    if (BetterPowersBlinkLoaded() && g_daudPawnTweaks) {
+        Protect(g_daudPawnTweaks);
+    } else {
+        LetGo(g_daudPawnTweaks);
+        g_daudPawnTweaks = nullptr;
+    }
     SetPullTarget(nullptr, nullptr);
     ForgetBowItems();
     ForgetCorvoArmsMaterials();
@@ -3683,6 +7043,141 @@ static unsigned __fastcall HookedSetCurrentPower(UDisItemPowers* self, void*, UD
     return g_origSetCurrentPower(self, comp, flag);
 }
 
+// Blink target clearance (0xBE8F20, only caller the targeting code at 0xBF5DDB). The game backs the target off from
+// what the aim hit, along the view, in steps of half the player's bounding-sphere radius until a player-sized box fits
+// (two SingleLineChecks, 0x64E7A0, trace flags 0x4060DF). Aimed at an NPC that lands up to a whole step further back
+// than needed ("can never blink directly to an npc", 2026-10-09). Keep the game's answer, then search the last step
+// for the closest spot that still fits - never closer than the game's own fit test allows (no landing inside anyone).
+using BlinkClearanceFn = float(__thiscall*)(void* self, float hx, float hy, float hz, float dx, float dy, float dz);
+static BlinkClearanceFn g_origBlinkClearance = nullptr;
+
+static bool BlinkSpotFits(void* pawn, const float* p, const float* extent) {
+    using LineCheckFn = int(__thiscall*)(void* world, void* hit, void* src, const float* end, const float* start,
+                                        uint32_t flags, const float* extent, void* light);
+    auto check = reinterpret_cast<LineCheckFn>(0x0064E7A0);
+    for (float off : { 1.0f, -1.0f }) {   // the game's own two tests: from p+1 and from p-1 to p
+        alignas(16) uint8_t hit[0x80] = {};
+        *reinterpret_cast<int*>(hit + 0x24) = -1;
+        *reinterpret_cast<int*>(hit + 0x44) = -1;
+        float start[3] = { p[0] + off, p[1] + off, p[2] + off };
+        if (!check(GetWorld(), hit, pawn, p, start, 0x4060DF, extent, nullptr)) return false;
+    }
+    return true;
+}
+
+// The targeting code's frame (its EBP when it calls 0xBE8F20) holds the aim trace's FCheckResult: Actor at EBP-0xB4,
+// Location at EBP-0xB0. A naked stub keeps that EBP for the hook (diagnostics: what the aim hit).
+extern "C" uintptr_t g_blinkCallerEbp = 0;
+extern "C" void* g_blinkHookTarget = nullptr;
+extern "C" __attribute__((naked)) void BlinkClearanceStub() {
+    __asm__("movl %ebp, _g_blinkCallerEbp\n\t"
+            "jmp *_g_blinkHookTarget");
+}
+
+static void LogBlinkAim(float back, float tight, float hx, float hy, float hz) {
+    static int logged = 0;
+    if (logged >= 60 || g_blinkCallerEbp < 0x10000) return;
+    auto* actor = *reinterpret_cast<UObject**>(g_blinkCallerEbp - 0xB4);
+    static UObject* last = reinterpret_cast<UObject*>(1);
+    static float lastBack = -1.0f;
+    if (actor == last && fabsf(back - lastBack) < 1.0f) return;   // only changes
+    last = actor; lastBack = back; ++logged;
+    std::string cls = actor && actor->Class ? actor->Class->GetName() : std::string("none");
+    float dist = -1.0f;
+    if (actor && actor->IsA(AActor::StaticClass())) {
+        const FVector& l = static_cast<AActor*>(actor)->Location;
+        dist = sqrtf((l.X - hx) * (l.X - hx) + (l.Y - hy) * (l.Y - hy));
+    }
+    Log("Blink aim: hit %s (%s), hit-to-actor %.0f, back-off %.0f -> %.0f", cls.c_str(), actor ? actor->GetName().c_str() : "-",
+        dist, back, tight);
+}
+
+// Blink through NPCs, with "Pass Through Stumble" (2026-10-09: "lets just make it so we can blink through Npcs";
+// enemies blinked through stagger - user named that Pass Through Stumble and wants it kept). The aim already passes through
+// them, but the Blink move is stopped by their collision, so you end up short of (pushed back from) the NPC. While
+// Blink is being aimed and for 1.5 s after (the move), living pawns don't block: AActor.bBlockActors (+0x128 bit 0)
+// and their cylinder's BlockActors (+0x118 bit 0x40) are cleared and put back afterwards. Restored only for pawns
+// still in the level's pawn list, so a pawn removed in between is never written.
+struct GhostedPawn { APawn* pawn; bool actorBlock; UPrimitiveComponent* cyl; bool cylBlock; };
+static std::vector<GhostedPawn> g_ghosted;
+static ULONGLONG g_lastBlinkAim = 0;
+static bool g_ghostActive = false;
+
+static void GhostNpcs(APawn* player) {
+    g_lastBlinkAim = GetTickCount64();
+    if (g_ghostActive || !player || !player->WorldInfo) return;
+    g_ghostActive = true;
+    int n = 0;
+    for (APawn* p = player->WorldInfo->PawnList; p && n < 2048; p = p->NextPawn, ++n) {
+        if (p == player) continue;
+        auto* flags = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(p) + 0x128);
+        UPrimitiveComponent* cyl = reinterpret_cast<UPrimitiveComponent*>(p->CylinderComponent);
+        auto* cflags = cyl ? reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(cyl) + 0x118) : nullptr;
+        GhostedPawn g{ p, (*flags & 1u) != 0, cyl, cflags && (*cflags & 0x40u) != 0 };
+        if (!g.actorBlock && !g.cylBlock) continue;
+        *flags &= ~1u;
+        if (cflags) *cflags &= ~0x40u;
+        g_ghosted.push_back(g);
+    }
+    static int logged = 0;
+    if (logged++ < 10) Log("Blink through NPCs: %d pawn(s) not blocking (pawn list %d)", static_cast<int>(g_ghosted.size()), n);
+}
+
+static void RestoreNpcs(APawn* player, bool force) {
+    if (!g_ghostActive || (!force && GetTickCount64() - g_lastBlinkAim < 1500)) return;
+    if (player && player->WorldInfo) {
+        int n = 0;
+        for (APawn* p = player->WorldInfo->PawnList; p && n < 2048; p = p->NextPawn, ++n)
+            for (const GhostedPawn& g : g_ghosted) {
+                if (g.pawn != p) continue;
+                if (g.actorBlock) *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(p) + 0x128) |= 1u;
+                if (g.cylBlock && g.cyl == reinterpret_cast<UPrimitiveComponent*>(p->CylinderComponent))
+                    *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(g.cyl) + 0x118) |= 0x40u;
+            }
+    }
+    g_ghosted.clear();
+    g_ghostActive = false;
+}
+
+static float __fastcall HookedBlinkClearance(void* self, void*, float hx, float hy, float hz, float dx, float dy, float dz) {
+    float back = g_origBlinkClearance(self, hx, hy, hz, dx, dy, dz);
+    float result = back;
+    struct AimLog { float& r; float b, x, y, z; ~AimLog() { LogBlinkAim(b, r, x, y, z); } } aimLog{ result, back, hx, hy, hz };
+    {
+        auto* pawn = *reinterpret_cast<char**>(static_cast<char*>(self) + 0x80);
+        auto* coll = pawn ? *reinterpret_cast<char**>(pawn + 0x208) : nullptr;   // CollisionComponent
+        if (!coll) return back;
+        GhostNpcs(reinterpret_cast<APawn*>(pawn));
+        if (!(back > 0.0f)) return back;
+        float step = *reinterpret_cast<float*>(coll + 0xE4) * 0.5f;              // Bounds.SphereRadius / 2
+        float extent[3] = { *reinterpret_cast<float*>(coll + 0xD8), *reinterpret_cast<float*>(coll + 0xDC),
+                            *reinterpret_cast<float*>(pawn + 0x290) };
+        if (!(step > 0.0f) || back - step < -0.01f) return back;
+        auto at = [&](float b, float* p) { p[0] = hx - dx * b; p[1] = hy - dy * b; p[2] = hz - dz * b; };
+        float p[3];
+        at(back, p);
+        if (!BlinkSpotFits(pawn, p, extent)) return back;   // the game ran out of room: leave its answer alone
+        float lo = back - step, hi = back;                      // lo failed (the game's previous try), hi fits
+        for (int i = 0; i < 6; ++i) {
+            float mid = 0.5f * (lo + hi);
+            at(mid, p);
+            (BlinkSpotFits(pawn, p, extent) ? hi : lo) = mid;
+        }
+        result = hi;
+        return hi;
+    }
+}
+
+static void HookBlinkClearance() {
+    const uint8_t expect[] = { 0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x84, 0x00, 0x00, 0x00 };
+    if (memcmp(reinterpret_cast<void*>(0x00BE8F20), expect, sizeof(expect)) == 0 &&
+        (g_blinkHookTarget = reinterpret_cast<void*>(&HookedBlinkClearance)) &&
+        MH_CreateHook(reinterpret_cast<void*>(0x00BE8F20), reinterpret_cast<void*>(&BlinkClearanceStub),
+                      reinterpret_cast<void**>(&g_origBlinkClearance)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(0x00BE8F20)) == MH_OK) Log("Blink clearance hooked");
+    else Log("WARNING: could not hook Blink clearance");
+}
+
 static void HookPowerSaveLoad() {
     const uint8_t scpExpect[] = { 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14, 0x53, 0x56, 0x57, 0x89, 0x4D, 0xFC };
     if (memcmp(reinterpret_cast<void*>(0x00C4BA70), scpExpect, sizeof(scpExpect)) == 0 &&
@@ -3716,12 +7211,26 @@ static const LegacyFix kLegacyFixes[] = {
     { "DisDLC06ActivePowerComponent_DarkVision",  "DisActivePowerComponent_DarkVision",   0x01168870, 0x01168850 },
 };
 
+// With Better Powers: Blink installed, the pawn's Transversal PowerBlink is that mod's own, live component (it swaps
+// the PowerBlink template's class at startup), not a leftover: converting it back fought the mod's swap and left an
+// object the garbage collector walked with the wrong layout (crashes 2026-10-08, GC at 0x465894 reading Better
+// Powers' range values as object references). So the Transversal fix only runs without that mod.
+static bool BetterPowersBlinkLoaded() {
+    static int loaded = -1;
+    if (loaded < 0) {
+        loaded = GetModuleHandleA("BetterPowersBlink.dll") != nullptr;
+        Log("Better Powers: Blink %s - legacy Transversal fix %s", loaded ? "loaded" : "not loaded", loaded ? "off" : "on");
+    }
+    return loaded == 1;
+}
+
 static void FixLegacyPowerComponents(ADishonoredPlayerPawn* pawn, RawArray* arr) {
     for (int i = 0; i < arr->Num; ++i) {
         auto* c = static_cast<UDishonoredActivePowerComponent**>(arr->Data)[i];
         if (!c || c->Outer != pawn) continue;   // ours are in the transient package
         for (const LegacyFix& f : kLegacyFixes) {
             if (c->Class->GetName() != f.daudClass) continue;
+            if (f.corvoClass == kLegacyFixes[0].corvoClass && BetterPowersBlinkLoaded()) continue;
             UClass* cls = UObject::FindClass((std::string("Class DishonoredGame.") + f.corvoClass).c_str());
             auto* cdo = static_cast<UDishonoredActivePowerComponent*>(
                 FindObjectByName(f.corvoClass, (std::string("Default__") + f.corvoClass).c_str()));
@@ -3995,7 +7504,7 @@ static void __cdecl OnDaudUiLoaded(UObject* package, void*) {
 }
 
 static void LoadDaudUi() {
-    if (g_daudUiLoading || g_daudUiNext >= static_cast<LONG>(sizeof(kDaudUiPackages) / sizeof(kDaudUiPackages[0])) || !LoadPackageAsync) return;
+    if (g_daudUiLoading || g_daudUiNext >= static_cast<LONG>(sizeof(kDaudUiPackages) / sizeof(kDaudUiPackages[0])) || !RawLoadPackageAsync) return;
     InterlockedExchange(&g_daudUiLoading, 1);
     FString name(kDaudUiPackages[g_daudUiNext]);
     LoadPackageAsync(name, &OnDaudUiLoaded, nullptr, nullptr);
@@ -4192,14 +7701,123 @@ static void ApplyBladeEquipStyle(bool daudBlade) {
     applied = daudBlade ? 1 : 0;
 }
 
+// ---- Corvo's own Blink with Better Powers: Blink installed (2026-10-08). That mod swaps the PowerBlink template's
+// class to Daud's Transversal, so Corvo's Blink is a time-pausing Transversal even with Body Swap's Powers row on
+// Corvo. Converting it in place crashed (the mod keeps using it), so with the Corvo set we put a separate, genuine
+// Corvo Blink (transient package, from the class defaults: name Blink, Corvo's tweaks) in the slot and keep the mod's
+// component detached and alive; with Daud's set (or the mod gone) the mod's component goes back first, so Daud's
+// swap below takes it as "Corvo's original" as before. Saves write the pawn's own component (HookedPawnGameSave,
+// HookedGameSaveInventory) and levels by name, so the mod's component gets this one's level.
+static UDishonoredActivePowerComponent* g_corvoBlink = nullptr;   // ours (transient)
+static UDishonoredActivePowerComponent* g_bpBlink = nullptr;      // the mod's (pawn's own), detached while ours is in
+
+static void ForgetCorvoBlink() {
+    LetGo(g_corvoBlink); LetGo(g_bpBlink);
+    g_corvoBlink = g_bpBlink = nullptr;
+}
+
+static void SwapPowerSlot(ADishonoredPlayerPawn* pawn, int idx, UDishonoredActivePowerComponent* out, UDishonoredActivePowerComponent* in) {
+    auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
+    in->m_CurrentLevel = out->m_CurrentLevel;
+    CancelPowerIfActive(out);
+    pawn->DetachComponent(out);
+    static_cast<UDishonoredActivePowerComponent**>(arr->Data)[idx] = in;
+    pawn->AttachComponent(in);
+    RetargetPowerPointers(pawn, out, in);
+    PowerLevelChanged(pawn, idx, in->m_CurrentLevel);
+}
+
+// Put the mod's Blink back (Daud's set, or the mod not loaded).
+static void RestoreModBlink(ADishonoredPlayerPawn* pawn) {
+    if (!g_corvoBlink || !g_bpBlink) return;
+    auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
+    for (int i = 0; arr->Data && i < arr->Num; ++i) {
+        if (static_cast<UDishonoredActivePowerComponent**>(arr->Data)[i] != g_corvoBlink) continue;
+        Log("Corvo Blink: Better Powers' Blink back in slot %d (level %d)", i, g_corvoBlink->m_CurrentLevel);
+        SwapPowerSlot(pawn, i, g_corvoBlink, g_bpBlink);
+        LetGo(g_bpBlink);
+        g_bpBlink = nullptr;
+        return;
+    }
+}
+
+// Corvo's set with the mod: replace its Transversal Blink with a genuine Corvo Blink.
+static void InstallCorvoBlink(ADishonoredPlayerPawn* pawn) {
+    auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
+    static UClass* transversal = nullptr;   // runs every tick: look the class up once (FindClass walks every object)
+    if (!transversal) transversal = UObject::FindClass("Class DishonoredGame.DisDLC06ActivePowerComponent_Transversal");
+    for (int i = 0; transversal && arr->Data && i < arr->Num; ++i) {
+        auto* cur = static_cast<UDishonoredActivePowerComponent**>(arr->Data)[i];
+        if (!cur || cur == g_corvoBlink || cur->Outer != pawn || cur->Class != transversal) continue;
+        if (cur->m_PowerName.ToString() != "Blink") continue;   // the mod's (Corvo's name), not Daud's own
+        if (!g_corvoBlink) {
+            UClass* cls = UDishonoredActivePowerComponent_Blink::StaticClass();
+            g_corvoBlink = static_cast<UDishonoredActivePowerComponent*>(
+                StaticConstructObject(cls, TransientPackage() ? TransientPackage() : pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+            if (!g_corvoBlink) { Log("Corvo Blink: could not construct"); return; }
+            KeepAlive(g_corvoBlink);
+            Log("Corvo Blink: made %s (name %s, ui %d, tweaks %s)", ObjName(g_corvoBlink).c_str(),
+                g_corvoBlink->m_PowerName.ToString().c_str(), static_cast<int>(g_corvoBlink->m_eUISelection),
+                ObjName(g_corvoBlink->m_pPowerTweaks).c_str());
+        }
+        Log("Corvo Blink: in for Better Powers' Blink in slot %d (level %d)", i, cur->m_CurrentLevel);
+        KeepAlive(cur);
+        g_bpBlink = cur;
+        SwapPowerSlot(pawn, i, cur, g_corvoBlink);
+        return;
+    }
+}
+
+// Better Powers: Blink puts its menu settings (range, horizontal/vertical range, cooldown, mana cost) on the tweaks
+// of its own Blink component (the pawn's own PowerBlink). With Body Swap the Blink in use is ours (Corvo's genuine
+// Blink, or Daud's Transversal with his tweaks), and the mod's provisioning of Daud's tweaks does not survive Body
+// Swap's package handling ("baseline capture FAILED", 2026-10-08 15:17) - so copy those settings onto the tweaks of
+// the Blink actually in the slot. Logged whenever something is copied.
+static void SyncBlinkSettings(ADishonoredPlayerPawn* pawn, bool wantDaud) {
+    UDishonoredActivePowerComponent* mod = g_bpBlink ? g_bpBlink : g_powerSwaps[0].orig;
+    UDishonoredActivePowerComponent* active = wantDaud ? g_powerSwaps[0].daud : g_corvoBlink;
+    auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
+    bool inSlot = false;
+    for (int i = 0; active && arr->Data && i < arr->Num; ++i) inSlot |= static_cast<UObject**>(arr->Data)[i] == active;
+    if (!mod || !active || !inSlot || !mod->m_pPowerTweaks || !active->m_pPowerTweaks) return;
+    if (!mod->m_pPowerTweaks->IsA(UDisTweaks_Blink::StaticClass()) || !active->m_pPowerTweaks->IsA(UDisTweaks_Blink::StaticClass())) return;
+    auto* src = static_cast<UDisTweaks_Blink*>(mod->m_pPowerTweaks);
+    auto* dst = static_cast<UDisTweaks_Blink*>(active->m_pPowerTweaks);
+    if (src == dst) return;
+    bool changed = dst->m_ManaCost != src->m_ManaCost;
+    for (int l = 0; l < 2; ++l) {
+        const FPowerAttributes_Blink& a = src->m_Levels[l];
+        const FPowerAttributes_Blink& b = dst->m_Levels[l];
+        changed |= a.m_Distance != b.m_Distance || a.m_HorizDistance != b.m_HorizDistance ||
+                   a.m_VertDistance != b.m_VertDistance || a.m_fCooldownTime != b.m_fCooldownTime;
+    }
+    if (!changed) return;
+    static int logged = 0;
+    if (logged++ < 20)
+        Log("Blink settings from Better Powers (%s) -> %s: range %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f (level 1), "
+            "%.0f/%.0f/%.0f (level 2), cooldown %.2f, mana %d -> %d", ObjName(src).c_str(), ObjName(dst).c_str(),
+            dst->m_Levels[0].m_Distance, dst->m_Levels[0].m_HorizDistance, dst->m_Levels[0].m_VertDistance,
+            src->m_Levels[0].m_Distance, src->m_Levels[0].m_HorizDistance, src->m_Levels[0].m_VertDistance,
+            src->m_Levels[1].m_Distance, src->m_Levels[1].m_HorizDistance, src->m_Levels[1].m_VertDistance,
+            src->m_Levels[0].m_fCooldownTime, dst->m_ManaCost, src->m_ManaCost);
+    dst->m_ManaCost = src->m_ManaCost;
+    for (int l = 0; l < 2; ++l) {
+        dst->m_Levels[l].m_Distance = src->m_Levels[l].m_Distance;
+        dst->m_Levels[l].m_HorizDistance = src->m_Levels[l].m_HorizDistance;
+        dst->m_Levels[l].m_VertDistance = src->m_Levels[l].m_VertDistance;
+        dst->m_Levels[l].m_fCooldownTime = src->m_Levels[l].m_fCooldownTime;
+    }
+}
+
 static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
     if (!pawn || !pawn->Class || pawn->Class->GetName() != "DishonoredPlayerPawn") return;   // not in Daud's own DLC
-    if (pawn != g_powerPawn) { ForgetPowerSwaps(); g_powerPawn = pawn; }
+    if (pawn != g_powerPawn) { ForgetPowerSwaps(); ForgetCorvoBlink(); g_powerPawn = pawn; }
     KeepCorvoArmsMaterial(pawn);
     auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
     if (!arr->Data || arr->Num <= 0 || arr->Num > 16) return;
     FixLegacyPowerComponents(pawn, arr);
     bool wantDaud = g_powerChar == 1;
+    if (wantDaud || !BetterPowersBlinkLoaded()) RestoreModBlink(pawn);   // before Daud's swap reads the slot
     if (g_daudLoadState == LoadState::Loaded) LoadDaudUi();
     static int lastWait = -1;
     int wait = !wantDaud ? 0 : g_daudLoadState != LoadState::Loaded ? 1 : !DaudPowerTweaks(0) ? 2 : 0;
@@ -4208,6 +7826,19 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
         if (wait) Log("Power set: waiting for %s", wait == 1 ? "Daud's package" : "Daud's power tweaks (not found)");
     }
     ApplyBladeEquipStyle(g_bladeChar != 0);   // Daud's and the Overseer's straight blades: quick draw, no flick
+    // Summon Assassin with (practically) unlimited range: its tweaks cap the targeting trace at 2000 units (~20 m).
+    // Daud's tweaks stay loaded while his set is used, so setting it here sticks; the original is logged once.
+    if (g_daudLoadState == LoadState::Loaded) {
+        UObject* t = DaudPowerTweaks(2);
+        if (t && t->IsA(UDisDLC06Tweaks_SummonAssassin::StaticClass())) {
+            auto* summon = static_cast<UDisDLC06Tweaks_SummonAssassin*>(t);
+            constexpr float kSummonRange = 1000000.0f;   // 10 km
+            if (summon->m_fTargetingRange != kSummonRange) {
+                Log("Summon Assassin: targeting range %.0f -> %.0f (%s)", summon->m_fTargetingRange, kSummonRange, ObjName(t).c_str());
+                summon->m_fTargetingRange = kSummonRange;
+            }
+        }
+    }
     if (wantDaud && !wait) EnsureDaudPowerAnims(pawn);
     for (int si = 0; si < kPowerSwapCount; ++si) {
         PowerSwap& s = g_powerSwaps[si];
@@ -4257,6 +7888,8 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
             s.orig = nullptr;   // Daud's stays (rooted, detached) so its level goes into saves and comes back
         }
     }
+    if (!wantDaud && BetterPowersBlinkLoaded()) InstallCorvoBlink(pawn);   // after Daud's Blink went back out
+    if (BetterPowersBlinkLoaded()) SyncBlinkSettings(pawn, wantDaud);
 }
 
 // ---- Diagnostic (build 161): why Pull / Summon Assassin do nothing on Corvo, and how Daud's sword draw differs.
@@ -4787,7 +8420,35 @@ static UDishonoredInventoryItem*& SlotItem(ADishonoredPlayerPawn* pawn, int slot
     return *reinterpret_cast<UDishonoredInventoryItem**>(static_cast<uint8_t*>(slots->Data) + slot * 12);
 }
 
+// The game's own "equip an item of this type" (the Kismet action DisSeqAct_EquipItemType, handled natively by
+// ADishonoredPawn::OnEquipItemType): one action object per pawn, made from the class defaults (so its links exist),
+// pointed at the item class each time. Secondary hand (usage 2), instantly or with the equip animation.
+static UDisSeqAct_EquipItemType* g_equipAct = nullptr;
+static ADishonoredPlayerPawn* g_equipActPawn = nullptr;
+static int g_bowAutoSwitch = 0;          // 1: we put the drawn bow away to swap it - draw the new one once it's in
+static DWORD g_bowAutoSwitchTick = 0;
+static int g_bowAutoSwitchFailedFor = -1;   // the choice a stalled attempt was for (not retried until it changes)
+
+static bool EquipItemType(ADishonoredPlayerPawn* pawn, UClass* cls, bool instantly) {
+    if (!pawn || !cls) return false;
+    if (g_equipActPawn != pawn) { if (g_equipAct) LetGo(g_equipAct); g_equipAct = nullptr; g_equipActPawn = pawn; }
+    if (!g_equipAct) {
+        UClass* actCls = UDisSeqAct_EquipItemType::StaticClass();
+        if (!actCls) return false;
+        g_equipAct = static_cast<UDisSeqAct_EquipItemType*>(StaticConstructObject(actCls, pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+        if (!g_equipAct) return false;
+        KeepAlive(g_equipAct);
+    }
+    g_equipAct->m_pItemTypeToEquip = cls;
+    g_equipAct->m_PreferredUsage = EDisEquipUsage::EDisEquipUsage_Secondary;
+    g_equipAct->m_bDoInstantly = instantly ? 1 : 0;
+    g_equipAct->m_bAffectsAIIntention = 0;
+    pawn->OnEquipItemType(g_equipAct);
+    return true;
+}
+
 static void ForgetBowItems() {
+    g_bowAutoSwitch = 0;
     for (auto*& it : g_bowKept) { LetGo(it); it = nullptr; }
     g_bowPawn = nullptr;
     // Found again next level (the wristbow's holder restriction lifted again). Corvo's settings are a campaign asset
@@ -4802,6 +8463,109 @@ static void ForgetBowItems() {
 // pawn, so every add returned null (build 181 retried it every frame). Only that insert reads it with HasTweaks.
 static bool IsDaudBow(UDishonoredInventoryItem* item) {
     return item && ((g_daudBowTweaks && ItemTweaks(item) == g_daudBowTweaks) || item->Class->GetName() == "DisDLC06WepCrossbow");
+}
+
+// ---- Bow upgrades carry over (user 2026-10-12). Piero sells Corvo's crossbow upgrades as always; whatever is owned works
+// on whichever bow is in the slot.
+//  - Corvo's three bow upgrades (accuracy, range, reload: host class DisWepCrossbow) can never reach the wristbow item - the
+//    game finds the bow by EXACT class and the wristbow is a DisDLC06WepCrossbow. So the wristbow gets their DLC twins
+//    (dlc06_*, identical attribute values, no attach mesh) put on its item with the item's own ApplyUpgrade (0xC122A0:
+//    removes then applies, so repeating it is safe). That only takes upgrades the bow's tweaks list as supported, and the
+//    wristbow ships listing only its reload one - the twins are added to its m_SupportedUpgrades (grown with the engine's
+//    allocator). Nothing is added to the owned list: saves stay vanilla, Piero's "owned" stays Corvo's.
+//  - Bolt capacity / combat sleep darts are player attributes (no host class): shared already.
+//  - Piero's crossbow entries (and the bolts) list Corvo's crossbow tweaks as a prerequisite: while the wristbow is in the
+//    slot that prerequisite points at the wristbow's tweaks instead (and back when Corvo's returns).
+//  - A purchase made while the wristbow is in hand lands on no item: its twin goes onto the wristbow at once, and Corvo's
+//    crossbow gets the owned upgrades re-applied whenever it comes back into the slot.
+static const char* kBowUpgradeTwins[3][2] = {
+    { "Twk_Upgrade_Crossbow_Accuracy", "dlc06_Upgrade_Wristbow_Acc" },
+    { "Twk_Upgrade_Crossbow_Range", "dlc06_Upgrade_Wristbow_Range" },
+    { "Twk_Upgrade_Crossbow_ReloadSpeed", "DLC06_Upgrd_Wristbow_ReloadSpeed" } };
+
+static bool PawnOwnsUpgrade(ADishonoredPlayerPawn* pawn, UObject* upg) {
+    if (!pawn || !upg) return false;
+    auto* a = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(pawn) + 0xB50);   // m_Upgrades
+    for (int k = 0; a->Data && k < a->Num && k < 256; ++k) if (static_cast<UObject**>(a->Data)[k] == upg) return true;
+    return false;
+}
+
+static bool ItemApplyUpgradeOk() {   // the function's first bytes, once: push ebp / mov ebp,esp / mov eax,[ebp+8] / push esi / push edi
+    static int ok = -1;
+    if (ok < 0) {
+        static const uint8_t want[8] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x56, 0x57 };
+        ok = memcmp(reinterpret_cast<const void*>(0x00C122A0), want, sizeof(want)) == 0 ? 1 : 0;
+        if (!ok) Log("WARNING: bow upgrades - the game's ApplyUpgrade isn't where expected; carry-over off");
+    }
+    return ok == 1;
+}
+
+static bool BowSupports(UObject* bowTweaks, UObject* upg, bool add) {
+    if (!bowTweaks || !upg) return false;
+    UObject* ps = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(bowTweaks) + 0x104);   // m_pPlayerSpecificTweaks
+    if (!ps) return false;
+    auto* sup = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(ps) + 0x170);           // m_SupportedUpgrades
+    for (int k = 0; sup->Data && k < sup->Num && k < 64; ++k) if (static_cast<UObject**>(sup->Data)[k] == upg) return true;
+    if (!add || sup->Num < 0 || sup->Num > 60) return false;
+    if (sup->Max < sup->Num + 1 && !GrowArray(sup, 4, sup->Num + 4)) return false;
+    static_cast<UObject**>(sup->Data)[sup->Num++] = upg;
+    Log("bow upgrades: %s now takes %s", ObjName(ps).c_str(), upg->GetName().c_str());
+    return true;
+}
+
+// The owned crossbow upgrades onto this bow item (Corvo's: the upgrades themselves; the wristbow: their twins).
+static void CarryBowUpgrades(ADishonoredPlayerPawn* pawn, UDishonoredInventoryItem* item, const char* why) {
+    if (!g_cfg.crossbowUpgradesCarryOver || !pawn || !item || !ItemApplyUpgradeOk()) return;
+    bool daud = IsDaudBow(item);
+    if (daud && !g_daudBowTweaks) return;
+    std::string done;
+    for (auto& tw : kBowUpgradeTwins) {
+        UObject* corvoUpg = FindObjectByName("DisTweaks_Upgrade", tw[0]);
+        if (!corvoUpg || !PawnOwnsUpgrade(pawn, corvoUpg)) continue;
+        UObject* use = corvoUpg;
+        if (daud) {
+            use = FindObjectByName("DisTweaks_Upgrade", tw[1]);
+            if (!use) { Log("bow upgrades: %s not loaded - %s can't carry over to the wristbow", tw[1], tw[0]); continue; }
+            if (!BowSupports(g_daudBowTweaks, use, true)) { Log("bow upgrades: couldn't make the wristbow take %s", tw[1]); continue; }
+        }
+        int r = reinterpret_cast<int(__thiscall*)(void*, void*)>(0x00C122A0)(item, use);
+        done += std::string(done.empty() ? "" : ", ") + use->GetName() + (r ? "" : " (refused)");
+    }
+    if (!done.empty()) Log("bow upgrades (%s): %s got %s | its modifiers now: %s", why, daud ? "the wristbow" : "Corvo's crossbow", done.c_str(), ItemMods(item).c_str());
+}
+
+// Piero's prerequisite follows the bow in the slot (once a second; the store object is cached per world).
+static void PointStoreAtBow(ADishonoredPlayerPawn* pawn) {
+    if (!g_cfg.crossbowUpgradesCarryOver || !pawn) return;
+    static DWORD last = 0;
+    static void* forWorld = nullptr;
+    static UObject* store = nullptr;
+    static DWORD lastFind = 0;
+    DWORD now = GetTickCount();
+    if (now - last < 1000) return;
+    last = now;
+    if (GetWorld() != forWorld) { forWorld = GetWorld(); store = nullptr; lastFind = 0; }
+    if (!store && (!lastFind || now - lastFind > 10000)) {
+        lastFind = now;
+        store = FindObjectByName("DisTweaks_Store", "Twk_Store_Craftsman");
+    }
+    if (!store) return;
+    int slot = CrossbowSlot(pawn);
+    UDishonoredInventoryItem* bow = slot >= 0 ? SlotItem(pawn, slot) : nullptr;
+    if (!bow || !g_corvoBowTweaks || !g_daudBowTweaks) return;
+    bool daud = IsDaudBow(bow);
+    UObject* want = daud ? static_cast<UObject*>(g_daudBowTweaks) : static_cast<UObject*>(g_corvoBowTweaks);
+    UObject* other = daud ? static_cast<UObject*>(g_corvoBowTweaks) : static_cast<UObject*>(g_daudBowTweaks);
+    auto* items = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(store) + 0xC4);   // m_StoreItems
+    int changed = 0;
+    for (int k = 0; items->Data && k < items->Num && k < 128; ++k) {
+        auto* pre = reinterpret_cast<RawArray*>(static_cast<uint8_t*>(items->Data) + k * 0x88 + 0x34);   // m_Prerequisites
+        for (int q = 0; pre->Data && q < pre->Num && q < 16; ++q) {
+            UObject*& o = static_cast<UObject**>(pre->Data)[q];
+            if (o == other) { o = want; ++changed; }
+        }
+    }
+    if (changed) Log("bow upgrades: Piero's store - %d entries now need %s", changed, daud ? "the wristbow" : "Corvo's crossbow");
 }
 
 static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
@@ -4823,7 +8587,36 @@ static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
             AddArmsAnimSet(pawn, "DLC06_PlyDaud_Wristbow_as");
         }
     }
-    if (cur == g_handItem[0] || cur == g_handItem[1]) return;   // only while it is put away
+    if (cur == g_handItem[0] || cur == g_handItem[1]) {   // only while it is put away...
+        // ...but a new choice made while holding a bow (user): put it away at once, the swap below then happens and the new
+        // bow is drawn (g_bowAutoSwitch). The empty hand first; if the bow is still in hand after 0.8 s, the powers hand;
+        // after 3 s give up (not retried until the choice changes again).
+        bool pendingDaud = g_bowChar == 1, curDaud = IsDaudBow(cur);
+        if (pendingDaud == curDaud) { g_bowAutoSwitch = 0; g_bowAutoSwitchFailedFor = -1; }
+        if (g_cfg.crossbowSwapInHand && pendingDaud != curDaud && (!pendingDaud || g_daudLoadState == LoadState::Loaded) &&
+            g_bowAutoSwitchFailedFor != g_bowChar) {
+            DWORD t = GetTickCount();
+            static bool triedPowers = false;
+            if (g_bowAutoSwitch == 0) {
+                g_bowAutoSwitch = 1;
+                g_bowAutoSwitchTick = t;
+                triedPowers = false;
+                bool ok = EquipItemType(pawn, UObject::FindClass("Class DishonoredGame.DishonoredItemEmpty"), true);
+                Log("crossbow: %s chosen while holding %s - putting it away to swap (%s)", pendingDaud ? "Daud's wristbow" : "Corvo's crossbow",
+                    ObjName(cur).c_str(), ok ? "ok" : "the equip action could not be made");
+            } else if (!triedPowers && t - g_bowAutoSwitchTick > 800) {
+                triedPowers = true;
+                bool ok = EquipItemType(pawn, UObject::FindClass("Class DishonoredGame.DisItemPowers"), true);
+                Log("crossbow: still in hand - equipping the powers hand instead (%s)", ok ? "ok" : "failed");
+            } else if (t - g_bowAutoSwitchTick > 3000) {
+                g_bowAutoSwitch = 0;
+                g_bowAutoSwitchFailedFor = g_bowChar;
+                Log("crossbow: the bow stayed in hand - swap it by holstering it yourself (not retried until the choice changes)");
+            }
+        }
+        return;
+    }
+    if (g_bowAutoSwitch && GetTickCount() - g_bowAutoSwitchTick < 250) return;   // (a beat after putting it away before swapping)
     if (!g_corvoBowTweaks) {
         g_corvoBowTweaks = static_cast<UDisTweaks_InventoryItem*>(FindObjectByName("DisTweaks_WepCrossbow", "Twk_Inv_CrossbowCorvo"));
         if (g_corvoBowTweaks) KeepAlive(g_corvoBowTweaks);
@@ -4833,6 +8626,10 @@ static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
     // A failed swap is not retried until the menu choice changes again.
     static int failedWant = -1, lastChoice = -1;
     if (lastChoice != g_bowChar) { lastChoice = g_bowChar; failedWant = -1; }
+    if (g_bowAutoSwitch && (wantDaud == isDaud || failedWant == (wantDaud ? 1 : 0))) {   // (put away for a swap that is no longer wanted)
+        g_bowAutoSwitch = 0;
+        if (cur && cur->Class) { bool ok = EquipItemType(pawn, cur->Class, false); Log("crossbow: no swap after all - drawing %s again (%s)", ObjName(cur).c_str(), ok ? "ok" : "failed"); }
+    }
     if (wantDaud == isDaud || failedWant == (wantDaud ? 1 : 0)) return;
     if (wantDaud) {
         if (g_daudLoadState != LoadState::Loaded) return;
@@ -4851,6 +8648,9 @@ static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
     }
     UDisTweaks_InventoryItem* want = wantDaud ? g_daudBowTweaks : g_corvoBowTweaks;
     uint8_t usage = *(reinterpret_cast<uint8_t*>(want) + 0x8D);   // m_RequiredEquipUsage
+    Log("per-bow upgrades: swap %s -> %s | owned %s | outgoing bow modifiers: %s | kept %s modifiers: %s | pawn modifiers: %s",
+        ObjName(cur).c_str(), wantDaud ? "Daud's wristbow" : "Corvo's crossbow", OwnedUpgrades(pawn).c_str(), ItemMods(cur).c_str(),
+        ObjName(g_bowKept[wantDaud ? 1 : 0]).c_str(), ItemMods(g_bowKept[wantDaud ? 1 : 0]).c_str(), PawnMods(pawn).c_str());
     // Take the current one out of the slot and keep it.
     LetGo(g_bowKept[isDaud ? 1 : 0]);
     g_bowKept[isDaud ? 1 : 0] = cur;
@@ -4873,6 +8673,18 @@ static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
             g_bowKept[isDaud ? 1 : 0] = nullptr;
             LetGo(cur);
             failedWant = wantDaud ? 1 : 0;
+        }
+    }
+    {
+        UDishonoredInventoryItem* now = SlotItem(pawn, slot);
+        Log("per-bow upgrades: after the swap the slot holds %s | its modifiers: %s | owned %s", ObjName(now).c_str(), ItemMods(now).c_str(), OwnedUpgrades(pawn).c_str());
+        if (now && now != cur) CarryBowUpgrades(pawn, now, "bow swapped in");
+        if (g_bowAutoSwitch) {
+            g_bowAutoSwitch = 0;
+            if (now && now->Class) {   // (the new bow - or the old one back if the swap failed: never leave the hand empty)
+                bool ok = EquipItemType(pawn, now->Class, false);
+                Log("crossbow: drawing %s (%s)", ObjName(now).c_str(), ok ? "ok" : "failed");
+            }
         }
     }
 }
@@ -4909,12 +8721,12 @@ static void HookPlayerSave() {
 
 static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !pawn->Mesh) return;
     if (!g_bodyBuiltTick && g_body) g_bodyBuiltTick = GetTickCount();
-    bool needPackage = (g_armsChar == 1 && !g_daudArmsMesh) || (g_bladeChar == 1 && !g_daudSwordMesh) || (g_bowChar == 1 && !g_daudBowMesh) ||
+    bool needPackage = (g_armsChar == 1 && !g_daudArmsMesh) || (g_bodyChar == 1 && g_cfg.fpArmSkin && !g_daudArmsMesh) || (g_bladeChar == 1 && !g_daudSwordMesh) || (g_bowChar == 1 && !g_daudBowMesh) ||
                        (g_powerChar == 1 && g_daudLoadState != LoadState::Loaded);
     if (needPackage) {
         // Load only once our body has been in use a while: a second package load before that tore down the
         // first package's mesh data (tests 12-15).
-        if (g_daudLoadState == LoadState::Idle && g_ovsLoadState != LoadState::Loading && LoadPackageAsync && g_body &&
+        if (g_daudLoadState == LoadState::Idle && g_ovsLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
             g_bodyAnimated && GetTickCount() - g_bodyBuiltTick > 3000) {
             Log("Body Swap: async loading %s", Narrow(kDaudPackage).c_str());
             g_daudLoadState = LoadState::Loading;
@@ -4930,9 +8742,10 @@ static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !p
     Protect(g_daudSwordMesh);
     Protect(g_daudBowMesh);
     // Overseer disguise (build 200): its package, on demand, one package load at a time (never alongside Daud's).
-    bool needOvs = (g_bodyChar == 2 && !g_ovsBodyMesh) || (g_armsChar == 2 && !g_ovsArmsMesh) || (g_bladeChar == 2 && !g_ovsSwordMesh);
+    bool needOvs = (g_bodyChar == 2 && !g_ovsBodyMesh) || (g_armsChar == 2 && !g_ovsArmsMesh) ||
+                   (g_bodyChar == 2 && g_cfg.fpArmSkin && !g_ovsArmsMesh) || (g_bladeChar == 2 && !g_ovsSwordMesh);
     if (needOvs) {
-        if (g_ovsLoadState == LoadState::Idle && g_daudLoadState != LoadState::Loading && LoadPackageAsync && g_body &&
+        if (g_ovsLoadState == LoadState::Idle && g_daudLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
             g_bodyAnimated && GetTickCount() - g_bodyBuiltTick > 3000) {
             Log("Body Swap: async loading %s (Overseer disguise)", Narrow(kOvsPackage).c_str());
             g_ovsLoadState = LoadState::Loading;
@@ -4955,10 +8768,39 @@ static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !p
     if (!settled) { settledSince = 0; return; }
     if (!settledSince) settledSince = GetTickCount();
     if (GetTickCount() - settledSince < 300) return;
+    // ...and with quiet hands (18:4x: the swap replaced the 1P arms mesh and rebuilt the anim state maps 0.1 s into the
+    // crossbow's draw - the draw never finished, so the crossbow could neither fire nor be put away). Whenever anything
+    // structural is due (a new pawn, arms or sword component, a character choice, a package that just finished
+    // loading), it waits until the held items have not changed for 1 s and both are on an idle animation (or the same
+    // non-idle one for 3 s - a held pose). Routine upkeep after that runs every frame as before.
+    {
+        struct SwapSig { void* pawn; void* arms; void* sword; int armsChar, bladeChar, bowChar, powerChar, bodyChar, daud, ovs; };
+        static SwapSig applied = {};
+        SwapSig now = { pawn, pawn->Mesh, FindSwordMesh(pawn), g_armsChar, g_bladeChar, g_bowChar, g_powerChar, g_bodyChar,
+                        static_cast<int>(g_daudLoadState), static_cast<int>(g_ovsLoadState) };
+        if (memcmp(&now, &applied, sizeof(SwapSig)) != 0) {
+            DWORD t = GetTickCount();
+            bool stable = t - g_handsChangedTick >= 1000;
+            bool quiet = stable && (g_handsAllIdle || t - g_handSeqChangedTick >= 3000);
+            static DWORD waitLog = 0;
+            if (!quiet) {
+                if (t - waitLog > 1000) { waitLog = t; Log("Body Swap: waiting for the hands to be idle (%s)", !stable ? "an item just changed" : "an item is mid-animation"); }
+                return;
+            }
+            applied = now;
+            Log("Body Swap: hands idle - applying");
+        }
+    }
 
     DumpPowersOnce(pawn);
     USkeletalMesh* armsAlt = g_armsChar == 1 ? g_daudArmsMesh : g_armsChar == 2 ? g_ovsArmsMesh : nullptr;
     USkeletalMesh* arms = ApplyMeshSwap(pawn->Mesh, armsAlt, { g_daudArmsMesh, g_ovsArmsMesh }, g_armsSwap, "1P arms");
+    if (g_ovsArmsMat) {   // the Overseer arms mesh has no material: give it its own; never leave it on another mesh
+        auto* am = reinterpret_cast<RawArray*>(&pawn->Mesh->Materials);
+        UMaterialInterface* cur0 = (am->Data && am->Num > 0) ? static_cast<UMaterialInterface**>(am->Data)[0] : nullptr;
+        if (arms == g_ovsArmsMesh && cur0 != g_ovsArmsMat) { pawn->Mesh->SetMaterial(0, g_ovsArmsMat); Log("1P arms: Overseer material on"); }
+        else if (arms != g_ovsArmsMesh && cur0 == g_ovsArmsMat) { pawn->Mesh->SetMaterial(0, nullptr); Log("1P arms: Overseer material off"); }
+    }
     if (arms && g_armsShadow && g_armsShadow->SkeletalMesh != arms) g_armsShadow->SetSkeletalMesh(arms, false);
     USkeletalMeshComponent* swordComp = FindSwordMesh(pawn);
     USkeletalMesh* swordAlt = g_bladeChar == 1 ? g_daudSwordMesh : g_bladeChar == 2 ? g_ovsSwordMesh : nullptr;
@@ -5058,7 +8900,8 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
     static DWORD last = 0;
     static float crouchBlend = 0.0f;
     DWORD now = GetTickCount();
-    float dt = last ? Clamp((now - last) / 1000.0f, 0.0f, 0.1f) : 0.0f;
+    static LONGLONG qpc9 = 0;
+    float dt = QpcDt(qpc9);   // (frame-accurate; was GetTickCount steps)
     last = now;
     crouchBlend += Clamp((g_isCrouched ? 1.0f : 0.0f) - crouchBlend, -dt * 4.0f, dt * 4.0f);
     t.X += crouchBlend * g_cfg.crouchOffsetX;
@@ -5072,9 +8915,25 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
     float sinkSpeed = (goingDown && (g_isSliding || g_crouchSink - g_smoothedSink > 30.0f)) ? 600.0f
                     : (!goingDown && g_smoothedSink - g_crouchSink > 15.0f) ? g_cfg.slideRecoverSpeed : g_cfg.crouchSmoothSpeed;
     g_smoothedSink += Clamp(g_crouchSink - g_smoothedSink, -dt * sinkSpeed, dt * sinkSpeed);
+    // After a slide the body rises on the legs' get-up clock (g_slideLegW = 1 - smoothstep(get-up)), not at 90 uu/s:
+    // one motion with the pose fade and the forward offset (user 01:20).
+    {
+        static bool getUpSink = false;
+        static float slideSink = 54.5f;
+        if (g_isSliding) { getUpSink = true; slideSink = g_smoothedSink; }
+        else if (getUpSink) {
+            if (g_slideLegW <= 0.0f) getUpSink = false;
+            else g_smoothedSink = g_crouchSink + (slideSink - g_crouchSink) * g_slideLegW;
+        }
+    }
     t.Z += g_crouchSink - g_smoothedSink;
     t.Z += g_slideAmount * g_cfg.slideRaise;   // slide: hips just above the ground (was raised into the camera, video 17-19-35)
-    t.X -= g_slideAmount * g_cfg.slideBack;
+    // Forward under the camera with the slide (user 00:05: "legs further away from the camera, see more body" - SlideBack
+    // -10 -> -30), and back out of it with the legs' get-up (g_slideLegW: the 0.6 s smoothstep) instead of the 0.4 s linear
+    // fade plus SlideRecoverBack's one-frame step: that step swung the raised left knee up through the camera the frame
+    // the slide ended (clip 23-59-16, 5.75 s). The knee is down by the time the hips come back past the camera.
+    float slideFwd = g_slideAmount > g_slideLegW ? g_slideAmount : g_slideLegW;
+    t.X -= slideFwd * g_cfg.slideBack;
     // On a chain/ladder: shift the body sideways so the chain runs between the legs (user: move both legs left).
     t.Y -= g_climbAmount * g_cfg.climbSideShift;
     t.X += g_climbAmount * g_cfg.climbForwardShift;
@@ -5097,6 +8956,40 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         t.X -= recover * g_cfg.slideRecoverBack;
     }
     t.Z += g_landDip;   // landing squat (both bodies; the planted feet bend the knees)
+    // After a slide the game moves the pawn up a step (6-8 uu, log 00:29) a frame after the cylinder grows, while its
+    // camera eases: the body popped up under the view. Take the unexplained part of any pawn Z step in the second
+    // after a slide and release it at the camera's rate (10/s).
+    // (10:26 clip: the step is normally caught by the view hook now, in the frame it happens - this is the fallback.)
+    {
+        static bool wasSliding = false;
+        float cyl = pawn->CylinderComponent ? pawn->CylinderComponent->CollisionHeight : 0.0f;
+        if (wasSliding && !g_isSliding) g_absorbSlideEndAt = GetTickCount();
+        wasSliding = g_isSliding;
+        if (g_absorbLastZ != 0.0f && g_absorbSlideEndAt && GetTickCount() - g_absorbSlideEndAt < 1000 && static_cast<int>(pawn->Physics) == 1) {
+            float dz = pawn->Location.Z - g_absorbLastZ - (cyl - g_absorbLastCyl) - pawn->Velocity.Z * dt;
+            if (fabsf(dz) > 2.0f && fabsf(dz) < 40.0f) g_zAbsorb -= dz;
+        }
+        g_absorbLastZ = pawn->Location.Z; g_absorbLastCyl = cyl;
+        QpcDt(g_absorbQpc);   // (snapshot time)
+        g_zAbsorb += (0.0f - g_zAbsorb) * Clamp(dt * 10.0f, 0.0f, 1.0f);
+        if (fabsf(g_zAbsorb) < 0.05f) g_zAbsorb = 0.0f;
+        t.Z += g_zAbsorb;
+    }
+    // Slide turn lag (user 00:52, Dishonored 2 style): the body and legs follow the view round a little later. The
+    // body's yaw chases the pawn's at SlideTurnLag per second while the slide pose holds; the difference is applied
+    // to both bodies' rotation (the arm skin takes the body's rotation in UpdateArmSkin). Snaps back in step outside.
+    {
+        auto wrap = [](float a) { while (a > 180.0f) a -= 360.0f; while (a < -180.0f) a += 360.0f; return a; };
+        static float lagYaw = 0.0f;
+        static bool lagInit = false;
+        float pawnYaw = static_cast<int16_t>(pawn->Rotation.Yaw & 0xFFFF) * (360.0f / 65536.0f);
+        float slideW = g_slideAmount > g_slideLegW ? g_slideAmount : g_slideLegW;
+        if (!lagInit || slideW <= 0.0f || g_cfg.slideTurnLag <= 0.0f) { lagYaw = pawnYaw; lagInit = true; }
+        else lagYaw = wrap(lagYaw + wrap(pawnYaw - lagYaw) * Clamp(dt * g_cfg.slideTurnLag, 0.0f, 1.0f));
+        g_slideYawOffDeg = Clamp(wrap(lagYaw - pawnYaw) * slideW, -g_cfg.slideTurnLagMax, g_cfg.slideTurnLagMax);
+    }
+    FRotator bodyRot = arms->Rotation;
+    bodyRot.Yaw += static_cast<int>(g_slideYawOffDeg * 65536.0f / 360.0f);
     // Camera bob/lean/mantle moves the view up to ~75 uu from the eyes (logged); the body stayed put and the camera
     // ended up inside the collar. Shift the visible body (not the shadow) with the camera's horizontal offset, in
     // player space, and hide the upper body when the camera dips below the eyes or the player is airborne.
@@ -5131,10 +9024,14 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         static float sprintBack = 0.0f;
         FVector v = pawn->Velocity;
         float speed = sqrtf(v.X * v.X + v.Y * v.Y);
-        float want = (!g_isCrouched && static_cast<int>(pawn->Physics) == 1)
+        // (11:15: in the air too - the game keeps its sprint arm offset through a sprint jump, so with the pull-back
+        // fading out at take-off the body and arm skin sat ~30 uu further forward than in a standing jump)
+        int physS = static_cast<int>(pawn->Physics);
+        float want = (!g_isCrouched && (physS == 1 || physS == 2))
             ? Clamp((speed - g_cfg.runBlendStart) / (g_cfg.runBlendEnd - g_cfg.runBlendStart + 1.0f), 0.0f, 1.0f) : 0.0f;
         sprintBack += Clamp(want - sprintBack, -dt * 4.0f, dt * 4.0f);
         bodyT.X -= sprintBack * g_cfg.sprintBodyBack;
+        g_sprintBackAmount = sprintBack;
         // Crouch-walking leans the chest forward into the bottom of the view (video 17-38-35): ease the visible body
         // back while moving crouched.
         static float crouchBack = 0.0f;
@@ -5213,16 +9110,18 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
             if (endAt && nowD - endAt < 600) {
                 FName pel("Root_jnt");
                 FVector p = g_body->GetBoneLocation(pel, 0);
-                Log("slide end +%lums: view Z %.0f pelvis Z %.0f (dxy %.0f) pawn Z %.0f eye %.1f | sink %.1f/%.1f slide %.2f legW %.2f push %.0f applied (%.0f %.0f %.0f)",
+                Log("slide end +%lums: view Z %.0f pelvis Z %.0f (dxy %.0f) pawn Z %.0f eye %.1f | sink %.1f/%.1f slide %.2f legW %.2f push %.0f applied (%.0f %.0f %.0f) absorb %.1f",
                     nowD - endAt, g_viewLoc.Z, p.Z, sqrtf((p.X - g_viewLoc.X) * (p.X - g_viewLoc.X) + (p.Y - g_viewLoc.Y) * (p.Y - g_viewLoc.Y)),
                     pawn->Location.Z, pawn->EyeHeight, g_crouchSink, g_smoothedSink, g_slideAmount, g_slideLegW, g_clipPush,
-                    applied.X, applied.Y, applied.Z);
+                    applied.X, applied.Y, applied.Z, g_zAbsorb);
             }
         }
     }
-    if (static_cast<int>(pawn->Physics) != 1) hideUpper = true;   // not PHYS_Walking: jumping, falling, mantling
+    if (static_cast<int>(pawn->Physics) != 1 && !(g_isSliding || g_slideAmount > 0.0f)) hideUpper = true;   // not PHYS_Walking: jumping, falling, mantling (not the slide's physics 14 - user 00:52: the shirt was gone while sliding)
     if (!g_cfg.hideUpperWhenClipping) hideUpper = false;   // arms stay visible unless a hand holds something (user)
-    if (g_isClimbing) hideUpper = true;   // except on ladders/chains: the coat and shoulders filled the view (1P hands grip)
+    // On ladders/chains the coat and shoulders filled the view (1P hands grip), so the upper body was hidden. With the
+    // climbing arms (user, 2026-10-11) it stays: chest and neck are always shrunk anyway; the arms join the 1P forearms.
+    if (g_isClimbing && !g_cfg.climbArms) hideUpper = true;
     if (g_cfg.hideShouldersUp) hideUpper = true;   // shoulders up never visible: no clipping at all (the shadow keeps them)
     if (pc && g_cfg.lookUpHideDeg > 0.0f) {   // looking steeply up the camera sits at the back of the collar (video
         int p = pc->Rotation.Pitch & 0xFFFF;  // 14-47-15); the arms are out of view up there, so hide the upper body
@@ -5238,14 +9137,15 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         float yawR = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
         if (g_cfg.jumpHideUpper && !g_cfg.jumpArms && g_jumpAmount > 0.3f && v.X * cosf(yawR) + v.Y * sinf(yawR) < -50.0f) hideUpper = true;
     }
-    if (g_smoothedSink > g_cfg.deepCrouchSink) hideUpper = true;   // very low crouch after a slide/under things (log: cylinder 33)
+    bool slideNowU = g_isSliding || g_slideAmount > 0.0f;
+    if (g_smoothedSink > g_cfg.deepCrouchSink && !slideNowU) hideUpper = true;   // very low crouch after a slide/under things (log: cylinder 33)
     if (g_swimAmount > 0.0f) hideUpper = true;   // swimming: the collar/hood ringed the underwater view (video 18-09-27)
-    if (g_isSliding || g_slideAmount > 0.0f) hideUpper = true;   // sliding (incl. the blend in/out, which clipped): the reclined chest would fill the view; legs + 1P hands only
-    if (g_isCrouched && g_viewPitchDeg > g_cfg.crouchHidePitch) hideUpper = true;   // crouched, looking ahead: chest top clipped the view
+    // (00:35: no slide clause any more - the upper body shows in slides, user "torso is missing"; the camera is above the chest)
+    if (g_isCrouched && !slideNowU && g_viewPitchDeg > g_cfg.crouchHidePitch) hideUpper = true;   // crouched, looking ahead: chest top clipped the view
     g_hideUpperNow = hideUpper;
     if (g_cfg.hideUpperWhenClipping) {   // user: holstered arms stay visible while sprinting / looking up
         FVector v = pawn->Velocity;
-        if (sqrtf(v.X * v.X + v.Y * v.Y) > g_cfg.hideUpperSpeed) hideUpper = true;   // sprinting
+        if (sqrtf(v.X * v.X + v.Y * v.Y) > g_cfg.hideUpperSpeed && !slideNowU) hideUpper = true;   // sprinting (a slide starts faster than this)
     }
     if (pc && g_cfg.hideUpperWhenClipping) {   // looking up: Rotation.Pitch is 0..65535, up = small positive values
         int pitch = pc->Rotation.Pitch & 0xFFFF;
@@ -5269,7 +9169,7 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         upperHidden = hideUpper ? 1 : 0;
     }
     g_body->SetTranslation(bodyT);
-    g_body->SetRotation(arms->Rotation);
+    g_body->SetRotation(bodyRot);
     {
         // Mantle: shrink the visible body away fast, grow it back smoothly (UpdateVisibility sets g_mantleWant).
         // Gone at once (shrinking over a few frames showed a tiny Corvo out in front - video 22-13-39), held while the
@@ -5281,8 +9181,26 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
     if (g_shadowBody) {
         g_shadowBody->SetTranslation(t);
         g_shadowBodyT = t;
-        g_shadowBody->SetRotation(arms->Rotation);
+        g_shadowBody->SetRotation(bodyRot);
         g_shadowBody->SetScale(arms->Scale);
+    }
+    if (g_shadowArms) {
+        g_shadowArms->SetTranslation(t);
+        g_shadowArms->SetRotation(bodyRot);
+        g_shadowArms->SetScale(arms->Scale);
+        // (13:54 clip: the hand limb IK did nothing on this body while SingleBone controls on the same arm worked - and
+        // the old "IK arms had no visible effect" note was from before the rendered arm skin made g_shadowBody count as
+        // rendered.) A never-rendered component has its limb IK skipped (per-control bIgnoreWhenNotRendered / the
+        // recently-rendered test); stamp it as just rendered every frame.
+        if (pawn->WorldInfo) g_shadowArms->LastRenderTime = pawn->WorldInfo->TimeSeconds;
+        g_shadowArms->bRecentlyRendered = 1;
+    }
+    if (g_holsterCast) {
+        g_holsterCast->SetTranslation(t);
+        g_holsterCast->SetRotation(bodyRot);
+        g_holsterCast->SetScale(arms->Scale);
+        if (pawn->WorldInfo) g_holsterCast->LastRenderTime = pawn->WorldInfo->TimeSeconds;
+        g_holsterCast->bRecentlyRendered = 1;
     }
     if (g_head) {
         // The head shadow is a separate rigid piece: with the spine lean (look up/down, corner lean) the shadow
@@ -5292,8 +9210,10 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         static USkeletalMeshComponent* fixFor = nullptr;
         if (fixFor != g_head) { fixFor = g_head; headFix = { 0, 0, 0 }; }
         FName headBone("head_jnt");
-        if (g_shadowBody && headBone.FNameEntryId >= 0) {
-            FVector want = g_shadowBody->GetBoneLocation(headBone, 0);
+        // (13:39 clip: the head bobbed on the body shadow - it chased g_shadowBody while g_shadowArms did the casting)
+        USkeletalMeshComponent* headCaster = g_shadowArms ? g_shadowArms : g_shadowBody;
+        if (headCaster && headBone.FNameEntryId >= 0) {
+            FVector want = headCaster->GetBoneLocation(headBone, 0);
             FVector have = g_head->GetBoneLocation(headBone, 0);
             float ex = want.X - have.X, ey = want.Y - have.Y, ez = want.Z - have.Z;
             if (ex * ex + ey * ey + ez * ez < 150.0f * 150.0f) {   // ignore a garbage frame (spawn, teleport)
@@ -5371,6 +9291,550 @@ static void TraceBones(ADishonoredPlayerPawn* pawn) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// HD body textures (user 01:05: "upscale the player models to the same quality as the hands"). The body maps
+// (Corvo 2048x1024, Daud / Overseer 2048x1024 colour + 1024x512 normal/spec) were AI-upscaled to 4096x2048 (Bria
+// increase-resolution, content-preserving) and saved as DXT1 DDS with mips in CorvoBody\hd\<texture name>.dds next
+// to this dll. Dishonored's packages / TFCs can't take bigger textures, so they go in at runtime, entirely at the D3D9
+// level (the 07:14 run crashed walking the engine's render-resource structures for the texture behind a Texture2D;
+// nothing of the engine is read any more): IDirect3DDevice9::SetTexture is hooked (vtable slot 65, taken from a
+// throwaway device; MinHook). Every texture the renderer binds is classified once (per 5 s): a 2D DXT1 texture twice
+// as wide as high and at least 32 wide has its ~32-wide mip decoded and compared with the same mip of each HD file
+// (mean abs error < 25 = the same picture; the game's own small mip of that map); a match is bound as our texture
+// from then on, created on the render thread from the file (D3DPOOL_MANAGED, survives resets). Logs "hd textures:".
+static const char* kHdTexNames[] = { "Corvo_Body_d", "Corvo_Body_n", "Corvo_Body_s", "CorvoHood_d", "CorvoHood_n", "CorvoHood_s",
+                                     "Daud_Body01_d", "Daud_Body01_n", "Daud_Body01_s", "OverseerBody_d", "OverseerBody_n", "OverseerBody_s" };
+static const int kHdTexCount = sizeof(kHdTexNames) / sizeof(kHdTexNames[0]);
+static const uint32_t kHdSmallW = 32, kHdSmallH = 16;   // the compare mip (all maps are 2:1)
+static const uint32_t kHdMidW = 128, kHdMidH = 64;      // the verify mip: a candidate that has it must also CORRELATE with the file's
+static const float kHdMinCorr = 0.6f;                    // (14:17 log: the pistol's 1024x512 took the hood's slot at error 14.5 - the 32x16 means of dark
+                                                         // leather and the hood coat are alike; true matches at 128x64 correlate ~0.9+, other things < 0.5)
+struct HdTexSlot {
+    uint8_t* dds; uint32_t ddsSize; bool loadTried;          // the file (freed once the D3D texture exists)
+    uint8_t small[kHdSmallW * kHdSmallH * 3]; bool haveSmall; // the file's 32x16 mip, decoded (game thread, at load)
+    uint8_t mid[kHdMidW * kHdMidH * 3]; bool haveMid; float corr; // ...and its 128x64 mip; the last candidate's correlation with it
+    IDirect3DTexture9* repl; bool replTried;                  // (render thread)
+    IDirect3DBaseTexture9* orig; float mae, bestMae;          // the game's texture matched to this slot; best error seen
+    UINT origW, origH; DWORD origLevels, lastVerify;          // its shape at the match, and when its picture was last re-checked
+    unsigned swaps, dropped;
+};
+static HdTexSlot g_hdTex[kHdTexCount] = {};
+typedef HRESULT(__stdcall* SetTextureFn)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+static SetTextureFn g_origSetTexture = nullptr;
+static bool g_hdHooked = false;
+static volatile LONG g_hdSetTextureCalls = 0, g_hdClassified = 0, g_hdCompared = 0;
+static volatile LONG g_hdGen = 0;   // bumped by the game thread every 5 s: the render thread forgets its classifications
+struct HdClass { IDirect3DBaseTexture9* ptr; int slot; };   // slot -1 = not a body map
+static const int kHdClassSize = 16384;
+static HdClass g_hdClass[kHdClassSize];
+
+// DXT1 block rows -> RGB (w x h x 3, 8-bit); rows of blocks are 'pitch' bytes apart in the source.
+static void HdDecodeDxt1(const uint8_t* src, uint32_t pitch, uint32_t w, uint32_t h, uint8_t* out) {
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (uint32_t by = 0; by < bh; ++by) for (uint32_t bx = 0; bx < bw; ++bx) {
+        const uint8_t* b = src + by * pitch + bx * 8;
+        uint32_t c0 = b[0] | (b[1] << 8), c1 = b[2] | (b[3] << 8), idx = b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24);
+        int pal[4][3];
+        auto unpack = [](uint32_t c, int* o) { o[0] = ((c >> 11) & 31) * 255 / 31; o[1] = ((c >> 5) & 63) * 255 / 63; o[2] = (c & 31) * 255 / 31; };
+        unpack(c0, pal[0]); unpack(c1, pal[1]);
+        for (int k = 0; k < 3; ++k) {
+            if (c0 > c1) { pal[2][k] = (2 * pal[0][k] + pal[1][k]) / 3; pal[3][k] = (pal[0][k] + 2 * pal[1][k]) / 3; }
+            else { pal[2][k] = (pal[0][k] + pal[1][k]) / 2; pal[3][k] = 0; }
+        }
+        for (uint32_t py = 0; py < 4; ++py) for (uint32_t px = 0; px < 4; ++px) {
+            uint32_t x = bx * 4 + px, y = by * 4 + py;
+            if (x >= w || y >= h) continue;
+            const int* c = pal[(idx >> (2 * (py * 4 + px))) & 3];
+            uint8_t* o = out + (y * w + x) * 3;
+            o[0] = static_cast<uint8_t>(c[0]); o[1] = static_cast<uint8_t>(c[1]); o[2] = static_cast<uint8_t>(c[2]);
+        }
+    }
+}
+
+// The file's mip of exactly kHdSmallW x kHdSmallH, decoded into s.small.
+static void HdExtractSmall(HdTexSlot& s) {
+    const uint32_t* h = reinterpret_cast<const uint32_t*>(s.dds + 4);
+    uint32_t fw = h[3], fh = h[2], fm = h[6] ? h[6] : 1;
+    const uint8_t* p = s.dds + 128;
+    const uint8_t* end = s.dds + s.ddsSize;
+    for (uint32_t m = 0; m < fm; ++m) {
+        uint32_t bytes = ((fw + 3) / 4) * ((fh + 3) / 4) * 8;
+        if (p + bytes > end) return;
+        if (fw == kHdMidW && fh == kHdMidH) { HdDecodeDxt1(p, (fw / 4) * 8, fw, fh, s.mid); s.haveMid = true; }
+        if (fw == kHdSmallW && fh == kHdSmallH) { HdDecodeDxt1(p, (fw / 4) * 8, fw, fh, s.small); s.haveSmall = true; return; }
+        p += bytes; fw = fw > 1 ? fw / 2 : 1; fh = fh > 1 ? fh / 2 : 1;
+    }
+}
+
+// DDS (DXT1 / DXT5, with mips) -> a managed D3D9 texture. Render thread only.
+static IDirect3DTexture9* HdCreateFromDds(IDirect3DDevice9* dev, const uint8_t* data, uint32_t size) {
+    if (!dev || !data || size < 128 || memcmp(data, "DDS ", 4) != 0) return nullptr;
+    const uint32_t* h = reinterpret_cast<const uint32_t*>(data + 4);   // DDS_HEADER as dwords: size flags height width pitch depth mips ...
+    uint32_t height = h[2], width = h[3], mips = h[6] ? h[6] : 1, fourcc = h[20];
+    D3DFORMAT fmt;
+    uint32_t blockBytes;
+    if (fourcc == MAKEFOURCC('D', 'X', 'T', '1')) { fmt = D3DFMT_DXT1; blockBytes = 8; }
+    else if (fourcc == MAKEFOURCC('D', 'X', 'T', '5')) { fmt = D3DFMT_DXT5; blockBytes = 16; }
+    else return nullptr;
+    IDirect3DTexture9* t = nullptr;
+    if (FAILED(dev->CreateTexture(width, height, mips, 0, fmt, D3DPOOL_MANAGED, &t, nullptr)) || !t) return nullptr;
+    const uint8_t* p = data + 128;
+    const uint8_t* end = data + size;
+    uint32_t w = width, hh = height;
+    for (uint32_t m = 0; m < mips; ++m) {
+        uint32_t bw = (w + 3) / 4, bh = (hh + 3) / 4, rowBytes = bw * blockBytes, levelBytes = rowBytes * bh;
+        if (p + levelBytes > end) { t->Release(); return nullptr; }
+        D3DLOCKED_RECT lr;
+        if (FAILED(t->LockRect(m, &lr, nullptr, 0))) { t->Release(); return nullptr; }
+        for (uint32_t r = 0; r < bh; ++r) memcpy(static_cast<uint8_t*>(lr.pBits) + r * lr.Pitch, p + r * rowBytes, rowBytes);
+        t->UnlockRect(m);
+        p += levelBytes;
+        w = w > 1 ? w / 2 : 1;
+        hh = hh > 1 ? hh / 2 : 1;
+    }
+    return t;
+}
+
+// Which body map is this (bound) texture, if any: shape first, then its ~32-wide mip against every file's (or one slot's
+// when 'only' >= 0). Render thread.
+static int HdClassify(IDirect3DBaseTexture9* tex, float& maeOut, int only = -1) {
+    maeOut = -1.0f;
+    if (tex->GetType() != D3DRTYPE_TEXTURE) return -1;
+    auto* t = static_cast<IDirect3DTexture9*>(tex);
+    DWORD levels = t->GetLevelCount();
+    D3DSURFACE_DESC d = {};
+    if (FAILED(t->GetLevelDesc(0, &d)) || d.Format != D3DFMT_DXT1 || d.Width != d.Height * 2 || d.Width < kHdSmallW || d.Width > 2048) return -1;
+    DWORD lvl = 0;
+    for (; lvl < levels; ++lvl) { if (FAILED(t->GetLevelDesc(lvl, &d))) return -1; if (d.Width <= kHdSmallW) break; }
+    if (lvl >= levels || d.Width != kHdSmallW || d.Height != kHdSmallH) return -1;
+    D3DLOCKED_RECT lr;
+    if (FAILED(t->LockRect(lvl, &lr, nullptr, D3DLOCK_READONLY))) return -2;   // (couldn't read it now: retry, don't classify)
+    uint8_t rgb[kHdSmallW * kHdSmallH * 3];
+    HdDecodeDxt1(static_cast<const uint8_t*>(lr.pBits), lr.Pitch, kHdSmallW, kHdSmallH, rgb);
+    t->UnlockRect(lvl);
+    InterlockedIncrement(&g_hdCompared);
+    int best = -1;
+    float bestMae = 1e9f;
+    for (int i = 0; i < kHdTexCount; ++i) {
+        HdTexSlot& s = g_hdTex[i];
+        if (!s.haveSmall || (only >= 0 && i != only)) continue;
+        unsigned sum = 0;
+        for (uint32_t k = 0; k < kHdSmallW * kHdSmallH * 3; ++k) sum += rgb[k] > s.small[k] ? rgb[k] - s.small[k] : s.small[k] - rgb[k];
+        float mae = sum / static_cast<float>(kHdSmallW * kHdSmallH * 3);
+        if (mae < s.bestMae) s.bestMae = mae;
+        if (mae < bestMae) { bestMae = mae; best = i; }
+    }
+    maeOut = bestMae;
+    if (!(bestMae < 15.0f)) return -1;   // (07:49 log: true matches 2-13, a look-alike NPC texture 17 - 25 let it through)
+    // Verify by structure at 128x64 when the candidate has that level (a streamed-in stub smaller than that is taken on
+    // the 32x16 match alone, as before): grey-level correlation with the file's mip, which the DXT1 / mip-filter
+    // differences that put true matches at error 7-17 do not disturb.
+    HdTexSlot& v = g_hdTex[best];
+    if (v.haveMid) {
+        DWORD lvlM = 0;
+        D3DSURFACE_DESC dm = {};
+        for (; lvlM < levels; ++lvlM) { if (FAILED(t->GetLevelDesc(lvlM, &dm))) return -1; if (dm.Width <= kHdMidW) break; }
+        if (lvlM < levels && dm.Width == kHdMidW && dm.Height == kHdMidH) {
+            D3DLOCKED_RECT lm;
+            if (FAILED(t->LockRect(lvlM, &lm, nullptr, D3DLOCK_READONLY))) return -2;
+            static uint8_t rgbM[kHdMidW * kHdMidH * 3];   // (render thread only; one classification at a time)
+            HdDecodeDxt1(static_cast<const uint8_t*>(lm.pBits), lm.Pitch, kHdMidW, kHdMidH, rgbM);
+            t->UnlockRect(lvlM);
+            const uint32_t n = kHdMidW * kHdMidH;
+            double sa = 0, sb = 0;
+            for (uint32_t k = 0; k < n; ++k) { sa += rgbM[k * 3] + rgbM[k * 3 + 1] + rgbM[k * 3 + 2]; sb += v.mid[k * 3] + v.mid[k * 3 + 1] + v.mid[k * 3 + 2]; }
+            double ma = sa / n, mb = sb / n, cov = 0, va = 0, vb = 0;
+            for (uint32_t k = 0; k < n; ++k) {
+                double a = rgbM[k * 3] + rgbM[k * 3 + 1] + rgbM[k * 3 + 2] - ma, b = v.mid[k * 3] + v.mid[k * 3 + 1] + v.mid[k * 3 + 2] - mb;
+                cov += a * b; va += a * a; vb += b * b;
+            }
+            float corr = (va > 0 && vb > 0) ? static_cast<float>(cov / sqrt(va * vb)) : 0.0f;
+            v.corr = corr;
+            if (corr < kHdMinCorr) {
+                static DWORD lastRej[kHdTexCount] = {};
+                if (GetTickCount() - lastRej[best] > 2000) {
+                    lastRej[best] = GetTickCount();
+                    D3DSURFACE_DESC d0 = {};
+                    t->GetLevelDesc(0, &d0);
+                    Log("hd textures: %s: a %ux%u x%lu candidate matched at %.1f but its 128x64 correlation is %.2f - not ours",
+                        kHdTexNames[best], d0.Width, d0.Height, static_cast<unsigned long>(levels), bestMae, corr);
+                }
+                return -1;
+            }
+        }
+    }
+    return best;
+}
+
+static void CaptureHookGameDevice(IDirect3DDevice9* dev);
+static HRESULT __stdcall HookedSetTexture(IDirect3DDevice9* self, DWORD stage, IDirect3DBaseTexture9* tex) {
+    InterlockedIncrement(&g_hdSetTextureCalls);
+    {
+        static volatile LONG checked = 0;
+        if (g_cfg.selfTestCapture && self && InterlockedExchange(&checked, 1) == 0) CaptureHookGameDevice(self);
+    }
+    if (tex) {
+        static LONG myGen = 0;
+        LONG gen = g_hdGen;
+        if (gen != myGen) {   // forget everything (a freed texture's address can be reused): classify afresh
+            myGen = gen;
+            memset(g_hdClass, 0, sizeof(g_hdClass));
+            for (int i = 0; i < kHdTexCount; ++i) g_hdTex[i].orig = nullptr;
+        }
+        uintptr_t key = reinterpret_cast<uintptr_t>(tex) >> 4;
+        int slot = -2;   // -2 unknown
+        int at = -1;
+        for (int probe = 0; probe < 8; ++probe) {
+            int k = static_cast<int>((key + probe) & (kHdClassSize - 1));
+            if (g_hdClass[k].ptr == tex) { slot = g_hdClass[k].slot; break; }
+            if (!g_hdClass[k].ptr) { at = k; break; }
+        }
+        int tableAt = -1;
+        if (slot == -2) {
+            float mae;
+            slot = HdClassify(tex, mae);
+            InterlockedIncrement(&g_hdClassified);
+            // (11:20: a transient lock failure must not classify the texture as 'not ours' for 5 s - the body flickered
+            // to its original map at a slide end; -2 leaves the table empty so the next bind retries)
+            if (slot == -2) { slot = -1; at = -1; }
+            else if (at >= 0) { g_hdClass[at].ptr = tex; g_hdClass[at].slot = slot; tableAt = at; }
+            if (slot >= 0) {
+                HdTexSlot& s = g_hdTex[slot];
+                D3DSURFACE_DESC d = {};
+                auto* t = static_cast<IDirect3DTexture9*>(tex);
+                t->GetLevelDesc(0, &d);
+                s.orig = tex; s.mae = mae; s.origW = d.Width; s.origH = d.Height; s.origLevels = t->GetLevelCount(); s.lastVerify = GetTickCount();
+            }
+        } else if (slot >= 0) {
+            // Still the same texture? A freed texture's address is reused at once on a loading screen (07:35: the loading
+            // text went lavender - the body normal map on the font). Shape every time, the picture every 250 ms.
+            HdTexSlot& s = g_hdTex[slot];
+            auto* t = static_cast<IDirect3DTexture9*>(tex);
+            D3DSURFACE_DESC d = {};
+            bool same = tex->GetType() == D3DRTYPE_TEXTURE && t->GetLevelCount() == s.origLevels && SUCCEEDED(t->GetLevelDesc(0, &d)) &&
+                        d.Width == s.origW && d.Height == s.origH && d.Format == D3DFMT_DXT1;
+            DWORD now = GetTickCount();
+            if (same && now - s.lastVerify > 250) {
+                float mae;
+                int r = HdClassify(tex, mae, slot);
+                if (r != -2) { same = r == slot; s.lastVerify = now; if (same) s.mae = mae; }   // (-2: couldn't read it now - keep, retry)
+            }
+            if (!same) {
+                for (int probe = 0; probe < 8; ++probe) {   // forget it in the table
+                    int k = static_cast<int>((key + probe) & (kHdClassSize - 1));
+                    if (g_hdClass[k].ptr == tex) { g_hdClass[k].slot = -1; break; }
+                }
+                if (s.orig == tex) s.orig = nullptr;
+                ++s.dropped;
+                slot = -1;
+            }
+        }
+        (void)tableAt;
+        if (slot >= 0) {
+            HdTexSlot& s = g_hdTex[slot];
+            if (!s.repl && !s.replTried && s.dds) {
+                s.replTried = true;
+                s.repl = HdCreateFromDds(self, s.dds, s.ddsSize);
+                if (s.repl) { uint8_t* old = s.dds; s.dds = nullptr; free(old); }   // (the small mip is kept in s.small)
+            }
+            if (s.repl) { tex = s.repl; ++s.swaps; }
+        }
+    }
+    return g_origSetTexture(self, stage, tex);
+}
+
+// ---- Frame capture (DEVELOPMENT, SelfTestCapture): the presented frame saved as a half-size 24-bit BMP in
+// CorvoBody\captures next to this dll, so the author can look at the result himself. Requested from the game thread
+// (g_captureWant), served on the render thread in Present (device or swap chain - whichever the game uses).
+typedef HRESULT(__stdcall* DevPresentFn)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+typedef HRESULT(__stdcall* ScPresentFn)(IDirect3DSwapChain9*, const RECT*, const RECT*, HWND, const RGNDATA*, DWORD);
+static DevPresentFn g_origDevPresent = nullptr;
+static ScPresentFn g_origScPresent = nullptr;
+static void* g_hookedDevPresent = nullptr;     // the code address the throwaway device's Present hook patched
+static void* g_hookedScPresent = nullptr;
+static DevPresentFn g_origDevPresent2 = nullptr;   // the game's own device's Present, if it is different code
+static ScPresentFn g_origScPresent2 = nullptr;
+static volatile LONG g_presentSeen = 0;
+
+static void CaptureFrame(IDirect3DDevice9* dev) {
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) { Log("capture: no back buffer"); return; }
+    D3DSURFACE_DESC d = {};
+    bb->GetDesc(&d);
+    IDirect3DSurface9* src = bb;
+    IDirect3DSurface9* rt = nullptr;
+    if (d.MultiSampleType != D3DMULTISAMPLE_NONE) {   // resolve first
+        if (SUCCEEDED(dev->CreateRenderTarget(d.Width, d.Height, d.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &rt, nullptr)) && rt &&
+            SUCCEEDED(dev->StretchRect(bb, nullptr, rt, nullptr, D3DTEXF_NONE))) src = rt;
+    }
+    IDirect3DSurface9* sys = nullptr;
+    bool ok = (d.Format == D3DFMT_X8R8G8B8 || d.Format == D3DFMT_A8R8G8B8) &&
+              SUCCEEDED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, nullptr)) && sys &&
+              SUCCEEDED(dev->GetRenderTargetData(src, sys));
+    D3DLOCKED_RECT lr = {};
+    if (ok && SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY))) {
+        int w = static_cast<int>(d.Width) / 2, h = static_cast<int>(d.Height) / 2;
+        int rowBytes = (w * 3 + 3) & ~3;
+        char path[MAX_PATH];
+        HMODULE self = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&CaptureFrame), &self)) {
+            GetModuleFileNameA(self, path, MAX_PATH);
+            char* slash = strrchr(path, '\\');
+            if (slash) {
+                *(slash + 1) = 0;
+                strncat(path, "CorvoBody\\captures", MAX_PATH - strlen(path) - 1);
+                CreateDirectoryA(path, nullptr);
+                SYSTEMTIME st; GetLocalTime(&st);
+                char name[96];
+                LONG n = InterlockedIncrement(&g_captureCount);
+                snprintf(name, sizeof(name), "\\%02d%02d%02d_%03ld_%s.bmp", st.wHour, st.wMinute, st.wSecond, static_cast<long>(n), g_captureTag);
+                strncat(path, name, MAX_PATH - strlen(path) - 1);
+                HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                if (f != INVALID_HANDLE_VALUE) {
+                    BITMAPFILEHEADER fh = {};
+                    BITMAPINFOHEADER ih = {};
+                    ih.biSize = sizeof(ih); ih.biWidth = w; ih.biHeight = h; ih.biPlanes = 1; ih.biBitCount = 24; ih.biCompression = BI_RGB;
+                    ih.biSizeImage = rowBytes * h;
+                    fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(ih); fh.bfSize = fh.bfOffBits + ih.biSizeImage;
+                    DWORD wr = 0;
+                    WriteFile(f, &fh, sizeof(fh), &wr, nullptr);
+                    WriteFile(f, &ih, sizeof(ih), &wr, nullptr);
+                    std::string row(rowBytes, '\0');
+                    for (int y = h - 1; y >= 0; --y) {   // bottom-up
+                        const uint8_t* srow = static_cast<const uint8_t*>(lr.pBits) + static_cast<size_t>(y * 2) * lr.Pitch;
+                        for (int x = 0; x < w; ++x) {
+                            const uint8_t* px = srow + x * 8;   // every other pixel (BGRA)
+                            row[x * 3 + 0] = static_cast<char>(px[0]); row[x * 3 + 1] = static_cast<char>(px[1]); row[x * 3 + 2] = static_cast<char>(px[2]);
+                        }
+                        WriteFile(f, row.data(), rowBytes, &wr, nullptr);
+                    }
+                    CloseHandle(f);
+                    static DWORD lastCapLog = 0;
+                    if (GetTickCount() - lastCapLog > 2000) { lastCapLog = GetTickCount(); Log("capture: saved %s (%dx%d)", path, w, h); }
+                }
+            }
+        }
+        sys->UnlockRect();
+    } else Log("capture: could not read the frame (format %d, msaa %d)", static_cast<int>(d.Format), static_cast<int>(d.MultiSampleType));
+    if (sys) sys->Release();
+    if (rt) rt->Release();
+    bb->Release();
+}
+
+static HRESULT __stdcall HookedDevPresent(IDirect3DDevice9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e) {
+    if (InterlockedExchange(&g_presentSeen, 1) == 0) Log("capture: the game presents through the device's Present");
+    if (InterlockedCompareExchange(&g_captureWant, 0, 1) == 1) CaptureFrame(self);
+    return g_origDevPresent(self, a, b, c, e);
+}
+
+static HRESULT __stdcall HookedDevPresent2(IDirect3DDevice9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e) {
+    if (InterlockedExchange(&g_presentSeen, 1) == 0) Log("capture: the game presents through its own device's Present");
+    if (InterlockedCompareExchange(&g_captureWant, 0, 1) == 1) CaptureFrame(self);
+    return g_origDevPresent2(self, a, b, c, e);
+}
+
+static HRESULT __stdcall HookedScPresent(IDirect3DSwapChain9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e, DWORD fl) {
+    if (InterlockedCompareExchange(&g_captureWant, 0, 1) == 1) {
+        IDirect3DDevice9* dev = nullptr;
+        if (SUCCEEDED(self->GetDevice(&dev)) && dev) { CaptureFrame(dev); dev->Release(); }
+    }
+    return g_origScPresent(self, a, b, c, e, fl);
+}
+
+static HRESULT __stdcall HookedScPresent2(IDirect3DSwapChain9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e, DWORD fl) {
+    if (InterlockedExchange(&g_presentSeen, 1) == 0) Log("capture: the game presents through its own swap chain");
+    if (InterlockedCompareExchange(&g_captureWant, 0, 1) == 1) {
+        IDirect3DDevice9* dev = nullptr;
+        if (SUCCEEDED(self->GetDevice(&dev)) && dev) { CaptureFrame(dev); dev->Release(); }
+    }
+    return g_origScPresent2(self, a, b, c, e, fl);
+}
+
+// Once, from inside SetTexture (render thread, the GAME's device as 'self'): if its Present / swap-chain Present are
+// different code from the throwaway device's (another device type), hook those too.
+static void CaptureHookGameDevice(IDirect3DDevice9* dev) {
+    void** vt = *reinterpret_cast<void***>(dev);
+    Log("capture: game device Present %p (throwaway's %p)", vt[17], g_hookedDevPresent);
+    if (vt[17] != g_hookedDevPresent &&
+        MH_CreateHook(vt[17], reinterpret_cast<void*>(&HookedDevPresent2), reinterpret_cast<void**>(&g_origDevPresent2)) == MH_OK &&
+        MH_EnableHook(vt[17]) == MH_OK) Log("capture: hooked the game device's own Present");
+    IDirect3DSwapChain9* sc = nullptr;
+    if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
+        void** svt = *reinterpret_cast<void***>(sc);
+        Log("capture: game swap chain Present %p (throwaway's %p)", svt[3], g_hookedScPresent);
+        if (svt[3] != g_hookedScPresent &&
+            MH_CreateHook(svt[3], reinterpret_cast<void*>(&HookedScPresent2), reinterpret_cast<void**>(&g_origScPresent2)) == MH_OK &&
+            MH_EnableHook(svt[3]) == MH_OK) Log("capture: hooked the game swap chain's own Present");
+        sc->Release();
+    }
+}
+
+// SetTexture's address from a throwaway device (the vtable is d3d9.dll's, shared with the game's device).
+static void HdInstallHook() {
+    HMODULE d3d9 = LoadLibraryA("d3d9.dll");
+    typedef IDirect3D9* (WINAPI* CreateFn)(UINT);
+    auto create = d3d9 ? reinterpret_cast<CreateFn>(GetProcAddress(d3d9, "Direct3DCreate9")) : nullptr;
+    if (!create) { Log("hd textures: no Direct3DCreate9"); return; }
+    IDirect3D9* d3d = create(D3D_SDK_VERSION);
+    if (!d3d) { Log("hd textures: Direct3DCreate9 failed"); return; }
+    HWND wnd = CreateWindowExA(0, "STATIC", "CorvoBodyHd", WS_OVERLAPPED, 0, 0, 16, 16, nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+    D3DPRESENT_PARAMETERS pp = {};
+    pp.Windowed = TRUE;
+    pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferFormat = D3DFMT_UNKNOWN;
+    pp.BackBufferWidth = pp.BackBufferHeight = 1;
+    pp.hDeviceWindow = wnd;
+    IDirect3DDevice9* dev = nullptr;
+    HRESULT hr = d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, wnd, D3DCREATE_SOFTWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES, &pp, &dev);
+    if (FAILED(hr) || !dev) {
+        Log("hd textures: dummy device failed (%08lx)", static_cast<unsigned long>(hr));
+    } else {
+        void** vt = *reinterpret_cast<void***>(dev);
+        if (MH_CreateHook(vt[65], reinterpret_cast<void*>(&HookedSetTexture), reinterpret_cast<void**>(&g_origSetTexture)) == MH_OK &&
+            MH_EnableHook(vt[65]) == MH_OK) {
+            g_hdHooked = true;
+            Log("hd textures: SetTexture hooked (fn %p)", vt[65]);
+        } else Log("hd textures: SetTexture hook FAILED");
+        if (g_cfg.selfTestCapture) {   // frame capture: device Present (17) and swap chain Present (3)
+            if (MH_CreateHook(vt[17], reinterpret_cast<void*>(&HookedDevPresent), reinterpret_cast<void**>(&g_origDevPresent)) == MH_OK &&
+                MH_EnableHook(vt[17]) == MH_OK) { g_hookedDevPresent = vt[17]; Log("capture: device Present hooked"); }
+            IDirect3DSwapChain9* sc = nullptr;
+            if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
+                void** svt = *reinterpret_cast<void***>(sc);
+                if (MH_CreateHook(svt[3], reinterpret_cast<void*>(&HookedScPresent), reinterpret_cast<void**>(&g_origScPresent)) == MH_OK &&
+                    MH_EnableHook(svt[3]) == MH_OK) { g_hookedScPresent = svt[3]; Log("capture: swap chain Present hooked"); }
+                sc->Release();
+            }
+        }
+        dev->Release();
+    }
+    d3d->Release();
+    if (wnd) DestroyWindow(wnd);
+}
+
+// CorvoBody\hd\<name>.dds next to this dll, read whole.
+static void HdLoadDds(HdTexSlot& s, const char* name) {
+    s.loadTried = true;
+    s.bestMae = 1e9f;
+    char path[MAX_PATH];
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&HdLoadDds), &self)) return;
+    GetModuleFileNameA(self, path, MAX_PATH);
+    char* slash = strrchr(path, '\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+    strncat(path, "CorvoBody\\hd\\", MAX_PATH - strlen(path) - 1);
+    strncat(path, name, MAX_PATH - strlen(path) - 1);
+    strncat(path, ".dds", MAX_PATH - strlen(path) - 1);
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("hd textures: no %s", path); return; }
+    DWORD size = GetFileSize(f, nullptr), got = 0;
+    uint8_t* buf = (size != INVALID_FILE_SIZE && size > 128) ? static_cast<uint8_t*>(malloc(size)) : nullptr;
+    if (buf && ReadFile(f, buf, size, &got, nullptr) && got == size) {
+        s.ddsSize = size;
+        s.dds = buf;
+        HdExtractSmall(s);
+        Log("hd textures: loaded %s (%lu bytes, compare mip %s)", path, size, s.haveSmall ? "ok" : "MISSING");
+        if (!s.haveSmall) { s.dds = nullptr; free(buf); }
+    } else { free(buf); Log("hd textures: could not read %s", path); }
+    CloseHandle(f);
+}
+
+static void HdTexProbe() {
+    static DWORD lastSlow = 0;
+    static bool loaded = false, hookTried = false;
+    DWORD now = GetTickCount();
+    if (!loaded) {
+        loaded = true;
+        for (int i = 0; i < kHdTexCount; ++i) HdLoadDds(g_hdTex[i], kHdTexNames[i]);
+    }
+    bool anyFile = false;
+    for (int i = 0; i < kHdTexCount; ++i) if (g_hdTex[i].haveSmall) anyFile = true;
+    if (!hookTried && (anyFile || g_cfg.selfTestCapture)) { hookTried = true; HdInstallHook(); }
+    if (!g_hdHooked || now - lastSlow < 5000) return;
+    lastSlow = now;
+    LONG calls = InterlockedExchange(&g_hdSetTextureCalls, 0);
+    LONG classified = InterlockedExchange(&g_hdClassified, 0), compared = InterlockedExchange(&g_hdCompared, 0);
+    for (int i = 0; i < kHdTexCount; ++i) {
+        HdTexSlot& s = g_hdTex[i];
+        if (!s.haveSmall) continue;
+        unsigned swaps = s.swaps, dropped = s.dropped;
+        s.swaps = 0; s.dropped = 0;
+        if (s.orig || swaps || dropped || s.bestMae < 60.0f)
+            Log("hd textures: %s: game texture %p %ux%u x%lu (match error %.1f, best seen %.1f, corr %.2f) | swapped %u, dropped %u in 5 s | hd %s",
+                kHdTexNames[i], static_cast<void*>(s.orig), s.origW, s.origH, static_cast<unsigned long>(s.origLevels), s.mae, s.bestMae, s.corr,
+                swaps, dropped, s.repl ? "ready" : s.replTried ? "FAILED" : "loaded");
+    }
+    Log("hd textures: %ld SetTexture calls, %ld new textures classified, %ld compared in 5 s", calls, classified, compared);
+    InterlockedIncrement(&g_hdGen);   // (after the log: the render thread forgets its table and re-matches)
+}
+
+// Holstered slide (09:15 clip, looking straight down): a second, darker pair of hands under the view - the game's own
+// first-person arms (their slide / aim-offset pose puts them low in front). With both hands free the arm skin is the
+// arms, so the 1P mesh is hidden for the slide (HideBone never hides in this game; the component can). Its skeleton
+// keeps updating while hidden - the camera rides its camera_jnt.
+static void UpdateSlideOnePArms(ADishonoredPlayerPawn* pawn) {
+    static bool hidden = false;
+    if (!pawn || !pawn->Mesh) { hidden = false; return; }
+    bool want = g_cfg.slideHideFirstPersonArms && g_armSkinOn && g_slideAmount > 0.3f && !g_leftHandBusy && !g_rightHandBusy;
+    want = want || (g_climbHandsOn && g_armSkinOn && g_climbAmount > 0.3f && !g_leftHandBusy && !g_rightHandBusy);   // (climbing: ours climb, the game's sit still under them)
+    if (want) {
+        pawn->Mesh->bUpdateSkelWhenNotRendered = 1;
+        if (!pawn->Mesh->HiddenGame) pawn->Mesh->SetHidden(true);   // (every frame: the game may show it again)
+        if (!hidden) Log("1P arms hidden for the slide");
+    } else if (hidden) {
+        pawn->Mesh->SetHidden(false);
+        Log("1P arms shown again after the slide");
+    }
+    hidden = want;
+}
+
+// Slide diagnostic (slide work, 2026-10-12): every 100 ms through a slide and its get-up, where the body, legs and the
+// arm skin are in VIEW space (forward / right / up from the camera, uu) - what the player can see, for tuning the
+// body offsets, the camera raise and the arm pose against the clips.
+static void DiagSlide(ADishonoredPlayerPawn* pawn) {
+    static DWORD startAt = 0, lastLine = 0, lastActive = 0;
+    static bool was = false;
+    DWORD now = GetTickCount();
+    if (g_isSliding && !was) startAt = now;
+    was = g_isSliding;
+    bool active = g_isSliding || g_slideAmount > 0.0f || g_slideLegW > 0.0f;
+    if (active) lastActive = now;
+    if (!g_body || !pawn || !startAt || (!active && now - lastActive > 300) || now - lastLine < 100) return;
+    lastLine = now;
+    Xf vw = XfFromRotator(g_viewRot, g_viewLoc);
+    auto vs = [&](const FVector& p, float* o) {
+        FVector d{ p.X - g_viewLoc.X, p.Y - g_viewLoc.Y, p.Z - g_viewLoc.Z };
+        for (int i = 0; i < 3; ++i) o[i] = d.X * vw.m[i][0] + d.Y * vw.m[i][1] + d.Z * vw.m[i][2];
+    };
+    static const char* bodyBones[7] = { "Root_jnt", "lower_leg_L_jnt", "lower_leg_R_jnt", "foot_L_jnt", "foot_R_jnt", "spine_2_jnt", "neck_jnt" };
+    // whose hands (09:15): the body's hand-to-elbow distance (0 = collapsed under the skin) and the game's 1P hands in view
+    float bh[2] = { 0, 0 }, p1[2][3] = {};
+    for (int sd = 0; sd < 2; ++sd) {
+        FVector e = g_body->GetBoneLocation(FName(kLowerArmBones[sd]), 0), hnd = g_body->GetBoneLocation(FName(kHandBones[sd]), 0);
+        bh[sd] = sqrtf((e.X - hnd.X) * (e.X - hnd.X) + (e.Y - hnd.Y) * (e.Y - hnd.Y) + (e.Z - hnd.Z) * (e.Z - hnd.Z));
+        if (pawn->Mesh) vs(pawn->Mesh->GetBoneLocation(FName(kHandBones[sd]), 0), p1[sd]);
+    }
+    static const char* skinBones[6] = { "upper_arm_L_jnt", "upper_arm_R_jnt", "lower_arm_L_jnt", "lower_arm_R_jnt", "hand_L_jnt", "hand_R_jnt" };
+    float b[7][3] = {}, k[6][3] = {};
+    for (int i = 0; i < 7; ++i) vs(g_body->GetBoneLocation(FName(bodyBones[i]), 0), b[i]);
+    if (g_armSkin) for (int i = 0; i < 6; ++i) vs(g_armSkin->GetBoneLocation(FName(skinBones[i]), 0), k[i]);
+    FVector v = pawn->Velocity;
+    Log("slide diag +%lums%s: amount %.2f legW %.2f sink %.1f/%.1f pitch %.0f speed %.0f | fwd/right/up: pelvis %.0f %.0f %.0f "
+        "kneeL %.0f %.0f %.0f kneeR %.0f %.0f %.0f footL %.0f %.0f %.0f footR %.0f %.0f %.0f | skin shoulderL %.0f %.0f %.0f "
+        "shoulderR %.0f %.0f %.0f elbowL %.0f %.0f %.0f elbowR %.0f %.0f %.0f handL %.0f %.0f %.0f handR %.0f %.0f %.0f | "
+        "skin shown L%d R%d | 1P hand on screen L%d R%d | spine2 %.0f %.0f %.0f neck %.0f %.0f %.0f torso hidden %.2f upper %.2f | yaw lag %.0f"
+        " | body hand-elbow L %.1f R %.1f | 1P hands raw L %.0f %.0f %.0f R %.0f %.0f %.0f | 1P mesh hidden %d",
+        now - startAt, g_isSliding ? "" : " (over)", g_slideAmount, g_slideLegW, g_crouchSink, g_smoothedSink, g_viewPitchDeg,
+        sqrtf(v.X * v.X + v.Y * v.Y), b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2], b[2][0], b[2][1], b[2][2],
+        b[3][0], b[3][1], b[3][2], b[4][0], b[4][1], b[4][2], k[0][0], k[0][1], k[0][2], k[1][0], k[1][1], k[1][2],
+        k[2][0], k[2][1], k[2][2], k[3][0], k[3][1], k[3][2], k[4][0], k[4][1], k[4][2], k[5][0], k[5][1], k[5][2],
+        g_skinArmShown[0] ? 1 : 0, g_skinArmShown[1] ? 1 : 0, g_onePHandOnScreen[0] ? 1 : 0, g_onePHandOnScreen[1] ? 1 : 0,
+        b[5][0], b[5][1], b[5][2], b[6][0], b[6][1], b[6][2], g_torsoAmount, g_upperAmount, g_slideYawOffDeg,
+        bh[0], bh[1], p1[0][0], p1[0][1], p1[0][2], p1[1][0], p1[1][1], p1[1][2], pawn->Mesh ? (pawn->Mesh->HiddenGame ? 1 : 0) : -1);
+}
+
 static void OnPlayerTick() {
     // (Build 201: the F6-F11 development keys - body on/off, arm hiding, attach mode, ini reload, leg axis, debug
     // dump - are gone: they clashed with players' bindings and nothing is meant to be adjusted in game.)
@@ -5386,14 +9850,21 @@ static void OnPlayerTick() {
         // that replaces the pawn (build 57 crash: IncrementalPurgeGarbage -> ExitProperties freeing our arrays).
         if (g_ourArrayCount) {
             if (g_shadowBody && g_shadowBody->Animations) DetachNodeArrays(g_shadowBody->Animations, 0);
+            if (g_shadowArms && g_shadowArms->Animations) DetachNodeArrays(g_shadowArms->Animations, 0);
+            if (g_holsterCast && g_holsterCast->Animations) DetachNodeArrays(g_holsterCast->Animations, 0);
             DetachOurArrays(g_body);
         }
         lastPawn = pawn;
         g_body = nullptr;
         g_head = nullptr;
+        g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+        g_castLightEnv = nullptr;
         g_shadowBody = nullptr;
+        g_shadowArms = nullptr;
+        g_holsterCast = nullptr;
         g_itemShadow[0] = g_itemShadow[1] = nullptr;   // owned by the pawn; dropped with it
         g_armsShadow = nullptr;
+        g_armSkin = nullptr;
         g_bodyPawn = nullptr;
         ReleaseLoadedAssets();
         g_bodyBuiltTick = 0;
@@ -5452,30 +9923,79 @@ static void OnPlayerTick() {
     RebuildBodyIfCharacterChanged(pawn);
     if (!g_body) CreateBody(pawn);
     ApplyArmsCharacter(pawn);
+    WatchOwnedUpgrades(pawn);   // (per-bow upgrades: diagnostics + a purchase carried to the bow in hand)
+    PointStoreAtBow(pawn);      // (Piero's crossbow entries follow the bow in the slot)
     ApplyArmsShift(pawn);
     UpdateHitState(pawn);
     // Posture first: on the frame a slide ends the game re-centres the taller cylinder (pawn up ~32) and
     // SyncTransform used last frame's sink, so the pelvis jumped into the camera for one frame (log 21:06).
+    PhysProbe("frame start");
     UpdatePosture(pawn);
+    PhysProbe("UpdatePosture");
     SyncTransform(pawn);
+    PhysProbe("SyncTransform");
     TraceBones(pawn);
+    PhysProbe("TraceBones");
     UpdateBodyAnimation();
+    PhysProbe("UpdateBodyAnimation");
     UpdateLocomotionBlend(pawn);
+    PhysProbe("UpdateLocomotionBlend");
     UpdateTurnInPlace(pawn);
+    PhysProbe("UpdateTurnInPlace");
     UpdateFootIK(pawn);
+    PhysProbe("UpdateFootIK");
     UpdateSlide();
+    PhysProbe("UpdateSlide");
     UpdateClimb(pawn);
+    PhysProbe("UpdateClimb");
     UpdateJump(pawn);
+    PhysProbe("UpdateJump");
     UpdateSwim(pawn);
+    PhysProbe("UpdateSwim");
     UpdateHands(GetPlayerPawn());
+    PhysProbe("UpdateHands");
+    UpdateOnePHandOnScreen(pawn);
+    PhysProbe("UpdateOnePHandOnScreen");
+    UpdateSlideOnePArms(pawn);
+    PhysProbe("UpdateSlideOnePArms");
+    UpdateJumpSway(pawn);
+    PhysProbe("UpdateJumpSway");
     UpdateCoat();
+    PhysProbe("UpdateCoat");
+    CapturePowerHand(pawn);
+    PhysProbe("CapturePowerHand");
+    UpdateJumpHands();
+    PhysProbe("UpdateJumpHands");
+    UpdateClimbArms(pawn);
+    PhysProbe("UpdateClimbArms");
+    UpdateArmSkin(pawn);
+    PhysProbe("UpdateArmSkin");
+    HideFirstPersonJumpHands(pawn);
+    PhysProbe("HideFirstPersonJumpHands");
     UpdateLean(pawn);
+    PhysProbe("UpdateLean");
     UpdateArmBlend();
+    PhysProbe("UpdateArmBlend");
     UpdateArmIK(pawn);
+    PhysProbe("UpdateArmIK");
     UpdateArmsShadow(pawn);
+    PhysProbe("UpdateArmsShadow");
+    UpdateArmSkinReach(pawn);
+    PhysProbe("UpdateArmSkinReach");
+    UpdateCastingArmReach(pawn);
+    UpdateHolsterShoulders();
+    UpdateClimbHands(pawn);   // (after UpdateArmSkinReach / UpdateCastingArmReach: their wrist resets must not undo it)
+    PhysProbe("UpdateCastingArmReach");
     UpdateItemShadows(pawn);
+    PhysProbe("UpdateItemShadows");
     UpdateVisibility(pawn);
+    PhysProbe("UpdateVisibility");
     DiagHeadShadow();
+    PhysProbe("DiagHeadShadow");
+    DiagSlide(pawn);
+    PhysProbe("DiagSlide");
+    HdTexProbe();
+    PhysProbe("HdTexProbe");
     // EnsureLocalAtoms(g_body);  // no longer needed since assets are rooted in the load callback (needs 16-byte alignment if revived)
 }
 
@@ -5487,6 +10007,265 @@ using GameEngineTick_t = void(__thiscall*)(void*, float);
 static GameEngineTick_t g_origGameEngineTick = nullptr;
 static DWORD g_pawnSeenTick = 0;
 static ADishonoredPlayerPawn* g_pawnSeen = nullptr;
+
+// Ultimate Back Turn (2026-10-09): R3 (right stick click) or Left Alt - the game's Zoom on pad and keyboard
+// (DishonoredInput.ini: XboxTypeS_RightThumbstick / LeftAlt -> GBA_Zoom). A tap turns the view 180 degrees, eased in
+// and out over QuickTurnTime; held for ZoomHoldTime the game's Zoom comes on, and goes off again on release. The
+// game's own Zoom from those two buttons is swallowed (ProcessEvent hook: Dis_Zoom while R3 / Left Alt is down) and
+// called by us instead. Left Alt with Tab or F4 (Alt+Tab, Alt+F4) does neither.
+// The controller is read with XInput (the game's own xinput1_3.dll); the turn is added to the player controller's
+// yaw a little each frame, so the pawn follows as with stick input. Not while the game is paused (world time stops)
+// or the game window isn't in front.
+struct XPadState { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; };
+using XGetStateFn = DWORD(WINAPI*)(DWORD, XPadState*);
+static XGetStateFn g_xGetState = nullptr;
+static UFunction* g_disZoomFn = nullptr;
+static int g_ourZoomCall = 0;
+
+static void FindXInput() {
+    static bool looked = false;
+    if (looked) return;
+    looked = true;
+    for (const char* dll : { "xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll" }) {
+        HMODULE m = GetModuleHandleA(dll);
+        if (!m) m = LoadLibraryA(dll);
+        if (m && (g_xGetState = reinterpret_cast<XGetStateFn>(GetProcAddress(m, "XInputGetState")))) {
+            Log("Ultimate Back Turn: R3 via %s, Left Alt", dll);
+            return;
+        }
+    }
+    Log("Ultimate Back Turn: no XInput - Left Alt only");
+}
+
+static bool PadR3Down() {
+    if (!g_xGetState) return false;
+    for (DWORD i = 0; i < 4; ++i) {
+        XPadState st{};
+        if (g_xGetState(i, &st) == 0 && (st.buttons & 0x0080)) return true;   // XINPUT_GAMEPAD_RIGHT_THUMB
+    }
+    return false;
+}
+
+static bool BackTurnButtonDown() {
+    return g_cfg.quickTurn && ((GetAsyncKeyState(VK_LMENU) & 0x8000) || PadR3Down());
+}
+
+static void CallZoom(APlayerController* pc) {
+    if (!pc || !g_disZoomFn || !pc->IsA(ADishonoredPlayerController::StaticClass())) return;
+    ++g_ourZoomCall;
+    static_cast<ADishonoredPlayerController*>(pc)->Dis_Zoom();
+    --g_ourZoomCall;
+}
+
+static void QuickTurnTick(ADishonoredPlayerPawn* pawn) {
+    FindXInput();
+    if (!g_disZoomFn) g_disZoomFn = UFunction::FindFunction("Function DishonoredGame.DishonoredPlayerController.Dis_Zoom");
+    static bool turning = false;
+    static ULONGLONG lastMs = 0;
+    static float elapsed = 0.0f, applied = 0.0f;
+    static float lastTime = -1.0f, lastBend = -1.0f;
+    ULONGLONG nowMs = GetTickCount64();
+    float dt = lastMs ? (nowMs - lastMs) / 1000.0f : 0.0f;
+    lastMs = nowMs;
+
+    auto* pc = pawn ? static_cast<APlayerController*>(pawn->Controller) : nullptr;
+    AWorldInfo* wi = pawn ? pawn->WorldInfo : nullptr;
+    bool paused = true;
+    if (wi) {
+        paused = wi->TimeSeconds == lastTime && wi->BendTimeSeconds == lastBend;
+        lastTime = wi->TimeSeconds; lastBend = wi->BendTimeSeconds;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    bool focused = pid == GetCurrentProcessId();
+
+    // one press of R3 or Left Alt: tap -> turn, hold -> zoom while held
+    bool alt = focused && (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+    bool down = g_cfg.quickTurn && (alt || PadR3Down());
+    static bool wasDown = false, spoiled = false, zoomed = false;
+    static ULONGLONG pressMs = 0, zoomMs = 0;
+    static float baseFov = 0.0f;
+    auto fov = [&]() { return pc && pc->PlayerCamera ? pc->PlayerCamera->CameraCache.POV.FOV : 0.0f; };
+    if (down && !wasDown) {
+        pressMs = nowMs; spoiled = !focused || paused || !pc; zoomed = false; baseFov = fov();
+    }
+    if (down) {
+        if (alt && ((GetAsyncKeyState(VK_TAB) & 0x8000) || (GetAsyncKeyState(VK_F4) & 0x8000))) spoiled = true;
+        if (!spoiled && !zoomed && nowMs - pressMs >= static_cast<ULONGLONG>(g_cfg.zoomHoldTime * 1000.0f)) {
+            CallZoom(pc);
+            zoomed = true; zoomMs = nowMs;
+        }
+    } else if (wasDown) {
+        if (zoomed) {
+            // still zoomed (narrower view than at the press, or the zoom only just started): zoom back out
+            float f = fov();
+            if ((baseFov > 0.0f && f > 0.0f && f < baseFov - 1.0f) || nowMs - zoomMs < 700) CallZoom(pc);
+        } else if (!spoiled && !turning && pc && !paused && focused) {
+            turning = true; elapsed = 0.0f; applied = 0.0f;
+        }
+        zoomed = false;
+    }
+    wasDown = down;
+    if (!turning) return;
+    if (!pc) { turning = false; return; }
+    if (paused) return;                       // hold the turn while paused, finish it after
+    elapsed += (std::min)(dt, 0.1f);
+    float t = (std::min)(elapsed / g_cfg.quickTurnTime, 1.0f);
+    float eased = t * t * (3.0f - 2.0f * t);   // smoothstep
+    float want = eased * 32768.0f;             // 180 degrees in rotator units
+    int step = static_cast<int>(want - applied);
+    if (step) { pc->Rotation.Yaw += step; applied += static_cast<float>(step); }
+    if (t >= 1.0f) turning = false;
+}
+
+// ProcessEvent: swallow the game's own Dis_Zoom while R3 / Left Alt is held (that press is ours, see above).
+static void __fastcall HookedProcessEvent(UObject* obj, void*, UFunction* fn, void* parms, void* result) {
+    {   // (diagnostic: per-bow upgrades) Piero's store - which calls come through here, and what the movie points at
+        static UObject* storeCls = nullptr;
+        static DWORD lastTry = 0;
+        if (!storeCls && GetTickCount() - lastTry > 5000) { lastTry = GetTickCount(); storeCls = UObject::FindClass("Class DishonoredGame.DisGFxMoviePlayerStore"); }
+        if (storeCls && fn && fn->Outer == storeCls && obj) {
+            static UObject* dumpedFor = nullptr;
+            static int logged = 0;
+            std::string fname = fn->GetName();
+            if (logged++ < 200) {
+                int arg = (parms && (fname == "Req_BuyItem" || fname == "Req_ItemInfo")) ? *static_cast<int*>(parms) : -1;
+                uint8_t* m = reinterpret_cast<uint8_t*>(obj);
+                UObject* seq = *reinterpret_cast<UObject**>(m + 0x1B8);
+                auto* shown = reinterpret_cast<RawArray*>(m + 0x1C4);
+                Log("store: %s(%d) | movie tweaks %s, DLC tweaks %s | action %s: tweaks %s store %s | %d shown",
+                    fname.c_str(), arg, ObjName(*reinterpret_cast<UObject**>(m + 0x1B0)).c_str(), ObjName(*reinterpret_cast<UObject**>(m + 0x1B4)).c_str(),
+                    ObjName(seq).c_str(), seq ? ObjName(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(seq) + 0x128)).c_str() : "-",
+                    seq ? ObjName(*reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(seq) + 0x12C)).c_str() : "-", shown->Data ? shown->Num : 0);
+            }
+            if (dumpedFor != obj) { dumpedFor = obj; DumpUpgradeData(static_cast<ADishonoredPlayerPawn*>(GetPlayerPawn()), "store opened"); }
+        }
+    }
+    if (fn && fn == g_disZoomFn && !g_ourZoomCall && BackTurnButtonDown()) {
+        static int logged = 0;
+        if (logged++ < 5) Log("Ultimate Back Turn: game's Zoom on R3/Left Alt held back (hold to zoom)");
+        return;
+    }
+    g_origProcessEvent(obj, fn, parms, result);
+}
+
+static void HookZoomButton() {
+    if (MH_CreateHook(reinterpret_cast<void*>(addr::ProcessEvent), reinterpret_cast<void*>(&HookedProcessEvent),
+                      reinterpret_cast<void**>(&g_origProcessEvent)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(addr::ProcessEvent)) == MH_OK) Log("ProcessEvent hooked (hold to zoom)");
+    else Log("WARNING: could not hook ProcessEvent - R3/Left Alt zoom stays the game's");
+}
+
+// Always-loaded crossbow (2026-10-09): Corvo's crossbow and Daud's wristbow reload instantly after every shot - the
+// next bolt is in as soon as one is fired, as long as there's ammo of that type left. Their player reload tweaks
+// (DisTweaks_ReloadGunPlayer under the bow's pPlayerSpecific) get m_bDoNormalReloadInstantly and no reload time.
+// The tweaks come and go with packages (Daud's with Body Swap), so look again every 5 s; already-set ones are skipped.
+static void CrossbowInstantReload() {
+    if (!g_cfg.crossbowAlwaysLoaded) return;
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    if (last && now - last < 5000) return;
+    last = now;
+    UClass* cls = UDisTweaks_ReloadGunPlayer::StaticClass();
+    if (!cls) return;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* obj = objects->at(i);
+        if (!obj || obj->Class != cls) continue;
+        auto* t = static_cast<UDisTweaks_ReloadGunPlayer*>(obj);
+        if (t->m_bDoNormalReloadInstantly && t->m_fReloadTime == 0.0f) continue;
+        std::string name = obj->GetFullName();
+        if (name.find("rossbow") == std::string::npos && name.find("ristbow") == std::string::npos) continue;
+        if (name.find("Default__") != std::string::npos) continue;
+        Log("always-loaded bow: %s (reload %.2f s -> instant)", name.c_str(), t->m_fReloadTime);
+        t->m_bDoNormalReloadInstantly = 1;
+        t->m_fReloadTime = 0.0f;
+    }
+}
+
+// Body Swap "Jump" (2026-10-09): Corvo's Agility jump is a double jump (StatePlayerMasterJump.m_JumpStyle from
+// DishonoredPlayerState.ini = eDisJumpStyle_FixedNormalJump_FixedPowerJump); Daud's tweaks use one continuous power
+// jump (DisDLC06Tweaks_PlayerPawn.m_PowerJumpStyle = ..._ContinuousPowerJump). Set m_JumpStyle (+0x59) on the jump
+// state objects (and the class default) to match the switch: when it changes, and every 3 s for new pawns' states.
+static void ApplyJumpStyle() {
+    static DWORD last = 0;
+    static LONG applied = -1;
+    DWORD now = GetTickCount();
+    LONG want = g_jumpChar;
+    if (want == applied && last && now - last < 3000) return;
+    last = now;
+    static UClass* cls = nullptr;
+    if (!cls) cls = UObject::FindClass("Class DishonoredGame.StatePlayerMasterJump");
+    if (!cls) return;
+    const uint8_t style = want ? 2 : 0;   // EeDisJumpStyle: 0 FixedPowerJump, 2 ContinuousPowerJump
+    int changed = 0;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* obj = objects->at(i);
+        if (!obj || obj->Class != cls) continue;
+        auto* st = reinterpret_cast<uint8_t*>(obj) + 0x59;
+        if (*st != style) { *st = style; ++changed; }
+    }
+    if (want != applied || changed) Log("jump: %s (%d jump state%s set)", want ? "Daud's continuous jump" : "Corvo's double jump",
+                                        changed, changed == 1 ? "" : "s");
+    applied = want;
+}
+
+// Summon Assassin without a limit (2026-10-09: "summon as many assassins as i want"): each level's m_MaxAssassins
+// is 1 in DLC06_Pwr_Assassummon (one summon at a time). Every Summon Assassin tweaks object - Body Swap's and Daud's
+// own in his DLCs - gets SummonAssassinMax (default 100) at both levels and the unlimited targeting range. Every 5 s,
+// as the tweaks come and go with packages; already-set ones are skipped.
+static void SummonAssassinUnlimited() {
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    if (last && now - last < 5000) return;
+    last = now;
+    UClass* cls = UDisDLC06Tweaks_SummonAssassin::StaticClass();
+    if (!cls) return;
+    const int maxAssassins = g_cfg.summonAssassinMax;
+    const float castSpeed = 0.0f;   // the action's play-rate override stays the game's: 3.0 broke the summon (14:12)
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* obj = objects->at(i);
+        if (!obj || obj->Class != cls) continue;
+        auto* t = static_cast<UDisDLC06Tweaks_SummonAssassin*>(obj);
+        if (t->m_PowerLevels[0].m_MaxAssassins == maxAssassins && t->m_PowerLevels[1].m_MaxAssassins == maxAssassins &&
+            t->m_fTargetingRange == 1000000.0f && t->m_UsePowerAction.m_fPlayRateOverride == castSpeed) continue;
+        std::string name = obj->GetFullName();
+        if (name.find("Default__") != std::string::npos) continue;
+        Log("Summon Assassin: max assassins %d/%d -> %d, range %.0f -> 1000000, cast speed %.2f -> %.2f (%s)",
+            t->m_PowerLevels[0].m_MaxAssassins, t->m_PowerLevels[1].m_MaxAssassins, maxAssassins, t->m_fTargetingRange,
+            t->m_UsePowerAction.m_fPlayRateOverride, castSpeed, name.c_str());
+        t->m_UsePowerAction.m_fPlayRateOverride = castSpeed;
+        t->m_PowerLevels[0].m_MaxAssassins = maxAssassins;
+        t->m_PowerLevels[1].m_MaxAssassins = maxAssassins;
+        t->m_fTargetingRange = 1000000.0f;
+    }
+}
+
+
+// Infinite mana for every power (2026-10-09: the Cheat Menu's "Infinite mana" still let Summon Assassin drain mana).
+// The Mod Loader's infmana / infmana2 patches change the game's own mana writes (mov [esi+0A60h], eax at five sites;
+// mov ecx, [esi+0A60h] at 0xAA93B8 / 0xAA93F8); Daud's powers take mana another way. While either patch is in (the
+// bytes differ from the original), keep the player's m_Mana (+0xA60) at m_ManaMax (+0xA64).
+static bool CheatInfiniteManaOn() {
+    static const uintptr_t kSites[] = { 0xAA93B8, 0xAA93F8, 0xAA7948, 0xAB1A85, 0xAB614C, 0xABC961, 0xCF06B3 };
+    static const uint8_t kRead[6] = { 0x8B, 0x8E, 0x60, 0x0A, 0x00, 0x00 }, kWrite[6] = { 0x89, 0x86, 0x60, 0x0A, 0x00, 0x00 };
+    for (int i = 0; i < 7; ++i)
+        if (memcmp(reinterpret_cast<void*>(kSites[i]), i < 2 ? kRead : kWrite, 6) != 0) return true;
+    return false;
+}
+
+static void KeepManaFull(ADishonoredPlayerPawn* pawn) {
+    if (!pawn) return;
+    bool on = CheatInfiniteManaOn();
+    static bool wasOn = false;
+    if (on != wasOn) { wasOn = on; Log("infinite mana (Cheat Menu) %s: all powers free", on ? "on" : "off"); }
+    if (!on) return;
+    auto* mana = reinterpret_cast<int32_t*>(reinterpret_cast<char*>(pawn) + 0xA60);
+    int32_t max = mana[1];
+    if (max > 0 && mana[0] < max) mana[0] = max;
+}
 
 static void __fastcall HookedGameEngineTick(void* self, void* /*edx*/, float delta) {
     g_origGameEngineTick(self, delta);
@@ -5502,9 +10281,14 @@ static void __fastcall HookedGameEngineTick(void* self, void* /*edx*/, float del
         lastWorld = world;
         g_body = nullptr;
         g_head = nullptr;
+        g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+        g_castLightEnv = nullptr;
         g_shadowBody = nullptr;
+        g_shadowArms = nullptr;
+        g_holsterCast = nullptr;
         g_itemShadow[0] = g_itemShadow[1] = nullptr;   // owned by the pawn; dropped with it
         g_armsShadow = nullptr;
+        g_armSkin = nullptr;
         g_bodyPawn = nullptr;
         ReleaseLoadedAssets();
         g_bodyMesh = nullptr;
@@ -5517,7 +10301,15 @@ static void __fastcall HookedGameEngineTick(void* self, void* /*edx*/, float del
         g_crouchSet = nullptr;
         g_headMesh = nullptr; g_daudBodyMesh = nullptr; g_daudHeadMesh = nullptr; ForgetArmsSwap();
         if (g_animLoadState != LoadState::Loading) g_animLoadState = LoadState::Idle;
+        g_ghosted.clear(); g_ghostActive = false;   // that level's pawns are gone: nothing to put back
     }
+
+    RestoreNpcs(GetPlayerPawn(), false);   // NPCs block again 1.5 s after the last Blink aim
+    QuickTurnTick(GetPlayerPawn());
+    CrossbowInstantReload();
+    ApplyJumpStyle();
+    SummonAssassinUnlimited();
+    KeepManaFull(GetPlayerPawn());
 
     // Wait until a player pawn has existed for 3 s (level fully loaded, past the first frames).
     ADishonoredPlayerPawn* pawn = GetPlayerPawn();
@@ -5549,6 +10341,8 @@ static void __cdecl HookedCollectGarbage(uint64_t keepFlags, uint32_t fullPurge)
         if ((g_bodyMesh || g_animSet || g_ourArrayCount) && (!world || world != g_assetsWorld)) {
             Log("level is changing: releasing body assets before the purge");
             if (g_shadowBody && g_shadowBody->Animations) DetachNodeArrays(g_shadowBody->Animations, 0);
+            if (g_shadowArms && g_shadowArms->Animations) DetachNodeArrays(g_shadowArms->Animations, 0);
+            if (g_holsterCast && g_holsterCast->Animations) DetachNodeArrays(g_holsterCast->Animations, 0);
             DetachOurArrays(g_body);
             ReleaseLoadedAssets();
             g_bodyMesh = nullptr;
@@ -5564,16 +10358,23 @@ static void __cdecl HookedCollectGarbage(uint64_t keepFlags, uint32_t fullPurge)
         auto unreachable = [](void* o) { return o && (*reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(o) + 0x8) & 0x0000000200000000ULL); };
         // Only the components themselves: the instanced AnimTree is replaced now and then (old one unreachable,
         // harmless) and reacting to that rebuilt the body while the old one stayed attached (build 58 log).
-        if (unreachable(g_body) || unreachable(g_shadowBody)) {
+        if (unreachable(g_body) || unreachable(g_shadowBody) || unreachable(g_shadowArms) || unreachable(g_holsterCast)) {
             Log("GC marked our body unreachable (body %d, shadow %d): detaching arrays before the purge",
                 unreachable(g_body) ? 1 : 0, unreachable(g_shadowBody) ? 1 : 0);
             if (g_shadowBody && g_shadowBody->Animations) DetachNodeArrays(g_shadowBody->Animations, 0);
+            if (g_shadowArms && g_shadowArms->Animations) DetachNodeArrays(g_shadowArms->Animations, 0);
+            if (g_holsterCast && g_holsterCast->Animations) DetachNodeArrays(g_holsterCast->Animations, 0);
             DetachOurArrays(g_body);
             g_body = nullptr;
             g_head = nullptr;
+            g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+            g_castLightEnv = nullptr;
             g_shadowBody = nullptr;
+            g_shadowArms = nullptr;
+            g_holsterCast = nullptr;
             g_itemShadow[0] = g_itemShadow[1] = nullptr;   // owned by the pawn; dropped with it
         g_armsShadow = nullptr;
+        g_armSkin = nullptr;
             g_bodyPawn = nullptr;
         }
     }
@@ -5587,6 +10388,8 @@ static StaticExit_t g_origStaticExit = nullptr;
 static void __cdecl HookedStaticExit() {
     Log("game is quitting: detaching body arrays before the final purge");
     if (g_shadowBody && g_shadowBody->Animations) DetachNodeArrays(g_shadowBody->Animations, 0);
+    if (g_shadowArms && g_shadowArms->Animations) DetachNodeArrays(g_shadowArms->Animations, 0);
+    if (g_holsterCast && g_holsterCast->Animations) DetachNodeArrays(g_holsterCast->Animations, 0);
             DetachOurArrays(g_body);
     ReleaseLoadedAssets();
     g_bodyMesh = nullptr;
@@ -5595,9 +10398,14 @@ static void __cdecl HookedStaticExit() {
     g_headMesh = nullptr; g_daudBodyMesh = nullptr; g_daudHeadMesh = nullptr; ForgetArmsSwap();
     g_body = nullptr;
     g_head = nullptr;
+    g_shoulderBlob[0] = g_shoulderBlob[1] = nullptr;
+    g_castLightEnv = nullptr;
     g_shadowBody = nullptr;
+    g_shadowArms = nullptr;
+    g_holsterCast = nullptr;
     g_itemShadow[0] = g_itemShadow[1] = nullptr;   // owned by the pawn; dropped with it
         g_armsShadow = nullptr;
+        g_armSkin = nullptr;
     g_origStaticExit();
 }
 
@@ -5655,6 +10463,8 @@ static void LearnPitchCurve(PitchCurve& c, float deg, float f, float r, float u,
 
 static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx, FVector* loc, FRotator* rot) {
     g_origGetPlayerViewPoint(pc, edx, loc, rot);
+    if (pc && pc->PlayerCamera && pc->PlayerCamera->IsA(ADishonoredPlayerCamera::StaticClass()))
+        g_armsFov = reinterpret_cast<ADishonoredPlayerCamera*>(pc->PlayerCamera)->m_fCurFOV_Arms;
     auto off = []() { g_camCorrection = { 0, 0, 0 }; g_camTarget = { 0, 0, 0 }; g_bodyFollowTarget = { 0, 0, 0 }; g_cornerLeanRight = g_cornerLeanFwd = g_stairDz = 0.0f; };
     if (!g_cfg.rigidCamera || !pc || !loc || !rot) { off(); return; }
     auto* pawn = static_cast<APawn*>(pc->Pawn);
@@ -5663,6 +10473,36 @@ static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx
         pc->PlayerCamera->ViewTarget.Target != pawn && pc->PlayerCamera->ViewTarget.Target != pc) {
         off();
         return;
+    }
+    // Slide -> crouch with a weapon out (10:26 clip, "a flicker at the end of the slide"): the frame after a slide the
+    // game steps the pawn up ~7 uu in one go. Its own 1P arms hide that - camera_jnt and the hands ease together in the
+    // arms' animation, so nothing of the game's moves on screen - but the body, attached to the pawn, popped up with it
+    // for one frame: the mod's per-frame hook runs after the frame has been drawn, so SyncTransform's absorb
+    // (g_zAbsorb) only took hold a frame late, and the raised left knee flicked up at the camera (log 10:26:04: pelvis
+    // 2018 -> 2025 -> 2019). This hook runs after the tick and before the draw: take the step out of the attached
+    // meshes right here (ForceUpdate pushes the new transform to the renderer for this frame) and carry it in the
+    // absorb, which SyncTransform then releases as before. Holstered, the arm skin rides along so the shoulders match.
+    if (g_body && g_absorbSlideEndAt && GetTickCount() - g_absorbSlideEndAt < 1000 && g_absorbLastZ != 0.0f &&
+        static_cast<int>(pawn->Physics) == 1) {
+        float cyl = pawn->CylinderComponent ? pawn->CylinderComponent->CollisionHeight : 0.0f;
+        float dtS = QpcDt(g_absorbQpc);
+        float dz = pawn->Location.Z - g_absorbLastZ - (cyl - g_absorbLastCyl) - pawn->Velocity.Z * dtS;
+        if (fabsf(dz) > 2.0f && fabsf(dz) < 40.0f) {
+            g_zAbsorb -= dz;
+            USkeletalMeshComponent* parts[6] = { g_body, g_shadowBody, g_shadowArms, g_holsterCast, g_armSkinOn ? g_armSkin : nullptr, g_head };
+            int moved = 0;
+            for (auto* c : parts) {
+                if (!c || c->Owner != pawn || !c->bAttached) continue;
+                FVector t = c->Translation;
+                t.Z -= dz;
+                c->SetTranslation(t);
+                c->ForceUpdate(true);
+                ++moved;
+            }
+            g_shadowBodyT.Z -= dz;
+            Log("slide end: pawn Z stepped %.1f after the tick - %d attached meshes held in place before the draw (absorb %.1f)", dz, moved, g_zAbsorb);
+        }
+        g_absorbLastZ = pawn->Location.Z; g_absorbLastCyl = cyl;
     }
     // The 1P arms are moved by the same correction (so weapons stay in front of the fixed camera, build 58 video).
     // If the game's camera rides the arms (camera_jnt), that shift is already in the view: take it out first.
@@ -5805,7 +10645,29 @@ static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx
     loc->Y = raw.Y - k * S.Y + g_camTarget.Y;
     loc->Z = vanZ + g_camTarget.Z;
     // Sliding: the game drops the view to hip height (it looked out of the crotch - user); lift it up the body.
-    loc->Z += g_slideAmount * g_cfg.slideCameraUp;
+    loc->Z += g_slideCamW * g_cfg.slideCameraUp;
+    // Slide -> crouch (10:30 log: the view rose 25 uu in ~100 ms as the game lifted its camera out of the slide - a
+    // jolt): for SlideCamSettle seconds after a slide the view height eases from where it was (smoothstep) to wherever
+    // the game + the mod put it, so the climb into the crouch view is spread out instead of taken in six frames.
+    {
+        static LONGLONG endQpc = 0;
+        static float endZ = 0.0f, lastOutZ = 0.0f;
+        static bool wasSlide = false;
+        static LONGLONG freq = 0;
+        if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart ? f.QuadPart : 1; }
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        if (wasSlide && !g_isSliding && g_slideCamW > 0.5f && !g_leftHandBusy && !g_rightHandBusy) { endQpc = c.QuadPart; endZ = lastOutZ; }   // (holstered slides only: the eased view would part from the game's 1P arms)
+        wasSlide = g_isSliding;
+        float before = loc->Z;
+        if (endQpc && g_cfg.slideCamSettle > 0.05f) {
+            float u = static_cast<float>(static_cast<double>(c.QuadPart - endQpc) / static_cast<double>(freq)) / g_cfg.slideCamSettle;
+            if (u < 1.0f) { float ss = u * u * (3.0f - 2.0f * u); loc->Z = endZ + (loc->Z - endZ) * ss; }
+            else endQpc = 0;
+        }
+        g_slideCamSettleOff = loc->Z - before;   // (10:35 clip: with a weapon out the 1P arms bounced - they must ease with the view)
+        lastOutZ = loc->Z;
+    }
     g_camCorrection.X = loc->X - raw.X;
     g_camCorrection.Y = loc->Y - raw.Y;
     g_camCorrection.Z = loc->Z - raw.Z;
@@ -5887,9 +10749,20 @@ static void ApplyArmsShift(ADishonoredPlayerPawn* pawn) {
     FVector base = arms->Translation;
     if (fabsf(base.X - setTo.X) < 0.01f) base.X -= g_armsShiftLocal.X;
     if (fabsf(base.Y - setTo.Y) < 0.01f) base.Y -= g_armsShiftLocal.Y;
-    if (fabsf(base.Z - setTo.Z) < 0.01f) base.Z -= g_armsShiftLocal.Z;
+    // Z: ALWAYS take our shift back out. The game eases the arms' Z during slides, so a changed Z is not "the game
+    // rewrote it" - with the 45 uu slide raise in the shift that test re-based our own lift every frame and the arms
+    // (and the camera riding them) ran away upward until the 120 uu guard (10:10 clip, "floating"; log: camera 122 uu
+    // from the eyes). If the game sets Z outright each frame this just nullifies the Z shift, which is safe.
+    base.Z -= g_armsShiftLocal.Z;
     bool ours = true;
     FVector c = (g_cfg.rigidCamera && g_cfg.rigidCameraArms) ? g_camTarget : FVector{ 0, 0, 0 };
+    // The slide camera raise too (10:05 clip: with a weapon out the 1P hands sat 45 uu under the lifted view and looked
+    // small). The view hook takes the arms shift back out before adding the raise, so this moves only the arms.
+    // (10:40: no slide terms here any more - the game eases the 1P arms' Z out of a slide itself, and any Z we add is
+    // folded into that easing and fed back to the camera riding the arms: 10:35 bounce, 10:38 double bounce. Weapon
+    // slides keep the game's camera height instead, see UpdateSlide.)
+    c.Z += g_slideCamW * g_cfg.slideCameraUp;   // (the 1P arms rise with the slide camera: hands keep their size; the settle is holstered-only)
+    c.Z = Clamp(c.Z, -60.0f, 60.0f);
     float yaw = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
     float cy = cosf(yaw), sy = sinf(yaw);
     g_armsShiftLocal = { c.X * cy + c.Y * sy, -c.X * sy + c.Y * cy, c.Z };
@@ -5968,7 +10841,8 @@ static HMODULE g_chainDinput = nullptr;   // chained DLL whose DirectInput8Creat
 static HMODULE g_chainMods[32];
 static int g_chainModCount = 0;
 
-// Body Swap plugin (Mods\plugins\BodySwap.dll) API. part: 0 body, 1 first-person arms, 2 sword, 3 power set, 4 crossbow;
+// Body Swap plugin (Mods\plugins\BodySwap.dll) API. part: 0 body, 1 first-person arms, 2 sword, 3 power set, 4 crossbow,
+// 5 jump (Agility's power jump);
 // value: 0 Corvo, 1 Daud, 2 Daud's High Overseer disguise (body, arms and sword only).
 extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, int value) {
     int maxValue = part <= 2 ? 2 : 1;
@@ -5979,12 +10853,13 @@ extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, i
     else if (part == 2) InterlockedExchange(&g_bladeChar, value);
     else if (part == 3) InterlockedExchange(&g_powerChar, value);
     else if (part == 4) InterlockedExchange(&g_bowChar, value);
-    Log("Body Swap: %s -> %s", part == 0 ? "body" : part == 1 ? "arms" : part == 2 ? "blade" : part == 3 ? "powers" : "crossbow",
+    else if (part == 5) InterlockedExchange(&g_jumpChar, value);
+    Log("Body Swap: %s -> %s", part == 0 ? "body" : part == 1 ? "arms" : part == 2 ? "blade" : part == 3 ? "powers" : part == 4 ? "crossbow" : "jump",
         value == 2 ? "Overseer" : value ? "Daud" : "Corvo");
 }
 
 extern "C" __declspec(dllexport) int __cdecl CorvoBody_GetCharacter(int part) {
-    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : 0;
+    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : part == 5 ? static_cast<int>(g_jumpChar) : 0;
 }
 
 // Extra exports some chained proxies provide, which their plugins look up with GetModuleHandle("dinput8.dll") -
@@ -6073,9 +10948,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     LoadSettings();
     LoadPitchCurve();
 
-    LoadPackageAsync = reinterpret_cast<LoadPackageAsync_t>(
+    RawLoadPackageAsync = reinterpret_cast<LoadPackageAsync_t>(
         FindPattern("55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 81 EC 8C 00 00 00 56 57"));
-    Log("LoadPackageAsync at %p", reinterpret_cast<void*>(LoadPackageAsync));
+    Log("LoadPackageAsync at %p", reinterpret_cast<void*>(RawLoadPackageAsync));
 
     // Sanity check the prologue before hooking (push ebp; mov ebp,esp; push -1; push imm32).
     const uint8_t expect[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68 };
@@ -6118,6 +10993,8 @@ static DWORD WINAPI InitThread(LPVOID) {
         Log("WARNING: could not hook GetPlayerViewPoint");
     }
     HookPowerSaveLoad();
+    HookBlinkClearance();
+    HookZoomButton();
     HookPowerLevels();
     HookIcons();
     HookPawnSaveLoad();
@@ -6137,11 +11014,76 @@ static void OpenLog(HMODULE self) {
     g_log = fopen(path, "w");
 }
 
+// Title screen ("CorvoBody Version 3" under the Dishonored logo, release 3.0): the zip installs an edited
+// DishonoredGame\CookedPCConsole\Dishonored_MainMenu.upk, which is larger than the game's own. The engine reads every
+// package's size from DishonoredGame\PCConsoleTOC*.txt, so the entry must match the file on disk. Done here, in
+// DllMain: DINPUT8.dll is a static import of Dishonored.exe, so this runs before the engine has read anything. Each TOC
+// is only rewritten when its entry differs from the installed file (vanilla package -> vanilla size, so Steam's
+// "verify files" and an uninstall stay consistent). Plain kernel32 file calls only (safe under the loader lock).
+static void SyncTitleTocSize(HINSTANCE self) {
+    char root[MAX_PATH];
+    if (!GetModuleFileNameA(self, root, MAX_PATH)) return;
+    for (int up = 0; up < 3; ++up) {   // ...\Binaries\Win32\dinput8.dll -> the game folder
+        char* sl = strrchr(root, '\\');
+        if (!sl) return;
+        *sl = 0;
+    }
+    std::string base = std::string(root) + "\\DishonoredGame\\";
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA((base + "CookedPCConsole\\Dishonored_MainMenu.upk").c_str(), GetFileExInfoStandard, &fa)) return;
+    unsigned long long size = (static_cast<unsigned long long>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+    WIN32_FIND_DATAA fd;
+    HANDLE fh = FindFirstFileA((base + "PCConsoleTOC*.txt").c_str(), &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    const std::string key = "\\cookedpcconsole\\dishonored_mainmenu.upk 0";
+    do {
+        std::string path = base + fd.cFileName;
+        HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        DWORD len = GetFileSize(f, nullptr), got = 0;
+        std::string text(len, '\0');
+        bool ok = len > 0 && len < 16u * 1024u * 1024u && ReadFile(f, &text[0], len, &got, nullptr) && got == len;
+        CloseHandle(f);
+        if (!ok) continue;
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t end = text.find("\r\n", pos);
+            if (end == std::string::npos) end = text.size();
+            std::string line = text.substr(pos, end - pos);
+            std::string low = line;
+            for (char& c : low) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            while (!low.empty() && (low.back() == ' ' || low.back() == '\t')) low.pop_back();
+            if (low.size() >= key.size() && low.compare(low.size() - key.size(), key.size(), key) == 0) {
+                size_t sp = line.find(' ');
+                if (sp != std::string::npos) {
+                    unsigned long long listed = strtoull(line.substr(0, sp).c_str(), nullptr, 10);
+                    if (listed != size) {
+                        std::string fixed = std::to_string(size) + line.substr(sp);
+                        text = text.substr(0, pos) + fixed + text.substr(end);
+                        std::string tmp = path + ".corvobody.tmp";
+                        HANDLE w = CreateFileA(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+                        DWORD wr = 0;
+                        bool wok = w != INVALID_HANDLE_VALUE && WriteFile(w, text.data(), static_cast<DWORD>(text.size()), &wr, nullptr) && wr == text.size();
+                        if (w != INVALID_HANDLE_VALUE) CloseHandle(w);
+                        if (wok && MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+                            Log("title screen: %s lists Dishonored_MainMenu.upk as %llu bytes - set to %llu", fd.cFileName, listed, size);
+                        else { DeleteFileA(tmp.c_str()); Log("title screen: could not update %s (%llu -> %llu)", fd.cFileName, listed, size); }
+                    }
+                }
+                break;
+            }
+            pos = end + 2;
+        }
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(inst);
         g_self = inst;
         OpenLog(inst);
+        SyncTitleTocSize(inst);
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     }
     return TRUE;

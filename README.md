@@ -2,17 +2,21 @@
 
 Source code for **CorvoBody** on Nexus Mods: https://www.nexusmods.com/dishonored/mods/453
 
-See your own body in first person in Dishonored (2012), like Dishonored 2. The **Body Swap** add-on lets you play
-as Corvo, Daud or Daud's High Overseer disguise (body, arms, blade, powers and crossbow), switchable from the
+See your own body in first person in Dishonored (2012), like Dishonored 2 - and, since 3.0, its real-time shadow
+from the sun and from lamps, following every pose, weapon and item in your hands. The **Body Swap** add-on lets you
+play as Corvo, Daud or Daud's High Overseer disguise (body, arms, blade, powers and crossbow), switchable from the
 pause menu through [Dishonored Mod Loader](https://www.nexusmods.com/dishonored/mods/383).
 
-The mod contains no game assets: it uses the models and animations already installed with the game's DLC.
+This repository contains code only. The mod uses the models and animations already installed with the game's DLC.
+The Nexus download for 3.0 also includes, none of which is in this repository: high-detail upscales of the player
+body textures (`CorvoBody\hd\*.dds`), the game's main menu package with a "CorvoBody Version 3" subtitle added
+under the logo (`Dishonored_MainMenu.upk`), and Dishonored Mod Loader by Crimsab.
 
 ## What is in here
 
 | Path | What it is |
 |---|---|
-| `src/main.cpp` | CorvoBody: a `dinput8.dll` proxy that hooks the game with MinHook, builds the visible body from the DLC models, animates it and keeps it out of the camera |
+| `src/main.cpp` | CorvoBody: a `dinput8.dll` proxy that hooks the game with MinHook, builds the visible body from the DLC models, animates it, keeps it out of the camera and casts the player's shadow. It also swaps the player body's textures for the high-detail ones through a Direct3D 9 `SetTexture` hook, and keeps the `Dishonored_MainMenu.upk` size entry in `DishonoredGame\PCConsoleTOC*.txt` in step with the installed title-screen package |
 | `src/baked_settings.h` | the tuned settings (the mod has no ini or hotkeys) |
 | `src/dinput8.def` | exports: `DirectInput8Create` (forwarded to the system `dinput8.dll` or a chain-loaded mod), `BlinkBootstrap_Register` (forwarded for mods that expect it from `dinput8.dll`) and the Body Swap API |
 | `bodyswap/` | `BodySwap.dll`, a Dishonored Mod Loader plugin that adds the Body Swap menu and passes the choices to CorvoBody |
@@ -37,7 +41,7 @@ into `external\` and compiles the SDK (about a minute). Output:
 
 `-Install` copies both into the Steam install (`-Game <Binaries\Win32 folder>` to change it).
 
-The release DLLs for version 2.0 were built from this source with these steps. A clean build is identical to them
+The release DLLs for version 3.0 were built from this source with these steps. A clean build is identical to them
 apart from the link timestamp and the build ID, which change on every build.
 
 ## Supported game version
