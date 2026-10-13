@@ -57,26 +57,32 @@ const wchar_t* const kChars[] = { L"Corvo", L"Daud" };
 // Body / arms / blade also offer Daud's High Overseer disguise (Brigmore Witches, Coldridge Prison).
 const wchar_t* const kChars3En[] = { L"Corvo", L"Daud", L"Overseer" };
 const wchar_t* const kChars3It[] = { L"Corvo", L"Daud", L"Supervisore" };
+// Summoned NPC (Summon Assassin power, 3.1): the regular whaler, Corvo's / Daud's player model, or an Overseer hound ("Doggy!").
+const wchar_t* const kSummonEn[] = { L"Assassin", L"Corvo", L"Daud", L"Doggy!" };
+const wchar_t* const kSummonIt[] = { L"Assassino", L"Corvo", L"Daud", L"Cagnolino!" };
 const wchar_t* const kGroupsEn[] = { L"Character" };
 const wchar_t* const kGroupsIt[] = { L"Personaggio" };
 
-PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body (with its arms) and blade, and Corvo's or Daud's powers, crossbow and jump (needs CorvoBody)", L"Choose Body", 1 };
+PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body (with its arms) and blade, Corvo's or Daud's powers, crossbow and jump, and who Summon Assassin brings (needs CorvoBody)", L"Choose Body", 1 };
 
-MenuItem g_items[6] = {
+MenuItem g_items[7] = {
     { 2, L"Status", 2, kStatusEn, 0, 0, 1, 0, -1 },
     { 1, L"Body",   3, kChars3En, 0, 0, 1, 0,  0 },
     { 1, L"Blade",  3, kChars3En, 0, 0, 1, 0,  0 },
     { 1, L"Powers", 2, kChars,    0, 0, 1, 0,  0 },
     { 1, L"Crossbow", 2, kChars,  0, 0, 1, 0,  0 },
     { 1, L"Jump", 2, kChars,      0, 0, 1, 0,  0 },   // Agility: Corvo's double jump / Daud's one continuous jump
+    { 1, L"Summoned NPC", 4, kSummonEn, 0, 0, 1, 0, 0 },   // Summon Assassin: who comes (assassin / Corvo / Daud / an Overseer hound)
 };
 
-// Menu rows: [1] body, [2] blade, [3] power set, [4] crossbow, [5] jump (0 Corvo, 1 Daud, 2 Overseer for 1-2).
-// CorvoBody parts: 0 body, 1 arms (= body), 2 blade, 3 powers, 4 crossbow, 5 jump.
-volatile LONG g_value[6] = { 0, 0, 0, 0, 0, 0 };
-const int kPartOfRow[6] = { -1, 0, 2, 3, 4, 5 };
+// Menu rows: [1] body, [2] blade, [3] power set, [4] crossbow, [5] jump (0 Corvo, 1 Daud, 2 Overseer for 1-2),
+// [6] summoned NPC (0 assassin, 1 Corvo, 2 Daud, 3 Overseer hound).
+// CorvoBody parts: 0 body, 1 arms (= body), 2 blade, 3 powers, 4 crossbow, 5 jump, 6 summoned assassins.
+volatile LONG g_value[7] = { 0, 0, 0, 0, 0, 0, 0 };
+const int kPartOfRow[7] = { -1, 0, 2, 3, 4, 5, 6 };
+const int kRows = 7;
 
-int MaxValue(int idx) { return idx >= 1 && idx <= 2 ? 2 : 1; }
+int MaxValue(int idx) { return idx == 6 ? 3 : (idx >= 1 && idx <= 2) ? 2 : 1; }
 volatile LONG g_enabled = 1;
 bool g_italian = false;
 
@@ -110,22 +116,23 @@ void Push() {
     g_set(3, on ? g_value[3] : 0);
     g_set(4, on ? g_value[4] : 0);
     g_set(5, on ? g_value[5] : 0);
+    g_set(6, on ? g_value[6] : 0);   // (an older CorvoBody ignores part 6)
 }
 
 int __cdecl GetValue(int idx) {
     if (idx == 0) return ResolveCorvoBody() ? 1 : 0;
-    if (idx >= 1 && idx <= 5) return g_value[idx];
+    if (idx >= 1 && idx < kRows) return g_value[idx];
     return 0;
 }
 
 void __cdecl SetValue(int idx, int value) {
-    if (idx < 1 || idx > 5) return;
+    if (idx < 1 || idx >= kRows) return;
     if (value < 0 || value > MaxValue(idx)) return;
     InterlockedExchange(&g_value[idx], value);
     Push();
 }
 
-MenuDesc g_menu = { sizeof(MenuItem), 3, 1, 6, g_items, &GetValue, &SetValue, 1, kGroupsEn, 0 };
+MenuDesc g_menu = { sizeof(MenuItem), 3, 1, kRows, g_items, &GetValue, &SetValue, 1, kGroupsEn, 0 };
 
 } // namespace
 
@@ -134,7 +141,7 @@ extern "C" {
 __declspec(dllexport) void __cdecl Plg_Init(const char* lang) {
     g_italian = lang && lang[0] == 'I' && lang[1] == 'T' && lang[2] == 'A';
     if (g_italian) {
-        g_info.description = L"Scegli corpo (con le sue braccia) e lama di Corvo, di Daud o del travestimento da Supervisore, e poteri e balestra di Corvo o di Daud (richiede CorvoBody)";
+        g_info.description = L"Scegli corpo (con le sue braccia) e lama di Corvo, di Daud o del travestimento da Supervisore, poteri, balestra e salto di Corvo o di Daud, e chi arriva con Evoca assassino (richiede CorvoBody)";
         g_info.title = L"Scegli corpo";
         g_items[0].label = L"Stato";
         g_items[0].choices = kStatusIt;
@@ -143,12 +150,14 @@ __declspec(dllexport) void __cdecl Plg_Init(const char* lang) {
         g_items[3].label = L"Poteri";
         g_items[4].label = L"Balestra";
         g_items[5].label = L"Salto";
+        g_items[6].label = L"PNG evocati";
+        g_items[6].choices = kSummonIt;
         for (int i = 1; i <= 2; ++i) g_items[i].choices = kChars3It;
         g_menu.groupNames = kGroupsIt;
     }
     // Start from what CorvoBody already uses (its ini); the loader then applies the saved menu values.
     if (ResolveCorvoBody() && g_get) {
-        for (int i = 1; i <= 5; ++i) {
+        for (int i = 1; i < kRows; ++i) {
             int v = g_get(kPartOfRow[i]);
             g_value[i] = (v >= 0 && v <= MaxValue(i)) ? v : 0;
         }

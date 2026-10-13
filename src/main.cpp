@@ -245,6 +245,10 @@ struct Settings {
     float climbReachTime = 0.32f;    // ...seconds for a reach to the next grip (shorter when climbing fast)
     float climbHandSpread = 2.0f;    // ...each hand this far to its side of the chain
     float climbArmNearScale = 0.3f;  // ...the arm skin's near-camera guard limits scaled by this while climbing (the hands are at the face by design)
+    bool preloadDaudForSaves = true; // (2026-10-13 08:51 crash) a save with Daud's wristbow bolts lying around crashed on load (assert Array.h:596): load Daud's package before a level is restored, when a Daud choice is on and the bolt objects aren't in memory
+    bool fixTimerResolution = true;  // (2026-10-13, 23:36 clip: the turn skipped 4 times a second, the game time moving in 15.6 ms ticks) the game asks Windows for a 1 ms timer once at start-up; make Windows honour it (opt out of power throttling of timer requests) and ask again
+    bool hdNearMissLog = false;      // (off for the 3.1 release) (2026-10-13, exact HD matching) log a texture the OLD similarity test would have taken but whose bytes aren't a player map's (once per picture) - field proof the exact prints hold
+    bool frameTimingLog = false;     // (off for the 3.1 release) (2026-10-12 23:4x, user: "stutter when moving the camera left or right") every 5 s: frame pacing, Present, vsync/window mode, timer granularity and CorvoBody's own per-frame cost (log only)
     bool selfTestCapture = false;    // (OFF for the 3.0 release; 20:1x: Present is hooked on the game's OWN device, found from inside SetTexture) DEVELOPMENT: the mod saves its own frames (CorvoBody\captures\*.bmp, half size): 3 a second while climbing (45 per session) and a 10-frame burst on the Home key - so the author can see the result without a clip. TURN OFF FOR RELEASE
     bool climbShadowArms = false;  // (OFF 19:2x: reverted) ladders/chains: the shadow's hands reach the game's own first-person climbing hands (hand over hand, fingers gripping) - the same reach as the weapon arms (user 18:45: "a chain climbing animation for the arms and legs"; the game has none for the body, only the 1P hands)
     bool climbLegCycle = false;    // (OFF 19:2x: reverted, see ClimbHands) ...and the legs climb: crossed at the ankles (the grip), the knees drawn up and pushed down again once per ClimbLegStride climbed - a rope-climb foot lock; the still grip (with its sway) when not moving
@@ -428,6 +432,7 @@ static volatile LONG g_bladeChar = 0;
 static volatile LONG g_bowChar = 0;     // 1 = Daud's wristbow
 static volatile LONG g_powerChar = 0;   // 1 = Daud's power set
 static volatile LONG g_jumpChar = 0;    // Agility's power jump: 0 Corvo's double jump, 1 Daud's one continuous jump
+static volatile LONG g_summonChar = 0;  // (3.1) Summon Assassin: who comes - 0 the regular assassin, 1 Corvo, 2 Daud, 3 an Overseer hound ("Doggy!")
 static volatile LONG g_charsSet = 0;   // 1 once the ini or the plugin has set them (the plugin may run first)
 
 static void LoadSettings() {
@@ -440,6 +445,7 @@ static void LoadSettings() {
         g_bowChar = SettingInt("CrossbowCharacter", 0) == 1 ? 1 : 0;
         g_powerChar = SettingInt("PowerCharacter", 0) == 1 ? 1 : 0;
         g_jumpChar = SettingInt("JumpCharacter", 0) == 1 ? 1 : 0;
+        { int v = SettingInt("SummonCharacter", 0); g_summonChar = (v >= 0 && v <= 3) ? v : 0; }
     }
     auto readBool = [](const char* key, bool def) {
         return SettingInt(key, def ? 1 : 0) != 0;
@@ -640,6 +646,10 @@ static void LoadSettings() {
     g_cfg.climbHandSpread = readFloat("ClimbHandSpread", g_cfg.climbHandSpread);
     g_cfg.climbArmNearScale = readFloat("ClimbArmNearScale", g_cfg.climbArmNearScale);
     g_cfg.selfTestCapture = readBool("SelfTestCapture", g_cfg.selfTestCapture);
+    g_cfg.frameTimingLog = readBool("FrameTimingLog", g_cfg.frameTimingLog);
+    g_cfg.hdNearMissLog = readBool("HdNearMissLog", g_cfg.hdNearMissLog);
+    g_cfg.fixTimerResolution = readBool("FixTimerResolution", g_cfg.fixTimerResolution);
+    g_cfg.preloadDaudForSaves = readBool("PreloadDaudForSaves", g_cfg.preloadDaudForSaves);
     g_cfg.climbLegCycle = readBool("ClimbLegCycle", g_cfg.climbLegCycle);
     g_cfg.climbLegStride = readFloat("ClimbLegStride", g_cfg.climbLegStride);
     g_cfg.climbLegBendHip = readFloat("ClimbLegBendHip", g_cfg.climbLegBendHip);
@@ -687,6 +697,7 @@ static const char* kArmBones[] = { "shoulder_L_jnt", "shoulder_R_jnt" };
 
 enum class LoadState { Idle, Loading, Loaded, Failed };
 static volatile LoadState g_loadState = LoadState::Idle;
+static volatile LoadState g_houndLoadState = LoadState::Idle;   // (3.1 Doggy!) the kennel package; no other load starts while it runs
 static int g_sourceIndex = 0;
 static DWORD g_loadStartTick = 0;
 
@@ -870,6 +881,7 @@ static void __cdecl OnPackageLoaded(UObject* package, void* /*user*/) {
 }
 
 static void StartLoad() {
+    if (g_houndLoadState == LoadState::Loading) return;   // one package load at a time (retried next frame)
     if (!RawLoadPackageAsync || g_sourceIndex >= static_cast<int>(sizeof(kSources) / sizeof(kSources[0]))) {
         g_loadState = LoadState::Failed;
         Log("no more body sources to try");
@@ -7504,7 +7516,8 @@ static void __cdecl OnDaudUiLoaded(UObject* package, void*) {
 }
 
 static void LoadDaudUi() {
-    if (g_daudUiLoading || g_daudUiNext >= static_cast<LONG>(sizeof(kDaudUiPackages) / sizeof(kDaudUiPackages[0])) || !RawLoadPackageAsync) return;
+    if (g_daudUiLoading || g_daudUiNext >= static_cast<LONG>(sizeof(kDaudUiPackages) / sizeof(kDaudUiPackages[0])) || !RawLoadPackageAsync ||
+        g_houndLoadState == LoadState::Loading) return;
     InterlockedExchange(&g_daudUiLoading, 1);
     FString name(kDaudUiPackages[g_daudUiNext]);
     LoadPackageAsync(name, &OnDaudUiLoaded, nullptr, nullptr);
@@ -8692,7 +8705,9 @@ static void ApplyCrossbowCharacter(ADishonoredPlayerPawn* pawn) {
 // Saves never reference Daud's wristbow: the player's save runs with Corvo's crossbow in the slot.
 using PlayerGameSave_t = void(__thiscall*)(void*, void*, int);
 static PlayerGameSave_t g_origPlayerGameSave = nullptr;
+static void LogSummonLimbs();
 static void __fastcall HookedPlayerGameSave(ADishonoredPlayerPawn* pawn, void*, void* ar, int loc) {
+    LogSummonLimbs();
     int slot = pawn == g_bowPawn ? CrossbowSlot(pawn) : -1;
     UDishonoredInventoryItem* daud = slot >= 0 ? SlotItem(pawn, slot) : nullptr;
     bool isDaud = IsDaudBow(daud);
@@ -8726,7 +8741,7 @@ static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !p
     if (needPackage) {
         // Load only once our body has been in use a while: a second package load before that tore down the
         // first package's mesh data (tests 12-15).
-        if (g_daudLoadState == LoadState::Idle && g_ovsLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
+        if (g_daudLoadState == LoadState::Idle && g_ovsLoadState != LoadState::Loading && g_houndLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
             g_bodyAnimated && GetTickCount() - g_bodyBuiltTick > 3000) {
             Log("Body Swap: async loading %s", Narrow(kDaudPackage).c_str());
             g_daudLoadState = LoadState::Loading;
@@ -8745,7 +8760,7 @@ static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !p
     bool needOvs = (g_bodyChar == 2 && !g_ovsBodyMesh) || (g_armsChar == 2 && !g_ovsArmsMesh) ||
                    (g_bodyChar == 2 && g_cfg.fpArmSkin && !g_ovsArmsMesh) || (g_bladeChar == 2 && !g_ovsSwordMesh);
     if (needOvs) {
-        if (g_ovsLoadState == LoadState::Idle && g_daudLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
+        if (g_ovsLoadState == LoadState::Idle && g_daudLoadState != LoadState::Loading && g_houndLoadState != LoadState::Loading && RawLoadPackageAsync && g_body &&
             g_bodyAnimated && GetTickCount() - g_bodyBuiltTick > 3000) {
             Log("Body Swap: async loading %s (Overseer disguise)", Narrow(kOvsPackage).c_str());
             g_ovsLoadState = LoadState::Loading;
@@ -8857,6 +8872,7 @@ static void UpdateBodyAnimation() {
                 Log("anim set already in memory: %s", g_animSet->GetFullName().c_str());
                 break;
             }
+            if (g_houndLoadState == LoadState::Loading) break;   // one package load at a time
             Log("async loading %s for anim set %s", Narrow(kAnimPackage).c_str(), kAnimSetName);
             g_animLoadState = LoadState::Loading;
             g_animLoadStartTick = GetTickCount();
@@ -9324,7 +9340,7 @@ static SetTextureFn g_origSetTexture = nullptr;
 static bool g_hdHooked = false;
 static volatile LONG g_hdSetTextureCalls = 0, g_hdClassified = 0, g_hdCompared = 0;
 static volatile LONG g_hdGen = 0;   // bumped by the game thread every 5 s: the render thread forgets its classifications
-struct HdClass { IDirect3DBaseTexture9* ptr; int slot; };   // slot -1 = not a body map
+struct HdClass { IDirect3DBaseTexture9* ptr; int slot; UINT w; DWORD levels, lastVerify; };   // slot -1 = not a body map; w / levels = THIS texture's shape
 static const int kHdClassSize = 16384;
 static HdClass g_hdClass[kHdClassSize];
 
@@ -9397,7 +9413,8 @@ static IDirect3DTexture9* HdCreateFromDds(IDirect3DDevice9* dev, const uint8_t* 
 
 // Which body map is this (bound) texture, if any: shape first, then its ~32-wide mip against every file's (or one slot's
 // when 'only' >= 0). Render thread.
-static int HdClassify(IDirect3DBaseTexture9* tex, float& maeOut, int only = -1) {
+// (2026-10-13: no longer decides anything - kept to log near misses of the exact test, see HdClassify below.)
+static int HdClassifyBySimilarity(IDirect3DBaseTexture9* tex, float& maeOut, int only = -1) {
     maeOut = -1.0f;
     if (tex->GetType() != D3DRTYPE_TEXTURE) return -1;
     auto* t = static_cast<IDirect3DTexture9*>(tex);
@@ -9466,12 +9483,297 @@ static int HdClassify(IDirect3DBaseTexture9* tex, float& maeOut, int only = -1) 
     return best;
 }
 
+// ---- HD texture identity (2026-10-13) ----
+// Which body map is this bound texture: FNV-1a-64 of the GAME's own DXT1 blocks of its 32x16 / 64x32 / 128x64 levels. D3D
+// gets the cooked mips byte for byte and streaming only adds or drops TOP mips, so every resident size of a player map
+// (2048x1024 x12 .. 256x128 x9 .. a 64x32 x7 stub) carries exactly these bytes. Prints from CookedPCConsole + DLC05/06/07
+// (every package copy identical: Corvo 8, hood 2, Daud 8, Overseer ~40); no collision among the game's 1566 distinct 2:1
+// DXT1 textures nor 5775 lightmaps (wf_whaler + adversarial check). The whalers' Assassin_Body01 maps, Billie, Campbell,
+// the hood normal map and every stub impostor fail; Overseer NPCs and the Daud NPC use the very same textures and keep HD.
+struct HdPrint { uint64_t m32, m64, m128; };
+static const HdPrint kHdPrint[kHdTexCount] = {     // order = kHdTexNames
+    { 0x3ae2a72d19e192a6ull, 0x46a5239d088e5cabull, 0xf746d56498f120b0ull },   // Corvo_Body_d   2048x1024
+    { 0x90c4634d8dd7aa80ull, 0x9da9d63780fba4a2ull, 0x4775bf5908fda822ull },   // Corvo_Body_n   2048x1024
+    { 0x2fffaddbd61363c0ull, 0x9207e629425a08d1ull, 0x216664b2c9922960ull },   // Corvo_Body_s   2048x1024
+    { 0x13587c3a181ac893ull, 0x7492a3489a3a309eull, 0x5a65182cc80e53afull },   // CorvoHood_d    2048x1024
+    { 0x86bc410175a946b0ull, 0xcf859209aedc26e6ull, 0x967c45846f890ba2ull },   // CorvoHood_n    1024x512 (no HD file yet)
+    { 0xcc5bd3d3dde9d54bull, 0x4f078db79541c9f0ull, 0xad410d50efadf50dull },   // CorvoHood_s    1024x512 (no HD file yet)
+    { 0xa2d9877e6a407bd3ull, 0x9802c4b58185e127ull, 0x1b6ca224aca5411eull },   // Daud_Body01_d  2048x1024
+    { 0x5567139555c473c7ull, 0xd1503c6f92fc23f4ull, 0x3f3bc18e5ba6f35eull },   // Daud_Body01_n  1024x512
+    { 0x72f7f12891473572ull, 0x3f84e1200706a0c1ull, 0x5142146c0d601a6aull },   // Daud_Body01_s  1024x512
+    { 0xbe4773ca11a18c5aull, 0xdd2e307f3d1f3be8ull, 0x6c38aec9d2c44e2dull },   // OverseerBody_d 2048x1024
+    { 0x140fc093579689c4ull, 0xafc31cfa7b679de1ull, 0xb0ae7a2f944e4a5full },   // OverseerBody_n 1024x512
+    { 0xd7959ebb1f94f938ull, 0xd0895b3c5678790bull, 0x86939d0386f57986ull },   // OverseerBody_s 1024x512
+};
+
+// FNV-1a-64 of one level's DXT1 blocks, row by row (Pitch may exceed the row). The level must be exactly w x h DXT1 -
+// checked first, so a non-power-of-two texture can't make us read past its locked rows. 1 ok, 0 wrong shape, -2 no lock.
+static int HdHashLevel(IDirect3DTexture9* t, DWORD lvl, UINT w, UINT h, uint64_t& out) {
+    D3DSURFACE_DESC d = {};
+    if (FAILED(t->GetLevelDesc(lvl, &d)) || d.Width != w || d.Height != h || d.Format != D3DFMT_DXT1) return 0;
+    D3DLOCKED_RECT lr;
+    if (FAILED(t->LockRect(lvl, &lr, nullptr, D3DLOCK_READONLY))) return -2;
+    uint64_t x = 0xcbf29ce484222325ull;
+    const UINT rowBytes = (w / 4) * 8;
+    for (UINT r = 0; r < h / 4; ++r) {
+        const uint8_t* p = static_cast<const uint8_t*>(lr.pBits) + r * lr.Pitch;
+        for (UINT k = 0; k < rowBytes; ++k) { x ^= p[k]; x *= 0x100000001b3ull; }
+    }
+    t->UnlockRect(lvl);
+    out = x;
+    return 1;
+}
+
+// The slot whose HD file is loaded and whose prints this texture carries at every one of its 32/64/128 levels (a stub is
+// taken on the levels it has), -1 none, -2 couldn't read it now (retry). Render thread; one lock + 256 bytes for a miss.
+static int HdClassify(IDirect3DBaseTexture9* tex, float& maeOut, int only = -1, uint64_t* h32Out = nullptr) {
+    maeOut = -1.0f;
+    if (h32Out) *h32Out = 0;
+    if (tex->GetType() != D3DRTYPE_TEXTURE) return -1;
+    auto* t = static_cast<IDirect3DTexture9*>(tex);
+    const DWORD levels = t->GetLevelCount();
+    D3DSURFACE_DESC d0 = {};
+    if (FAILED(t->GetLevelDesc(0, &d0)) || d0.Format != D3DFMT_DXT1 || d0.Width != d0.Height * 2 ||
+        d0.Width < kHdSmallW || d0.Width > 2048) return -1;
+    auto lvlOf = [&](UINT w) { DWORD l = 0; for (UINT x = d0.Width; x > w; x >>= 1) ++l; return l; };
+    if (lvlOf(32) >= levels) return -1;
+    uint64_t h;
+    int r = HdHashLevel(t, lvlOf(32), 32, 16, h);
+    if (r != 1) return r == -2 ? -2 : -1;
+    InterlockedIncrement(&g_hdCompared);
+    if (h32Out) *h32Out = h;
+    int slot = -1;
+    for (int i = 0; i < kHdTexCount; ++i)
+        if ((only < 0 || i == only) && g_hdTex[i].haveSmall /*HD file loaded*/ && kHdPrint[i].m32 == h) { slot = i; break; }
+    if (slot < 0) return -1;
+    if (d0.Width >= 64) {
+        if (lvlOf(64) >= levels) return -1;
+        r = HdHashLevel(t, lvlOf(64), 64, 32, h);
+        if (r != 1) return r == -2 ? -2 : -1;
+        if (h != kHdPrint[slot].m64) return -1;
+    }
+    if (d0.Width >= 128) {
+        if (lvlOf(128) >= levels) return -1;
+        r = HdHashLevel(t, lvlOf(128), 128, 64, h);
+        if (r != 1) return r == -2 ? -2 : -1;
+        if (h != kHdPrint[slot].m128) return -1;
+    }
+    maeOut = 0.0f;
+    return slot;
+}
+
+// Near-miss diagnostic (HdNearMissLog): once per distinct 32x16 picture that isn't a player map, would the OLD test have
+// taken it? Logged (60 at most) - field proof that the live bytes are the cooked ones, and what got rejected.
+static void HdNearMiss(IDirect3DBaseTexture9* tex, uint64_t h32) {
+    static uint64_t seen[1024];
+    static int logged = 0;
+    if (!h32 || logged >= 60) return;
+    for (int probe = 0; probe < 16; ++probe) {
+        uint64_t& e = seen[(h32 + probe) & 1023];
+        if (e == h32) return;
+        if (!e) { e = h32; break; }
+        if (probe == 15) return;   // table busy: skip
+    }
+    float mae;
+    int old = HdClassifyBySimilarity(tex, mae);
+    if (old < 0) return;
+    ++logged;
+    auto* t = static_cast<IDirect3DTexture9*>(tex);
+    D3DSURFACE_DESC d0 = {};
+    t->GetLevelDesc(0, &d0);
+    Log("hd textures: not exact - a %ux%u x%lu texture (32x16 print %016llx) the old test would have given %s (error %.1f, corr %.2f): left alone",
+        d0.Width, d0.Height, static_cast<unsigned long>(t->GetLevelCount()), static_cast<unsigned long long>(h32),
+        kHdTexNames[old], mae, g_hdTex[old].corr);
+}
+
+// ---- frame timing (diagnostic, FrameTimingLog) ----
+// The 23:36 clip (30 fps) showed the picture advancing in ~64 Hz steps: 2 or 3 per captured frame, 4 times a second, while
+// the pan itself was even. 64 Hz is one tick of Windows' default 15.6 ms timer. These counters tell frame pacing (window
+// mode, vsync, timer) apart from anything the mod does. Render-thread numbers are handed over under a tiny spin lock.
+static LONGLONG FtNow() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }
+static double FtMs(LONGLONG ticks) {
+    static double perMs = 0.0;
+    if (perMs == 0.0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); perMs = f.QuadPart ? static_cast<double>(f.QuadPart) / 1000.0 : 1.0; }
+    return static_cast<double>(ticks) / perMs;
+}
+struct FtStats { int n; double sum, mn, mx; int b[8]; };
+// histogram edges (ms): 8, 12, 14.5, 16.2 (15.6 = one 64 Hz timer tick), 17.2 (16.7 = 60 Hz), 25, 40
+static void FtAdd(FtStats& s, double ms) {
+    static const double e[7] = { 8.0, 12.0, 14.5, 16.2, 17.2, 25.0, 40.0 };
+    int i = 0;
+    while (i < 7 && ms >= e[i]) ++i;
+    ++s.b[i];
+    if (!s.n || ms < s.mn) s.mn = ms;
+    if (ms > s.mx) s.mx = ms;
+    s.sum += ms;
+    ++s.n;
+}
+static void FtFormat(const FtStats& s, double spanS, char* out, size_t cap) {
+    snprintf(out, cap, "%.1f/s, every %.2f ms (min %.2f, max %.2f) | <8:%d 8-12:%d 12-14.5:%d 14.5-16.2:%d 16.2-17.2:%d 17.2-25:%d 25-40:%d 40+:%d",
+             spanS > 0 ? s.n / spanS : 0.0, s.n ? s.sum / s.n : 0.0, s.mn, s.mx, s.b[0], s.b[1], s.b[2], s.b[3], s.b[4], s.b[5], s.b[6], s.b[7]);
+}
+static volatile LONG g_ftLock = 0;
+static void FtLock() { while (InterlockedExchange(&g_ftLock, 1)) YieldProcessor(); }
+static void FtUnlock() { InterlockedExchange(&g_ftLock, 0); }
+static FtStats g_ftPresent[2];                       // intervals between Presents: [0] device Present, [1] swap chain Present
+static double g_ftPresentIn[2], g_ftPresentInMax[2];  // time inside Present (a vsync wait shows up here)
+static double g_ftHdMs = 0.0, g_ftHdMaxMs = 0.0;      // HD texture checks on the render thread (inside SetTexture)
+static int g_ftHdN = 0;
+static volatile LONG g_ftPpWindowed = -1, g_ftPpInterval = -1, g_ftPpRefresh = -1, g_ftPpW = 0, g_ftPpH = 0, g_ftPpSwap = -1;
+static HWND volatile g_ftWnd = nullptr;
+static volatile LONG g_ftSleepUs = -1;               // the process's real Sleep(1), measured on a helper thread
+static void FtPresent(int kind, IDirect3DDevice9* dev, LONGLONG t0, LONGLONG t1) {
+    if (!g_cfg.frameTimingLog) return;
+    static LONGLONG last[2] = { 0, 0 };
+    static DWORD ppAt = 0;
+    FtLock();
+    if (last[kind]) FtAdd(g_ftPresent[kind], FtMs(t0 - last[kind]));
+    double in = FtMs(t1 - t0);
+    g_ftPresentIn[kind] += in;
+    if (in > g_ftPresentInMax[kind]) g_ftPresentInMax[kind] = in;
+    FtUnlock();
+    last[kind] = t0;
+    if (dev && GetTickCount() - ppAt > 2000) {   // the device's present parameters, every 2 s
+        ppAt = GetTickCount();
+        IDirect3DSwapChain9* sc = nullptr;
+        if (SUCCEEDED(dev->GetSwapChain(0, &sc)) && sc) {
+            D3DPRESENT_PARAMETERS pp = {};
+            if (SUCCEEDED(sc->GetPresentParameters(&pp))) {
+                g_ftPpWindowed = pp.Windowed ? 1 : 0;
+                g_ftPpInterval = static_cast<LONG>(pp.PresentationInterval);
+                g_ftPpRefresh = static_cast<LONG>(pp.FullScreen_RefreshRateInHz);
+                g_ftPpW = static_cast<LONG>(pp.BackBufferWidth);
+                g_ftPpH = static_cast<LONG>(pp.BackBufferHeight);
+                g_ftPpSwap = static_cast<LONG>(pp.SwapEffect);
+                g_ftWnd = pp.hDeviceWindow;
+            }
+            sc->Release();
+        }
+    }
+}
+// ---- Windows timer (FixTimerResolution) ----
+// The 23:36 clip: the picture moved in whole 15.625 ms steps (64.02 Hz measured) on a 60 Hz screen, about 4 frames a second
+// carrying two steps - the skip in every turn, the whole scene and the game's own 1P arms alike (not the camera code).
+// Dishonored asks for a 1 ms timer once at start-up (timeBeginPeriod(1) in appPlatformPreInit, 0x48BF3E) and never again;
+// when Windows 11 doesn't honour a process's request (power throttling, or a window it counts as hidden) every Sleep in
+// the frame chain wakes only on the 15.6 ms tick. Opt this process out of timer throttling and EcoQoS (documented: the
+// flag in ControlMask, clear in StateMask = always honour timer requests / never throttle) and ask for 1 ms again.
+typedef UINT (WINAPI* TimeBeginPeriodFn)(UINT);
+static TimeBeginPeriodFn g_timeBeginPeriod = nullptr;
+static float SleepProbeMs() {
+    LONGLONG t0 = FtNow();
+    for (int i = 0; i < 8; ++i) Sleep(1);
+    return static_cast<float>(FtMs(FtNow() - t0) / 8.0);
+}
+static void FixTimerResolution() {
+    float before = SleepProbeMs();
+    if (!g_cfg.fixTimerResolution) { Log("timer: Sleep(1) takes %.2f ms (FixTimerResolution off)", before); return; }
+    struct PowerThrottlingState { ULONG Version, ControlMask, StateMask; };
+    typedef BOOL (WINAPI* SetProcessInformationFn)(HANDLE, int, LPVOID, DWORD);
+    auto spi = reinterpret_cast<SetProcessInformationFn>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessInformation"));
+    BOOL ok = FALSE;
+    DWORD err = 0;
+    if (spi) {
+        PowerThrottlingState ps = { 1, 0x1 | 0x4, 0 };   // version 1; EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION; both off
+        ok = spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &ps, sizeof(ps));
+        if (!ok) err = GetLastError();
+    }
+    if (HMODULE winmm = LoadLibraryA("winmm.dll"))
+        g_timeBeginPeriod = reinterpret_cast<TimeBeginPeriodFn>(GetProcAddress(winmm, "timeBeginPeriod"));
+    UINT r = g_timeBeginPeriod ? g_timeBeginPeriod(1) : 0xFFFFFFFFu;
+    Log("timer: Sleep(1) took %.2f ms at start-up | power throttling opt-out %s (error %lu) | timeBeginPeriod(1) %s | Sleep(1) now %.2f ms",
+        before, !spi ? "unavailable" : ok ? "ok" : "failed", static_cast<unsigned long>(err), r == 0 ? "ok" : "failed", SleepProbeMs());
+}
+
+static DWORD WINAPI FtSleepProbe(void*) {
+    int reasked = 0;
+    for (;;) {
+        float ms = SleepProbeMs();
+        InterlockedExchange(&g_ftSleepUs, static_cast<LONG>(ms * 1000.0f));
+        if (ms > 4.0f && g_cfg.fixTimerResolution && g_timeBeginPeriod && reasked < 5) {   // coarse again: ask again (a few times)
+            ++reasked;
+            g_timeBeginPeriod(1);
+            Log("timer: Sleep(1) took %.2f ms - asked Windows for 1 ms again (%d)", ms, reasked);
+        }
+        Sleep(5000);
+    }
+}
+// Game thread, once a frame: t0 = hook entry, t1 = after the engine's own tick, t2 = after CorvoBody's work.
+static void FrameTimingTick(LONGLONG t0, LONGLONG t1, LONGLONG t2, float delta) {
+    static bool probeStarted = false;
+    if (!probeStarted && (g_cfg.frameTimingLog || g_cfg.fixTimerResolution)) {
+        probeStarted = true;
+        HANDLE h = CreateThread(nullptr, 0, FtSleepProbe, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
+    if (!g_cfg.frameTimingLog) return;
+    static LONGLONG last = 0, since = 0;
+    static FtStats game = {}, dstat = {};
+    static double engSum = 0.0, engMax = 0.0, modSum = 0.0, modMax = 0.0, deltaSum = 0.0;
+    static int ticks = 0;
+    if (last) FtAdd(game, FtMs(t0 - last));
+    last = t0;
+    double eng = FtMs(t1 - t0), mod = FtMs(t2 - t1);
+    engSum += eng; if (eng > engMax) engMax = eng;
+    modSum += mod; if (mod > modMax) modMax = mod;
+    deltaSum += delta * 1000.0;
+    FtAdd(dstat, delta * 1000.0);
+    ++ticks;
+    if (!since) since = t0;
+    double spanMs = FtMs(t0 - since);
+    if (spanMs < 5000.0 || !game.n) return;
+    double span = spanMs / 1000.0;
+    since = t0;
+    FtStats pres[2]; double in[2], inMax[2], hdMs, hdMax; int hdN;
+    FtLock();
+    for (int k = 0; k < 2; ++k) { pres[k] = g_ftPresent[k]; in[k] = g_ftPresentIn[k]; inMax[k] = g_ftPresentInMax[k]; g_ftPresent[k] = FtStats{}; g_ftPresentIn[k] = g_ftPresentInMax[k] = 0.0; }
+    hdMs = g_ftHdMs; hdMax = g_ftHdMaxMs; hdN = g_ftHdN; g_ftHdMs = g_ftHdMaxMs = 0.0; g_ftHdN = 0;
+    FtUnlock();
+    char a[256], b[256];
+    FtFormat(game, span, a, sizeof(a));
+    Log("frame timing: game frames %s | engine tick %.2f ms (max %.2f), its delta %.2f ms | CorvoBody %.3f ms a frame (max %.2f)",
+        a, engSum / ticks, engMax, deltaSum / ticks, modSum / ticks, modMax);
+    FtFormat(dstat, span, b, sizeof(b));
+    Log("frame timing: engine delta %s", b);
+    for (int k = 0; k < 2; ++k) {
+        if (!pres[k].n) continue;
+        FtFormat(pres[k], span, b, sizeof(b));
+        Log("frame timing: %s Present %s | inside Present %.2f ms (max %.2f)", k ? "swap chain" : "device", b,
+            in[k] / pres[k].n, inMax[k]);
+    }
+    // window and display
+    HWND w = g_ftWnd;
+    LONG style = w ? GetWindowLongA(w, GWL_STYLE) : 0;
+    RECT wr = {}; if (w) GetWindowRect(w, &wr);
+    DWORD hz = 0; RECT mr = {};
+    if (w) {
+        HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXA mi = {}; mi.cbSize = sizeof(mi);
+        if (mon && GetMonitorInfoA(mon, &mi)) {
+            mr = mi.rcMonitor;
+            DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)) hz = dm.dmDisplayFrequency;
+        }
+    }
+    bool covers = w && wr.left <= mr.left && wr.top <= mr.top && wr.right >= mr.right && wr.bottom >= mr.bottom;
+    ULONG tMin = 0, tMax = 0, tCur = 0;   // 100 ns units ('Min' is the coarsest)
+    typedef LONG (NTAPI* QtrFn)(PULONG, PULONG, PULONG);
+    static QtrFn qtr = reinterpret_cast<QtrFn>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryTimerResolution"));
+    if (qtr) qtr(&tMin, &tMax, &tCur);
+    Log("frame timing: device windowed %ld, present interval 0x%lx, refresh %ld, back buffer %ldx%ld, swap effect %ld | window %s%s%s, %ldx%ld%s, monitor %lu Hz | Sleep(1) takes %.2f ms, timer now %.2f ms (finest %.2f) | HD texture checks %d, %.1f ms in 5 s (max %.2f)",
+        g_ftPpWindowed, g_ftPpInterval, g_ftPpRefresh, g_ftPpW, g_ftPpH, g_ftPpSwap,
+        !w ? "?" : (style & WS_POPUP) ? "popup" : "normal", (style & WS_CAPTION) == WS_CAPTION ? " with title bar" : "", (style & WS_THICKFRAME) ? " sizable" : "",
+        static_cast<long>(wr.right - wr.left), static_cast<long>(wr.bottom - wr.top), covers ? " covering the monitor" : "",
+        static_cast<unsigned long>(hz), g_ftSleepUs / 1000.0, tCur / 10000.0, tMax / 10000.0, hdN, hdMs, hdMax);
+    game = FtStats{}; dstat = FtStats{}; engSum = engMax = modSum = modMax = deltaSum = 0.0; ticks = 0;
+}
+
 static void CaptureHookGameDevice(IDirect3DDevice9* dev);
 static HRESULT __stdcall HookedSetTexture(IDirect3DDevice9* self, DWORD stage, IDirect3DBaseTexture9* tex) {
     InterlockedIncrement(&g_hdSetTextureCalls);
     {
         static volatile LONG checked = 0;
-        if (g_cfg.selfTestCapture && self && InterlockedExchange(&checked, 1) == 0) CaptureHookGameDevice(self);
+        if ((g_cfg.selfTestCapture || g_cfg.frameTimingLog) && self && InterlockedExchange(&checked, 1) == 0) CaptureHookGameDevice(self);
     }
     if (tex) {
         static LONG myGen = 0;
@@ -9482,54 +9784,73 @@ static HRESULT __stdcall HookedSetTexture(IDirect3DDevice9* self, DWORD stage, I
             for (int i = 0; i < kHdTexCount; ++i) g_hdTex[i].orig = nullptr;
         }
         uintptr_t key = reinterpret_cast<uintptr_t>(tex) >> 4;
-        int slot = -2;   // -2 unknown
-        int at = -1;
+        int found = -1, at = -1;
         for (int probe = 0; probe < 8; ++probe) {
             int k = static_cast<int>((key + probe) & (kHdClassSize - 1));
-            if (g_hdClass[k].ptr == tex) { slot = g_hdClass[k].slot; break; }
+            if (g_hdClass[k].ptr == tex) { found = k; break; }
             if (!g_hdClass[k].ptr) { at = k; break; }
         }
-        int tableAt = -1;
-        if (slot == -2) {
-            float mae;
-            slot = HdClassify(tex, mae);
-            InterlockedIncrement(&g_hdClassified);
-            // (11:20: a transient lock failure must not classify the texture as 'not ours' for 5 s - the body flickered
-            // to its original map at a slide end; -2 leaves the table empty so the next bind retries)
-            if (slot == -2) { slot = -1; at = -1; }
-            else if (at >= 0) { g_hdClass[at].ptr = tex; g_hdClass[at].slot = slot; tableAt = at; }
-            if (slot >= 0) {
-                HdTexSlot& s = g_hdTex[slot];
-                D3DSURFACE_DESC d = {};
-                auto* t = static_cast<IDirect3DTexture9*>(tex);
-                t->GetLevelDesc(0, &d);
-                s.orig = tex; s.mae = mae; s.origW = d.Width; s.origH = d.Height; s.origLevels = t->GetLevelCount(); s.lastVerify = GetTickCount();
-            }
-        } else if (slot >= 0) {
-            // Still the same texture? A freed texture's address is reused at once on a loading screen (07:35: the loading
-            // text went lavender - the body normal map on the font). Shape every time, the picture every 250 ms.
-            HdTexSlot& s = g_hdTex[slot];
+        int slot = -1;
+        bool classify = found < 0;
+        DWORD now = GetTickCount();
+        if (found >= 0 && g_hdClass[found].slot >= 0) {
+            // Still the same texture? A freed texture's address is reused at once on a loading screen (07:35: the loading text
+            // went lavender - the body normal map on the font). Its OWN shape every bind, its picture every 250 ms. (2026-10-13:
+            // the shape used to be the SLOT's - whichever copy was matched last - so two copies in one slot, e.g. a whaler's and
+            // the player's, evicted each other on every re-check: the flicker 'depending on the angle'.)
+            HdClass& e = g_hdClass[found];
             auto* t = static_cast<IDirect3DTexture9*>(tex);
             D3DSURFACE_DESC d = {};
-            bool same = tex->GetType() == D3DRTYPE_TEXTURE && t->GetLevelCount() == s.origLevels && SUCCEEDED(t->GetLevelDesc(0, &d)) &&
-                        d.Width == s.origW && d.Height == s.origH && d.Format == D3DFMT_DXT1;
-            DWORD now = GetTickCount();
-            if (same && now - s.lastVerify > 250) {
+            bool same = tex->GetType() == D3DRTYPE_TEXTURE && t->GetLevelCount() == e.levels && SUCCEEDED(t->GetLevelDesc(0, &d)) &&
+                        d.Width == e.w && d.Format == D3DFMT_DXT1;
+            if (!same) classify = true;                    // another texture at this address: look at it now
+            else if (now - e.lastVerify > 250) {
                 float mae;
-                int r = HdClassify(tex, mae, slot);
-                if (r != -2) { same = r == slot; s.lastVerify = now; if (same) s.mae = mae; }   // (-2: couldn't read it now - keep, retry)
+                int r = HdClassify(tex, mae, e.slot);
+                if (r == e.slot) e.lastVerify = now;
+                else if (r != -2) classify = true;          // (-2: couldn't read it now - keep, retry)
             }
-            if (!same) {
-                for (int probe = 0; probe < 8; ++probe) {   // forget it in the table
-                    int k = static_cast<int>((key + probe) & (kHdClassSize - 1));
-                    if (g_hdClass[k].ptr == tex) { g_hdClass[k].slot = -1; break; }
-                }
+            if (!classify) slot = e.slot;
+            else {
+                HdTexSlot& s = g_hdTex[e.slot];
                 if (s.orig == tex) s.orig = nullptr;
                 ++s.dropped;
-                slot = -1;
             }
         }
-        (void)tableAt;
+        if (classify) {
+            float mae;
+            uint64_t h32 = 0;
+            LONGLONG ftT0 = FtNow();
+            slot = HdClassify(tex, mae, -1, &h32);
+            if (g_cfg.frameTimingLog) {
+                double ms = FtMs(FtNow() - ftT0);
+                FtLock(); g_ftHdMs += ms; if (ms > g_ftHdMaxMs) g_ftHdMaxMs = ms; ++g_ftHdN; FtUnlock();
+            }
+            InterlockedIncrement(&g_hdClassified);
+            if (slot == -2) {
+                // (11:20: a transient lock failure must not classify the texture as 'not ours' for 5 s - the body flickered to its
+                // original map at a slide end): no entry, the next bind retries
+                if (found >= 0) g_hdClass[found].ptr = nullptr;
+                slot = -1;
+            } else {
+                int k = found >= 0 ? found : at;
+                auto* t = static_cast<IDirect3DTexture9*>(tex);
+                D3DSURFACE_DESC d = {};
+                if (tex->GetType() == D3DRTYPE_TEXTURE) t->GetLevelDesc(0, &d);
+                if (k >= 0) {
+                    g_hdClass[k].ptr = tex; g_hdClass[k].slot = slot; g_hdClass[k].w = d.Width;
+                    g_hdClass[k].levels = tex->GetType() == D3DRTYPE_TEXTURE ? t->GetLevelCount() : 0; g_hdClass[k].lastVerify = now;
+                }
+                if (slot >= 0) {
+                    HdTexSlot& s = g_hdTex[slot];
+                    s.orig = tex; s.mae = 0.0f; s.origW = d.Width; s.origH = d.Height; s.origLevels = t->GetLevelCount(); s.lastVerify = now;
+                } else if (g_cfg.hdNearMissLog && h32) {
+                    HdNearMiss(tex, h32);
+                }
+            }
+        } else if (found >= 0 && g_hdClass[found].slot < 0) {
+            slot = -1;   // known: not a body map (until the 5 s reset)
+        }
         if (slot >= 0) {
             HdTexSlot& s = g_hdTex[slot];
             if (!s.repl && !s.replTried && s.dds) {
@@ -9630,7 +9951,10 @@ static HRESULT __stdcall HookedDevPresent(IDirect3DDevice9* self, const RECT* a,
 static HRESULT __stdcall HookedDevPresent2(IDirect3DDevice9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e) {
     if (InterlockedExchange(&g_presentSeen, 1) == 0) Log("capture: the game presents through its own device's Present");
     if (InterlockedCompareExchange(&g_captureWant, 0, 1) == 1) CaptureFrame(self);
-    return g_origDevPresent2(self, a, b, c, e);
+    LONGLONG t0 = FtNow();
+    HRESULT hr = g_origDevPresent2(self, a, b, c, e);
+    FtPresent(0, self, t0, FtNow());
+    return hr;
 }
 
 static HRESULT __stdcall HookedScPresent(IDirect3DSwapChain9* self, const RECT* a, const RECT* b, HWND c, const RGNDATA* e, DWORD fl) {
@@ -9647,7 +9971,10 @@ static HRESULT __stdcall HookedScPresent2(IDirect3DSwapChain9* self, const RECT*
         IDirect3DDevice9* dev = nullptr;
         if (SUCCEEDED(self->GetDevice(&dev)) && dev) { CaptureFrame(dev); dev->Release(); }
     }
-    return g_origScPresent2(self, a, b, c, e, fl);
+    LONGLONG t0 = FtNow();
+    HRESULT hr = g_origScPresent2(self, a, b, c, e, fl);
+    FtPresent(1, nullptr, t0, FtNow());
+    return hr;
 }
 
 // Once, from inside SetTexture (render thread, the GAME's device as 'self'): if its Present / swap-chain Present are
@@ -9761,9 +10088,9 @@ static void HdTexProbe() {
         if (!s.haveSmall) continue;
         unsigned swaps = s.swaps, dropped = s.dropped;
         s.swaps = 0; s.dropped = 0;
-        if (s.orig || swaps || dropped || s.bestMae < 60.0f)
-            Log("hd textures: %s: game texture %p %ux%u x%lu (match error %.1f, best seen %.1f, corr %.2f) | swapped %u, dropped %u in 5 s | hd %s",
-                kHdTexNames[i], static_cast<void*>(s.orig), s.origW, s.origH, static_cast<unsigned long>(s.origLevels), s.mae, s.bestMae, s.corr,
+        if (s.orig || swaps || dropped)
+            Log("hd textures: %s: game texture %p %ux%u x%lu (exact match) | swapped %u, dropped %u in 5 s | hd %s",
+                kHdTexNames[i], static_cast<void*>(s.orig), s.origW, s.origH, static_cast<unsigned long>(s.origLevels),
                 swaps, dropped, s.repl ? "ready" : s.replTried ? "FAILED" : "loaded");
     }
     Log("hd textures: %ld SetTexture calls, %ld new textures classified, %ld compared in 5 s", calls, classified, compared);
@@ -9833,6 +10160,520 @@ static void DiagSlide(ADishonoredPlayerPawn* pawn) {
         g_skinArmShown[0] ? 1 : 0, g_skinArmShown[1] ? 1 : 0, g_onePHandOnScreen[0] ? 1 : 0, g_onePHandOnScreen[1] ? 1 : 0,
         b[5][0], b[5][1], b[5][2], b[6][0], b[6][1], b[6][2], g_torsoAmount, g_upperAmount, g_slideYawOffDeg,
         bh[0], bh[1], p1[0][0], p1[0][1], p1[0][2], p1[1][0], p1[1][1], p1[1][2], pawn->Mesh ? (pawn->Mesh->HiddenGame ? 1 : 0) : -1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Summoned NPC (3.1). Body Swap "Summoned NPC" (part 6, g_summonChar): who Summon Assassin brings - 0 the game's assassin,
+// 1 Corvo (DLC07_skm_Corvo_Body + DLC07_skm_Corvo_Mask), 2 Daud (skm_Daud_Body + skm_Daud_Head), 3 an Overseer hound ("Doggy!").
+// Corvo / Daud: per pawn, never through the shared tweaks (PostBeginPlay_Body would SetFaceFXAsset(skm_Daud_Head_FaceFX) - the
+// build-203 crash path). SetSkeletalMesh's reattach calls SetFaceFXAsset(comp+0x394) (0x756644), null on summons, so FaceFX is
+// never instanced; a pawn with one set is left alone.
+// ---------------------------------------------------------------------------------------------
+static bool g_summonReady = false;
+static UClass *g_clsNpcPawn = nullptr, *g_clsSummonComp = nullptr, *g_clsNpcTweaks = nullptr, *g_clsLimb = nullptr;
+static bool g_summonEverSwapped = false;   // this world (reset on a world change)
+static UObject* g_houndTweakForLook = nullptr;   // (mirror of the Doggy! tweak, declared before ApplySummonLook)
+static bool g_summonSpawnHooked = false;   // OnPawnSpawned hooked: every new summon is dressed at spawn, a live one never
+static int g_summonSwaps = 0, g_summonReverts = 0;
+
+static int SummonWant() { LONG v = g_summonChar; return (v == 1 || v == 2) ? static_cast<int>(v) : 0; }
+static bool IsUnreachable(UObject* o) { return o && (*reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(o) + 8) & kUnreachableFlag); }
+static int RefBones(USkeletalMesh* m) { return m ? reinterpret_cast<RawArray*>(&m->RefSkeleton)->Num : -1; }
+static bool SummonLogOk(int reason) { static int n[16] = {}; return reason >= 0 && reason < 16 && n[reason]++ < 6; }
+
+static bool SummonClasses() {
+    if (g_summonReady) return true;
+    g_clsNpcPawn = ADishonoredNPCPawn::StaticClass();
+    g_clsSummonComp = UDisDLC06ActivePowerComponent_SummonAssassin::StaticClass();
+    g_clsNpcTweaks = UDisTweaks_NPCPawn::StaticClass();
+    g_clsLimb = ADisMovableLimb::StaticClass();
+    g_summonReady = g_clsNpcPawn && g_clsSummonComp && g_clsNpcTweaks;
+    return g_summonReady;
+}
+
+static bool SummonMeshes(int want, USkeletalMesh*& body, USkeletalMesh*& head) {
+    body = head = nullptr;
+    if (g_loadState != LoadState::Loaded || !g_assetsWorld || g_assetsWorld != GetWorld()) return false;
+    if (g_daudLoadState == LoadState::Loading || g_ovsLoadState == LoadState::Loading || g_animLoadState == LoadState::Loading ||
+        g_houndLoadState == LoadState::Loading) return false;
+    if (want == 1) { body = g_bodyMesh; head = g_headMesh; }          // (DLC06 fallback source: no mask -> no swap)
+    else if (want == 2) { body = g_daudBodyMesh; head = g_daudHeadMesh; }
+    return body && head;
+}
+
+static int ClearOverrides(UMeshComponent* c) {
+    auto* m = reinterpret_cast<RawArray*>(&c->Materials);   // 0x1C4
+    int n = 0;
+    for (int i = 0; m->Data && i < m->Num && i < 16; ++i)
+        if (static_cast<UMaterialInterface**>(m->Data)[i]) { c->SetMaterial(i, nullptr); ++n; }
+    return n;
+}
+
+// What PostBeginPlay_Body applied ({default, custom} pairs; package MICs kept alive by the tweaks) - untouched by the swap.
+static int ReapplyOverrides(USkeletalMeshComponent* c, FDisMaterialsOverride& o) {
+    auto* reps = reinterpret_cast<RawArray*>(&o.m_MaterialReplacements);
+    USkeletalMesh* mesh = c->SkeletalMesh;
+    if (!mesh || !reps->Data || reps->Num <= 0 || reps->Num > 16) return 0;
+    auto* mm = reinterpret_cast<RawArray*>(&mesh->Materials);
+    int n = 0;
+    for (int r = 0; r < reps->Num; ++r) {
+        auto& rp = static_cast<FDisMaterialReplacement*>(reps->Data)[r];
+        if (!rp.m_pCustomMaterial) continue;
+        for (int k = 0; mm->Data && k < mm->Num && k < 16; ++k)
+            if (static_cast<UMaterialInterface**>(mm->Data)[k] == rp.m_pDefaultMaterial) { c->SetMaterial(k, rp.m_pCustomMaterial); ++n; }
+    }
+    return n;
+}
+
+// UDisSkelControl_FootPlacement caches its foot/toe bone indices once (InitializeFootProperties 0xA8C4A0, guarded by
+// m_bIsInitialized = bit 0x2 at +0x138, never cleared; InitAnimTree keeps the control objects). Clear the bit after a mesh
+// swap so the next update re-reads them from the new skeleton - what happens on first use anyway. (The 10:36 crash: indices
+// of Daud's 118-bone rig on the 85-bone assassin.) Anim tree: comp->Animations +0x1E0, UAnimTree::SkelControlLists +0x110
+// (FSkelControlListHead 0x10, ControlHead +8), USkelControlBase::NextControl +0xAC.
+static int ResetFootPlacement(USkeletalMeshComponent* body) {
+    static UClass* fpCls = UDisSkelControl_FootPlacement::StaticClass();
+    static UClass* treeCls = UAnimTree::StaticClass();
+    auto* tree = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(body) + 0x1E0);
+    if (!tree || !fpCls || !treeCls || !tree->IsA(treeCls)) return 0;
+    auto* lists = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(tree) + 0x110);
+    int n = 0;
+    for (int i = 0; lists->Data && i < lists->Num && i < 128; ++i) {
+        auto* c = *reinterpret_cast<UObject**>(static_cast<uint8_t*>(lists->Data) + i * 0x10 + 8);
+        for (int guard = 0; c && guard < 64; ++guard, c = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(c) + 0xAC)) {
+            if (!c->IsA(fpCls)) continue;
+            auto& flags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(c) + 0x138);
+            if (flags & 2u) { flags &= ~2u; ++n; }
+        }
+    }
+    return n;
+}
+
+static bool ApplySummonLook(APawn* raw, int want, const char* via) {
+    if (!want || !SummonClasses() || !raw || !raw->IsA(g_clsNpcPawn)) return false;   // forward swaps only (no live revert)
+    auto* p = static_cast<ADishonoredNPCPawn*>(raw);
+    if (p->bDeleteMe || p->bPendingDelete || IsUnreachable(p) || p->Physics == EPhysics::PHYS_RigidBody) return false;
+    USkeletalMeshComponent* body = p->Mesh;                 // 0x3DC
+    USkeletalMeshComponent* head = p->m_pHeadMesh;          // 0xCF0
+    if (!body || !head || !body->SkeletalMesh || !head->SkeletalMesh) return false;
+    if (head->ParentAnimComponent != body) { if (SummonLogOk(0)) Log("summoned NPC: %s not changed - head not slaved to the body", p->GetName().c_str()); return false; }
+    UDisTweaks_Pawn* tw = p->m_pPawnTweaks;                 // 0x748
+    if (!tw || !tw->IsA(g_clsNpcTweaks)) return false;
+    if (reinterpret_cast<UObject*>(tw) == g_houndTweakForLook) return false;   // never a summoned hound
+    auto* ntw = static_cast<UDisTweaks_NPCPawn*>(tw);
+    USkeletalMesh* gameBody = ntw->m_pSkeletalMesh;          // 0xC8
+    auto* heads = reinterpret_cast<RawArray*>(&ntw->m_RandomHeadMeshes);   // 0x244, FDisBodyMesh x 0x14
+    int sel = p->m_iRandomHeadMeshSel;                       // 0xA60
+    USkeletalMesh* gameHead = (heads->Data && sel >= 0 && sel < heads->Num) ? static_cast<FDisBodyMesh*>(heads->Data)[sel].m_pMesh : nullptr;
+    USkeletalMesh* cur = body->SkeletalMesh;
+    if (cur != gameBody || !gameHead || head->SkeletalMesh != gameHead) return false;   // only the game's own look is dressed
+    USkeletalMesh *wantBody = nullptr, *wantHead = nullptr;
+    if (!SummonMeshes(want, wantBody, wantHead)) {
+        if (SummonLogOk(1)) Log("summoned NPC (%s): %s stays the assassin - %s meshes not available (load %d, same world %d)", via,
+            p->GetName().c_str(), want == 1 ? "Corvo" : "Daud", static_cast<int>(g_loadState), g_assetsWorld == GetWorld() ? 1 : 0);
+        return false;
+    }
+    if (RefBones(wantBody) < RefBones(cur)) return false;   // never to a smaller skeleton (cached bone indices)
+    if (body->m_pFaceFXAsset || head->m_pFaceFXAsset) {     // 0x394: never touch a FaceFX pawn
+        if (SummonLogOk(2)) Log("summoned NPC (%s): %s not changed - FaceFX asset set (body %p, head %p)", via, p->GetName().c_str(),
+            static_cast<void*>(body->m_pFaceFXAsset), static_cast<void*>(head->m_pFaceFXAsset));
+        return false;
+    }
+    USkeletalMesh* fromHead = head->SkeletalMesh;
+    int bFrom = RefBones(cur), hFrom = RefBones(fromHead);
+    // Head first: SetSkeletalMesh waits for / unregisters the head's EdgeAnim job before the parent's SpaceBases are emptied;
+    // then the body; then the head's bone map (SetSkeletalMesh only rebuilds its own).
+    int clrH = ClearOverrides(head);
+    head->SetSkeletalMesh(wantHead, false);
+    int clrB = ClearOverrides(body);
+    body->SetSkeletalMesh(wantBody, false);
+    int feet = ResetFootPlacement(body);
+    head->UpdateParentBoneMap();
+    auto* sec = reinterpret_cast<RawArray*>(&p->m_SecondaryMeshes);   // 0xCF4
+    for (int i = 0; sec->Data && i < sec->Num && i < 16; ++i) {
+        auto* c = static_cast<USkeletalMeshComponent**>(sec->Data)[i];
+        if (c && c != head && c->ParentAnimComponent == body) c->UpdateParentBoneMap();
+    }
+    auto* backed = reinterpret_cast<RawArray*>(&p->m_BackedUpPhysicsBoneIndexes);   // APawn 0x47C (as SwitchToEatenMesh 0xB58B20)
+    if (backed->Num > 0) backed->Num = 0;
+    for (UStaticMeshComponent* a : p->m_AccessoryComponents) if (a) a->SetHidden(true);   // 0xA84 (null for summons)
+    ++g_summonSwaps;
+    g_summonEverSwapped = true;
+    int total = g_summonSwaps;
+    if (total <= 12 || total % 25 == 0)
+        Log("summoned NPC (%s): %s %s/%s (%d/%d bones) -> %s/%s (%d/%d) | overrides cleared %d+%d | foot placement re-init %d | head bone map %d | #%d",
+            via, p->GetName().c_str(), cur->GetName().c_str(), fromHead->GetName().c_str(), bFrom, hFrom, wantBody->GetName().c_str(),
+            wantHead->GetName().c_str(), RefBones(wantBody), RefBones(wantHead), clrB, clrH, feet,
+            reinterpret_cast<RawArray*>(&head->ParentBoneMap)->Num, total);
+    return true;
+}
+
+// The player's summon components: the ones in the power list, plus Body Swap's Daud one if Powers went back to Corvo
+// (its summons live on).
+static int SummonComponents(ADishonoredPlayerPawn* pawn, UObject** comps, int cap) {
+    int n = 0;
+    if (!pawn || !SummonClasses()) return 0;
+    auto* ap = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);   // 0x788
+    for (int i = 0; ap->Data && i < ap->Num && i < 32 && n < cap; ++i) {
+        UObject* c = static_cast<UObject**>(ap->Data)[i];
+        if (c && c->IsA(g_clsSummonComp)) comps[n++] = c;
+    }
+    for (auto& sw : g_powerSwaps) if (n < cap && !strcmp(sw.daudName, "SummonAssassin") && sw.daud && sw.daud->IsA(g_clsSummonComp)) {
+        bool dup = false;
+        for (int k = 0; k < n; ++k) dup |= comps[k] == sw.daud;
+        if (!dup) comps[n++] = sw.daud;
+    }
+    return n;
+}
+
+// Per frame (OnPlayerTick): ONLY a fallback for when the OnPawnSpawned hook could not be installed - forward swaps of summons
+// still arriving. A summon that is already out keeps the look it came with; a changed option applies to the next summons.
+// (2026-10-13 10:36 crash: switching the option re-skinned a live Daud summon back to the assassin, 118 -> 85 bones, and
+// 1.4 s later UDisSkelControl_FootPlacement::UpdateFootOrientation (0xA93870) indexed the bone array with an index cached for
+// the old skeleton - assert Array.h:596. Dressing at spawn happens before the pawn's first animation tick.)
+static void UpdateSummonedLook(ADishonoredPlayerPawn* pawn) {
+    if (g_summonSpawnHooked || !SummonClasses()) return;
+    int want = SummonWant();
+    if (!want || !pawn) return;
+    UObject* comps[8];
+    int n = SummonComponents(pawn, comps, 8);
+    int budget = 8;
+    for (int k = 0; k < n && budget > 0; ++k) {
+        auto* list = reinterpret_cast<RawArray*>(&static_cast<UDisDLC06ActivePowerComponent_SummonAssassin*>(comps[k])->m_ActiveAssassins);  // 0xF0
+        if (!list->Data || list->Num <= 0 || list->Num > 1024) continue;
+        for (int i = 0; i < list->Num && budget > 0; ++i) {
+            auto& e = static_cast<FDisDLC06SpawnedAssassinInfo*>(list->Data)[i];
+            if (!e.m_pAssassin || static_cast<int>(e.m_AssassinState) != 0) continue;   // still arriving only
+            if (ApplySummonLook(e.m_pAssassin, want, "scan")) --budget;
+        }
+    }
+}
+
+// ---- Doggy! (g_summonChar 3): an Overseer hound instead of an assassin ----
+// The hound is a plain ADishonoredNPCPawn made from Twk_Pawn_WolfHound.Pwn_WolfHound_0 (in memory: FName Pwn_WolfHound, number 1;
+// NOT Pwn_WolfHound_Base - fallback-only, no brain, which the spawner refuses). Smallest self-contained package with it:
+// L_Ovrsr_Kennel_Script (8.6 MB, base game; every import is in always-loaded packages). Hound levels already have it.
+// The tweak in use is always rooted and checked against its GObjects slot before use; it is let go on every level change.
+static UObject* g_houndTweak = nullptr;
+static int32_t g_houndIndex = -1;                   // its GObjects index
+static void* g_houndWorld = nullptr;                // the world it was taken in
+static bool g_houndOurs = false;                    // from OUR kennel load (else the level's own: its hounds save normally)
+static DWORD g_houndLoadStartTick = 0, g_houndLastScan = 0;
+static const wchar_t* kHoundPackage = L"L_Ovrsr_Kennel_Script";
+static int g_houndHooks = 0;                        // 4 = spawn slot + tweak pick + cast + level save all hooked (else no Doggy!)
+struct HoundRec { APawn* pawn; int32_t index; };
+static HoundRec g_hounds[64];                       // the hounds WE summoned in this world (pointer + GObjects index)
+static int g_houndCount = 0;
+static bool g_castHound = false, g_inCast = false;  // the cast decides once; the tweak pick inside it follows
+struct Vec3 { float x, y, z; };                     // (POD: passed by value on the stack, as the engine's FVector)
+static void* g_castSpawner = nullptr;               // the spawner we last moved / its home and own faction
+static int32_t g_castSpawnerIndex = -1;
+static Vec3 g_spawnerHome = { 0, 0, 0 };
+static UObject* g_spawnerFaction = nullptr;
+static bool g_spawnerChanged = false;
+
+static bool InGObjects(UObject* o, int32_t index) {
+    auto* objects = UObject::GObjObjects();
+    return o && index >= 0 && index < objects->size() && objects->at(index) == o;
+}
+static bool ObjAlive(UObject* o, int32_t index) { return InGObjects(o, index) && !IsUnreachable(o); }
+
+static UObject* FindHoundTweak() {
+    FName n("Pwn_WolfHound");
+    if (n.FNameEntryId < 0 || !SummonClasses()) return nullptr;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || o->Name.FNameEntryId != n.FNameEntryId || o->Name.InstanceNumber != 1 || !o->IsA(g_clsNpcTweaks)) continue;
+        if (!o->Outer || o->Outer->GetName() != "Twk_Pawn_WolfHound" || IsUnreachable(o)) continue;
+        return o;
+    }
+    return nullptr;
+}
+
+static void HoldHound(UObject* t, bool ours, const char* how) {
+    Protect(t);
+    g_houndTweak = t; g_houndTweakForLook = t;
+    g_houndIndex = t->ObjectInternalInteger;
+    g_houndWorld = GetWorld();
+    g_houndOurs = ours;
+    g_houndLoadState = LoadState::Loaded;
+    Log("Doggy!: %s - %s", how, t->GetFullName().c_str());
+}
+
+static void __cdecl OnHoundPackageLoaded(UObject* package, void*) {
+    UObject* t = package ? FindHoundTweak() : nullptr;
+    if (t) HoldHound(t, true, "kennel package loaded");
+    else {
+        g_houndLoadState = LoadState::Failed;
+        Log("Doggy!: %s load %s - hound tweak NOT FOUND", Narrow(kHoundPackage).c_str(), package ? "finished" : "FAILED");
+    }
+}
+
+static void ForgetHound() {
+    if (g_houndTweak && InGObjects(g_houndTweak, g_houndIndex)) LetGo(g_houndTweak);
+    g_houndTweak = nullptr; g_houndTweakForLook = nullptr;
+    g_houndIndex = -1;
+    g_houndWorld = nullptr;
+    g_houndOurs = false;
+    g_houndCount = 0;
+    g_castSpawner = nullptr; g_castSpawnerIndex = -1; g_spawnerChanged = false;
+    if (g_houndLoadState != LoadState::Loading) g_houndLoadState = LoadState::Idle;
+}
+
+static bool HoundTweakOk() { return g_houndTweak && ObjAlive(g_houndTweak, g_houndIndex) && g_houndWorld == GetWorld(); }
+static bool HoundMode() { return g_summonChar == 3 && g_houndHooks == 4 && HoundTweakOk(); }
+
+static bool IsOurHound(APawn* p) {
+    for (int i = 0; i < g_houndCount; ++i) if (g_hounds[i].pawn == p) return InGObjects(p, g_hounds[i].index);
+    return false;
+}
+
+// Per frame: make sure the hound tweak is there when Doggy! is chosen and a summon power exists. Cheap checks first, at most one
+// scan a second; one package load at a time, only once our body has been in use 3 s (the rule all our loads follow, tests 12-15).
+static void UpdateHound(ADishonoredPlayerPawn* pawn) {
+    if (g_houndTweak) {
+        if (HoundTweakOk()) Protect(g_houndTweak);
+        else { Log("Doggy!: the hound tweak went away - forgetting it"); ForgetHound(); }
+    }
+    if (g_summonChar != 3 || g_houndHooks != 4 || g_houndTweak || !pawn) return;
+    if (g_houndLoadState == LoadState::Loading) {
+        if (GetTickCount() - g_houndLoadStartTick > 45000) { Log("Doggy!: hound package load timed out"); g_houndLoadState = LoadState::Failed; }
+        return;
+    }
+    if (g_houndLoadState != LoadState::Idle) return;   // (failed: not again until the next level)
+    if (g_loadState == LoadState::Loading || g_animLoadState == LoadState::Loading || g_daudLoadState == LoadState::Loading ||
+        g_ovsLoadState == LoadState::Loading || !RawLoadPackageAsync || !g_body || !g_bodyAnimated || GetTickCount() - g_bodyBuiltTick < 3000) return;
+    DWORD now = GetTickCount();
+    if (now - g_houndLastScan < 1000) return;
+    g_houndLastScan = now;
+    UObject* comps[8];
+    if (!SummonComponents(pawn, comps, 8)) return;
+    if (UObject* t = FindHoundTweak()) { HoldHound(t, false, "this level has hounds - using its own"); return; }
+    Log("Doggy!: async loading %s for the hound", Narrow(kHoundPackage).c_str());
+    g_houndLoadState = LoadState::Loading;
+    g_houndLoadStartTick = now;
+    FString name(kHoundPackage);
+    LoadPackageAsync(name, &OnHoundPackageLoaded, nullptr, nullptr);
+}
+
+// GetAssassinTweaks @0xCF4580 (thiscall(component) -> the NPC tweak to spawn; MapInfo override, else the power level's).
+using PickSummonTweak_t = UObject*(__fastcall*)(void* comp, void* edx);
+static PickSummonTweak_t g_origPickSummonTweak = nullptr;
+static UObject* __fastcall HookedPickSummonTweak(void* comp, void* edx) {
+    bool hound = g_inCast ? g_castHound : HoundMode();
+    if (hound && HoundTweakOk()) return g_houndTweak;
+    return g_origPickSummonTweak(comp, edx);
+}
+
+// The cast @0xCFA1E0 (thiscall(component)): queues the spawn on the component's spawner (+0x98), which DoSpawnNow places at
+// the SPAWNER's location - (0,0,100000) for assassins, who then teleport in with their spell. A hound has no spell: move the
+// spawner to m_TeleportGroundLocation (+0xDC) first, and give it the player's faction (spawner m_pFactionTweakOverride +0x454
+// <- player m_pCurFactionTweak +0x50C; DoInit copies it into the pawn) - the hound's own faction is allied with Overseers and
+// guards. For assassins both go back to what they were.
+using SetLocation_t = int(__fastcall*)(void* actor, void* edx, Vec3 loc);   // AActor::SetLocation @0x6CC4D0 (ret 0xC)
+using SummonCast_t = int(__fastcall*)(void* comp, void* edx);
+static SummonCast_t g_origSummonCast = nullptr;
+
+static void RestoreSpawner(void* spawner) {
+    auto* sp = static_cast<uint8_t*>(spawner);
+    *reinterpret_cast<UObject**>(sp + 0x454) = g_spawnerFaction;
+    int ok = reinterpret_cast<SetLocation_t>(0x006CC4D0)(spawner, nullptr, g_spawnerHome);
+    Vec3& at = *reinterpret_cast<Vec3*>(sp + 0xC4);
+    if (!ok || fabsf(at.x - g_spawnerHome.x) + fabsf(at.y - g_spawnerHome.y) + fabsf(at.z - g_spawnerHome.z) >= 1.0f) at = g_spawnerHome;
+    g_spawnerChanged = false;
+}
+
+static int __fastcall HookedSummonCast(void* comp, void* edx) {
+    auto* c = static_cast<uint8_t*>(comp);
+    void* spawner = *reinterpret_cast<void**>(c + 0x98);
+    if (spawner && spawner != g_castSpawner) {   // another spawner: put the old one back first, then remember the new one's own state
+        if (g_spawnerChanged && g_castSpawner && ObjAlive(static_cast<UObject*>(g_castSpawner), g_castSpawnerIndex)) RestoreSpawner(g_castSpawner);
+        g_castSpawner = spawner;
+        g_castSpawnerIndex = static_cast<UObject*>(spawner)->ObjectInternalInteger;
+        g_spawnerHome = *reinterpret_cast<Vec3*>(static_cast<uint8_t*>(spawner) + 0xC4);
+        g_spawnerFaction = *reinterpret_cast<UObject**>(static_cast<uint8_t*>(spawner) + 0x454);
+        g_spawnerChanged = false;
+    }
+    bool hound = spawner && HoundMode();
+    if (hound) {
+        Vec3 dest = *reinterpret_cast<Vec3*>(c + 0xDC);   // m_TeleportGroundLocation
+        auto* owner = *reinterpret_cast<uint8_t**>(c + 0x80);   // m_pOwnerPlayerPawn
+        UObject* faction = owner ? *reinterpret_cast<UObject**>(owner + 0x50C) : nullptr;
+        if (faction) *reinterpret_cast<UObject**>(static_cast<uint8_t*>(spawner) + 0x454) = faction;
+        int ok = reinterpret_cast<SetLocation_t>(0x006CC4D0)(spawner, nullptr, dest);
+        Vec3& at = *reinterpret_cast<Vec3*>(static_cast<uint8_t*>(spawner) + 0xC4);
+        bool moved = fabsf(at.x - dest.x) + fabsf(at.y - dest.y) + fabsf(at.z - dest.z) < 1.0f;
+        if (!moved) at = dest;   // SetLocation refused (the spawner is not in the collision hash): it is only a spawn point
+        g_spawnerChanged = true;
+        static int logged = 0;
+        if (logged++ < 20) {
+            auto* target = *reinterpret_cast<UObject**>(c + 0xB4);
+            Log("Doggy!: cast - spawner %p to (%.0f %.0f %.0f) (%s), faction %s, target %s", spawner, dest.x, dest.y, dest.z,
+                ok && moved ? "SetLocation" : "written", faction ? faction->GetName().c_str() : "none",
+                target ? target->GetName().c_str() : "none");
+        }
+    } else if (spawner && g_spawnerChanged && spawner == g_castSpawner) {
+        RestoreSpawner(spawner);
+        Log("summoned NPC: assassins again - spawner back to (%.0f %.0f %.0f), its own faction", g_spawnerHome.x, g_spawnerHome.y, g_spawnerHome.z);
+    }
+    g_castHound = hound;
+    g_inCast = true;
+    int r = g_origSummonCast(comp, edx);
+    g_inCast = false;
+    return r;
+}
+
+// IDisSpawnRequesterInterface::OnPawnSpawned of the summon component: vtable 0x11CD20C slot 3 (0x11CD218 = 0xD017F0), called
+// from ADishonoredSpawner::DoSpawnNow (0xA5EB65) after the pawn's PostBeginPlay - where the game sets meshes itself.
+using SummonSpawned_t = void(__fastcall*)(void* iface, void* edx, APawn* pawn);
+static SummonSpawned_t g_origSummonSpawned = nullptr;
+static void __fastcall HookedSummonSpawned(void* iface, void* edx, APawn* pawn) {
+    g_origSummonSpawned(iface, edx, pawn);
+    if (!pawn) return;
+    auto* dp = static_cast<ADishonoredPawn*>(pawn);
+    if (g_houndTweak && reinterpret_cast<UObject*>(dp->m_pPawnTweaks) == g_houndTweak) {   // one of our hounds: remember it
+        int k = 0;
+        for (int i = 0; i < g_houndCount; ++i) if (InGObjects(g_hounds[i].pawn, g_hounds[i].index)) g_hounds[k++] = g_hounds[i];
+        g_houndCount = k;
+        if (g_houndCount < 64) g_hounds[g_houndCount++] = { pawn, pawn->ObjectInternalInteger };
+        static int logged = 0;
+        if (logged++ < 20) {
+            UObject* f = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(pawn) + 0x50C);
+            Log("Doggy!: hound %s spawned at (%.0f %.0f %.0f), faction %s, %d tracked", pawn->GetName().c_str(), pawn->Location.X,
+                pawn->Location.Y, pawn->Location.Z, f ? f->GetName().c_str() : "none", g_houndCount);
+        }
+        return;
+    }
+    int want = SummonWant();
+    if (want) ApplySummonLook(pawn, want, "spawn");
+}
+
+static void HookSummonSpawn() {
+    void** slot = reinterpret_cast<void**>(0x011CD218);
+    static const uint8_t pro[] = { 0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0, 0x83, 0xC4, 0x04, 0x55 };
+    if (*slot != reinterpret_cast<void*>(0x00D017F0) || memcmp(reinterpret_cast<void*>(0x00D017F0), pro, sizeof(pro)) != 0) {
+        Log("WARNING: summon OnPawnSpawned slot holds %p - summoned NPC look by the per-frame scan only, no Doggy!", *slot);
+    } else {
+        g_origSummonSpawned = reinterpret_cast<SummonSpawned_t>(0x00D017F0);
+        DWORD old;
+        if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+            *slot = reinterpret_cast<void*>(&HookedSummonSpawned);
+            VirtualProtect(slot, sizeof(void*), old, &old);
+            ++g_houndHooks;
+            g_summonSpawnHooked = true;
+            Log("Summoned NPC: OnPawnSpawned hooked (vtable slot 0x11CD218, was 0xD017F0)");
+        }
+    }
+    struct { uintptr_t at; const uint8_t* pro; size_t len; void* hook; void** orig; const char* what; } hooks[] = {
+        { 0x00CF4580, reinterpret_cast<const uint8_t*>("\x53\x8B\xD9\x8B\x43\x54"), 6, reinterpret_cast<void*>(&HookedPickSummonTweak),
+          reinterpret_cast<void**>(&g_origPickSummonTweak), "GetAssassinTweaks" },
+        { 0x00CFA1E0, reinterpret_cast<const uint8_t*>("\x55\x8B\xEC\x83\xEC\x78"), 6, reinterpret_cast<void*>(&HookedSummonCast),
+          reinterpret_cast<void**>(&g_origSummonCast), "the summon cast" },
+    };
+    for (auto& h : hooks) {
+        if (memcmp(reinterpret_cast<void*>(h.at), h.pro, h.len) == 0 &&
+            MH_CreateHook(reinterpret_cast<void*>(h.at), h.hook, h.orig) == MH_OK && MH_EnableHook(reinterpret_cast<void*>(h.at)) == MH_OK)
+            { ++g_houndHooks; Log("Doggy!: %s hooked", h.what); }
+        else Log("WARNING: Doggy!: could not hook %s - no hounds", h.what);
+    }
+}
+
+// Before any level is saved (FGameState save-level @0xA15E30, thiscall(this, ULevel*, int), ret 8 - the only way into a level
+// save: quicksave, autosave, checkpoints, map changes): no hound of ours may be in the save - its records name kennel objects
+// (the tweak, its brain, its mesh) that a load elsewhere can't resolve (the 13 Oct NULL-entry assert). Summoned hounds still out
+// vanish the power's own way (0xCFB2C0: drop the entry + destroy); hounds WE summoned that died (corpses), their AI controllers
+// and severed limbs with the kennel mesh are destroyed when the tweak is from our kennel load. A hound the player is possessing
+// is never touched (DisIsPossessed 0xB712B0). A hound level's own hounds (not ours) are left alone - its package has them.
+using SaveLevel_t = int(__fastcall*)(void* gameState, void* edx, void* level, int loc);
+static SaveLevel_t g_origSaveLevel = nullptr;
+using VanishSummon_t = void(__fastcall*)(void* comp, void* edx, int index);
+using DestroyActor_t = int(__fastcall*)(void* world, void* edx, void* actor, int bNetForce, int bShouldModifyLevel);
+using IsPossessed_t = int(__fastcall*)(void* pawn, void* edx);
+static int __fastcall HookedSaveLevel(void* gameState, void* edx, void* level, int loc) {
+    if (g_houndTweak && g_houndCount > 0) {
+        int vanished = 0, destroyed = 0, possessed = 0, controllers = 0, limbs = 0;
+        void* world = *reinterpret_cast<void**>(addr::GWorld);
+        static UClass* pcCls = APlayerController::StaticClass();
+        auto isPossessed = [](APawn* p) { return reinterpret_cast<IsPossessed_t>(0x00B712B0)(p, nullptr) != 0; };
+        auto dropController = [&](APawn* p) {   // its AI controller (+0x26C) after the pawn, if it is still there
+            AController* ctl = p->Controller;
+            if (!ctl || !world || (pcCls && ctl->IsA(pcCls))) return static_cast<AController*>(nullptr);
+            return ctl;
+        };
+        auto killController = [&](AController* ctl, int32_t idx) {
+            if (ctl && InGObjects(ctl, idx) && !ctl->bDeleteMe && !ctl->bPendingDelete) {
+                reinterpret_cast<DestroyActor_t>(0x00652CF0)(world, nullptr, ctl, 0, 1);
+                ++controllers;
+            }
+        };
+        ADishonoredPlayerPawn* player = GetPlayerPawn();
+        UObject* comps[8];
+        int n = SummonComponents(player, comps, 8);
+        for (int k = 0; k < n; ++k) {
+            auto* list = reinterpret_cast<RawArray*>(&static_cast<UDisDLC06ActivePowerComponent_SummonAssassin*>(comps[k])->m_ActiveAssassins);
+            for (int i = (list->Data && list->Num > 0 && list->Num <= 1024) ? list->Num - 1 : -1; i >= 0; --i) {
+                APawn* p = static_cast<FDisDLC06SpawnedAssassinInfo*>(list->Data)[i].m_pAssassin;
+                if (!p || !IsOurHound(p)) continue;
+                if (isPossessed(p)) { ++possessed; continue; }
+                AController* ctl = dropController(p);
+                int32_t ci = ctl ? ctl->ObjectInternalInteger : -1;
+                reinterpret_cast<VanishSummon_t>(0x00CFB2C0)(comps[k], nullptr, i);
+                ++vanished;
+                if (g_houndOurs) killController(ctl, ci);
+            }
+        }
+        if (g_houndOurs && world) {
+            for (int i = 0; i < g_houndCount; ++i) {   // ours that died (corpses) or left the list
+                APawn* p = g_hounds[i].pawn;
+                if (!InGObjects(p, g_hounds[i].index) || p->bDeleteMe || p->bPendingDelete) continue;
+                if (isPossessed(p)) { ++possessed; continue; }
+                AController* ctl = dropController(p);
+                int32_t ci = ctl ? ctl->ObjectInternalInteger : -1;
+                reinterpret_cast<DestroyActor_t>(0x00652CF0)(world, nullptr, p, 0, 1);
+                ++destroyed;
+                killController(ctl, ci);
+            }
+            USkeletalMesh* houndMesh = HoundTweakOk() ? static_cast<UDisTweaks_Pawn*>(static_cast<UObject*>(g_houndTweak))->m_pSkeletalMesh : nullptr;
+            if (houndMesh && g_clsLimb) {   // severed hound limbs
+                auto* objects = UObject::GObjObjects();
+                for (int i = 0; i < objects->size(); ++i) {
+                    UObject* o = objects->at(i);
+                    if (!o || !o->IsA(g_clsLimb) || IsUnreachable(o)) continue;
+                    auto* a = static_cast<ADisMovableLimb*>(o);
+                    if (a->bDeleteMe || !a->SkeletalMeshComponent || a->SkeletalMeshComponent->SkeletalMesh != houndMesh) continue;
+                    reinterpret_cast<DestroyActor_t>(0x00652CF0)(world, nullptr, a, 0, 1);
+                    ++limbs;
+                }
+            }
+        }
+        int k = 0;
+        for (int i = 0; i < g_houndCount; ++i) {
+            APawn* p = g_hounds[i].pawn;
+            if (InGObjects(p, g_hounds[i].index) && !p->bDeleteMe && !p->bPendingDelete) g_hounds[k++] = g_hounds[i];
+        }
+        g_houndCount = k;
+        if (vanished || destroyed || possessed || limbs)
+            Log("Doggy!: before saving level %p (loc %d): %d hound(s) sent away, %d corpse(s) + %d controller(s) + %d limb(s) removed, %d possessed left alone",
+                level, loc, vanished, destroyed, controllers, limbs, possessed);
+    }
+    return g_origSaveLevel(gameState, edx, level, loc);
+}
+
+// Save diagnostic (from HookedPlayerGameSave): severed limbs wearing our meshes would write an L_DLC07_Endgame_Script reference.
+static void LogSummonLimbs() {
+    if (!g_summonEverSwapped || !g_clsLimb) return;
+    int limbs = 0, ours = 0;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->IsA(g_clsLimb) || IsUnreachable(o)) continue;
+        auto* a = static_cast<ADisMovableLimb*>(o);
+        if (a->bDeleteMe) continue;
+        ++limbs;
+        USkeletalMesh* m = a->SkeletalMeshComponent ? a->SkeletalMeshComponent->SkeletalMesh : nullptr;   // AKAsset 0x248
+        if (m && (m == g_bodyMesh || m == g_headMesh || m == g_daudBodyMesh || m == g_daudHeadMesh)) ++ours;
+    }
+    Log("save: %d severed limbs, %d wear Corvo/Daud meshes (summoned NPC look)", limbs, ours);
 }
 
 static void OnPlayerTick() {
@@ -9923,6 +10764,8 @@ static void OnPlayerTick() {
     RebuildBodyIfCharacterChanged(pawn);
     if (!g_body) CreateBody(pawn);
     ApplyArmsCharacter(pawn);
+    UpdateSummonedLook(pawn);
+    UpdateHound(pawn);
     WatchOwnedUpgrades(pawn);   // (per-bow upgrades: diagnostics + a purchase carried to the bow in hand)
     PointStoreAtBow(pawn);      // (Piero's crossbow entries follow the bow in the slot)
     ApplyArmsShift(pawn);
@@ -10267,10 +11110,17 @@ static void KeepManaFull(ADishonoredPlayerPawn* pawn) {
     if (max > 0 && mana[0] < max) mana[0] = max;
 }
 
+static void GameTickWork();
 static void __fastcall HookedGameEngineTick(void* self, void* /*edx*/, float delta) {
+    LONGLONG ftT0 = FtNow();
     g_origGameEngineTick(self, delta);
+    LONGLONG ftT1 = FtNow();
     if (g_inHook) return;
+    GameTickWork();
+    FrameTimingTick(ftT0, ftT1, FtNow(), delta);
+}
 
+static void GameTickWork() {
     DWORD now = GetTickCount();
 
     // A new world means every component we made is gone (or going). Forget them without touching them.
@@ -10302,6 +11152,8 @@ static void __fastcall HookedGameEngineTick(void* self, void* /*edx*/, float del
         g_headMesh = nullptr; g_daudBodyMesh = nullptr; g_daudHeadMesh = nullptr; ForgetArmsSwap();
         if (g_animLoadState != LoadState::Loading) g_animLoadState = LoadState::Idle;
         g_ghosted.clear(); g_ghostActive = false;   // that level's pawns are gone: nothing to put back
+        g_summonEverSwapped = false;
+        ForgetHound();   // (the tweak of OUR kennel load goes with the old level; a hound level brings its own)
     }
 
     RestoreNpcs(GetPlayerPawn(), false);   // NPCs block again 1.5 s after the last Blink aim
@@ -10337,6 +11189,7 @@ void* g_assetsWorld = nullptr;   // the world our rooted assets were grabbed in
 static void __cdecl HookedCollectGarbage(uint64_t keepFlags, uint32_t fullPurge) {
     if (fullPurge) {
         void* world = GetWorld();
+        if (g_houndTweak && (!world || world != g_houndWorld)) { Log("level is changing: letting go of the hound tweak"); ForgetHound(); }
         Log("full GC: world %p (assets from %p), mesh %p, anim set %p", world, g_assetsWorld, g_bodyMesh, g_animSet);
         if ((g_bodyMesh || g_animSet || g_ourArrayCount) && (!world || world != g_assetsWorld)) {
             Log("level is changing: releasing body assets before the purge");
@@ -10378,6 +11231,51 @@ static void __cdecl HookedCollectGarbage(uint64_t keepFlags, uint32_t fullPurge)
             g_bodyPawn = nullptr;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Save load with Daud's wristbow bolts in the world (2026-10-13 08:51 crash, DisAutoSave0).
+// DisSaveLoad::FGameState::LoadLevel(ULevel*) @0xA13DB0 (thiscall, ret 4) builds the level loader (0xA13070), which
+// rebuilds the save's object table record by record. A settings-object record is followed by the actor's 24-byte location
+// only if that object resolves; a NULL one is read as outer/name/number instead, so the bytes of the location are taken
+// for an object index and the table check asserts (Array.h:596 at 0xA137A3: index 0x1AFA = the low half of a bolt's X).
+// Body Swap's Daud wristbow (Crossbow = Daud) leaves bolts - in flight, stuck in walls and bodies, as pickups - whose
+// settings object DLC06_Pckp_Ammo.DLC06_Pckp_Ammo_Bolt_Single lives only in DLC packages; ours, DLC07_Twk_Player_Daud_SF,
+// loads ~3 s into the level - too late for the save. So before a level is restored: if a Daud choice is on (only then
+// can the save hold his bolts - and his package is loaded a few seconds later anyway), the bolt object isn't in memory and
+// none of our own async loads is running (two loads at once once tore a package's mesh data apart, tests 12-15), load his
+// package synchronously - UObject::LoadPackage @0x4A9F60 (cdecl: outer, file name, flags); the level loader itself loads
+// packages at this very point. The saved bolts then resolve and respawn, and the stream stays in step.
+using LoadLevel_t = void(__fastcall*)(void* gameState, void* edx, void* level);
+static LoadLevel_t g_origLoadLevel = nullptr;
+using LoadPackageSync_t = UObject*(__cdecl*)(UObject* outer, const wchar_t* fileName, uint32_t flags);
+
+static bool ObjectNamedInMemory(const char* name) {
+    FName n(name);   // (the SDK finds the name in the name table and caches it; -1 = no such name, so no such object)
+    if (n.FNameEntryId < 0) return false;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (o && o->Name.FNameEntryId == n.FNameEntryId) return true;
+    }
+    return false;
+}
+
+static void __fastcall HookedLoadLevel(void* gameState, void* edx, void* level) {
+    bool daud = g_bowChar == 1 || g_powerChar == 1 || g_bodyChar == 1 || g_armsChar == 1 || g_bladeChar == 1;
+    if (g_cfg.preloadDaudForSaves && daud && !ObjectNamedInMemory("DLC06_Pckp_Ammo_Bolt_Single")) {
+        if (g_daudLoadState == LoadState::Loading || g_ovsLoadState == LoadState::Loading ||
+            g_loadState == LoadState::Loading || g_animLoadState == LoadState::Loading) {
+            Log("save load: Daud's bolt objects aren't loaded, but one of our package loads is still running - not loading %s now",
+                Narrow(kDaudPackage).c_str());
+        } else {
+            DWORD t0 = GetTickCount();
+            UObject* pkg = reinterpret_cast<LoadPackageSync_t>(0x004A9F60)(nullptr, kDaudPackage, 0);
+            Log("save load: loaded %s before restoring level %p (%s, %lu ms) - a save can hold Daud's wristbow bolts",
+                Narrow(kDaudPackage).c_str(), level, pkg ? "ok" : "FAILED", static_cast<unsigned long>(GetTickCount() - t0));
+        }
+    }
+    g_origLoadLevel(gameState, edx, level);
 }
 
 // UObject::StaticExit @0x4645D0 (cdecl, no args): the final purge on quit. It crashed freeing our arrays exactly
@@ -10509,9 +11407,19 @@ static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx
     FVector raw = *loc;
     float rawDx = raw.X - pawn->Location.X, rawDy = raw.Y - pawn->Location.Y;
     float dz = raw.Z - (pawn->Location.Z + pawn->EyeHeight);
+    // The arms shift as it is IN this view: camera_jnt carries g_armsShiftLocal turned by the pawn's yaw of THIS frame.
+    // (2026-10-13, clips 09-13-24 / 09-19-59: g_armsShiftWorld was turned by LAST frame's yaw - ApplyArmsShift runs after
+    // the draw - so taking it out left (R(yaw now) - R(yaw then)) x shift in the view. Turning at level pitch (shift ~27 uu
+    // forward) the view slid sideways by one frame's turn x 27 uu and the 1P hands jittered against it, offset = 0.38 x the
+    // background's scroll per captured frame, r 0.94; looking down the shift is 0 and so was the jitter.)
+    FVector S;
+    {
+        float pyS = pawn->Rotation.Yaw * (6.2831853f / 65536.0f), cS = cosf(pyS), sS = sinf(pyS);
+        S = { g_armsShiftLocal.X * cS - g_armsShiftLocal.Y * sS, g_armsShiftLocal.X * sS + g_armsShiftLocal.Y * cS, g_armsShiftLocal.Z };
+    }
     {   // not the 1P view: measured without our arms shift, else switching off/on fed back every frame
         float k0 = g_camFollowsArms == 1 ? 1.0f : 0.0f;
-        float vx = rawDx - k0 * g_armsShiftWorld.X, vy = rawDy - k0 * g_armsShiftWorld.Y, vz = dz - k0 * g_armsShiftWorld.Z;
+        float vx = rawDx - k0 * S.X, vy = rawDy - k0 * S.Y, vz = dz - k0 * S.Z;
         if (vx * vx + vy * vy + vz * vz > g_cfg.thirdPersonDist * g_cfg.thirdPersonDist) { off(); return; }
     }
 
@@ -10524,8 +11432,7 @@ static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx
     float sdeg = Clamp(deg, -85.0f, 85.0f);   // the curve is noisy at the very top/bottom (build 58: sways looking up)
     float yaw = pc->Rotation.Yaw * (6.2831853f / 65536.0f);
     float cy = cosf(yaw), sy = sinf(yaw);
-    FVector S = g_armsShiftWorld;
-    float sF = S.X * cy + S.Y * sy, sR = -S.X * sy + S.Y * cy;
+    float sF = S.X * cy + S.Y * sy, sR = -S.X * sy + S.Y * cy;   // (S: this frame's arms shift, worked out above)
     float rawF = rawDx * cy + rawDy * sy, rawR = -rawDx * sy + rawDy * cy;
     PitchCurve& curve = g_pitchCurve[g_isCrouched ? 1 : 0];
 
@@ -10845,7 +11752,7 @@ static int g_chainModCount = 0;
 // 5 jump (Agility's power jump);
 // value: 0 Corvo, 1 Daud, 2 Daud's High Overseer disguise (body, arms and sword only).
 extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, int value) {
-    int maxValue = part <= 2 ? 2 : 1;
+    int maxValue = part == 6 ? 3 : part <= 2 ? 2 : 1;
     value = (value >= 0 && value <= maxValue) ? value : 0;
     InterlockedExchange(&g_charsSet, 1);
     if (part == 0) InterlockedExchange(&g_bodyChar, value);
@@ -10854,12 +11761,14 @@ extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, i
     else if (part == 3) InterlockedExchange(&g_powerChar, value);
     else if (part == 4) InterlockedExchange(&g_bowChar, value);
     else if (part == 5) InterlockedExchange(&g_jumpChar, value);
+    else if (part == 6) InterlockedExchange(&g_summonChar, value);
+    if (part == 6) { Log("Body Swap: summoned NPC -> %s", value == 3 ? "an Overseer hound (Doggy!)" : value == 2 ? "Daud" : value ? "Corvo" : "the regular assassin"); return; }   // (applied on the game thread)
     Log("Body Swap: %s -> %s", part == 0 ? "body" : part == 1 ? "arms" : part == 2 ? "blade" : part == 3 ? "powers" : part == 4 ? "crossbow" : "jump",
         value == 2 ? "Overseer" : value ? "Daud" : "Corvo");
 }
 
 extern "C" __declspec(dllexport) int __cdecl CorvoBody_GetCharacter(int part) {
-    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : part == 5 ? static_cast<int>(g_jumpChar) : 0;
+    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : part == 5 ? static_cast<int>(g_jumpChar) : part == 6 ? static_cast<int>(g_summonChar) : 0;
 }
 
 // Extra exports some chained proxies provide, which their plugins look up with GetModuleHandle("dinput8.dll") -
@@ -10946,6 +11855,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
 
     LoadSettings();
+    FixTimerResolution();
     LoadPitchCurve();
 
     RawLoadPackageAsync = reinterpret_cast<LoadPackageAsync_t>(
@@ -10974,6 +11884,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     } else {
         Log("WARNING: could not hook CollectGarbage");
     }
+    if (memcmp(reinterpret_cast<void*>(0x00A13DB0), gcExpect, sizeof(gcExpect)) == 0 &&
+        MH_CreateHook(reinterpret_cast<void*>(0x00A13DB0), reinterpret_cast<void*>(&HookedLoadLevel),
+                      reinterpret_cast<void**>(&g_origLoadLevel)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(0x00A13DB0)) == MH_OK) {
+        Log("FGameState::LoadLevel hooked (Daud's package before a save's level is restored)");
+    } else {
+        Log("WARNING: could not hook FGameState::LoadLevel");
+    }
     const uint8_t exitExpect[] = { 0x8B, 0x0D, 0x14, 0xA9, 0x40, 0x01 };   // mov ecx, [GCallbackEvent]
     if (memcmp(reinterpret_cast<void*>(0x004645D0), exitExpect, sizeof(exitExpect)) == 0 &&
         MH_CreateHook(reinterpret_cast<void*>(0x004645D0), reinterpret_cast<void*>(&HookedStaticExit),
@@ -11000,6 +11918,14 @@ static DWORD WINAPI InitThread(LPVOID) {
     HookPawnSaveLoad();
     HookPlayerSave();
     HookPowerText();
+    HookSummonSpawn();
+    {
+        const uint8_t pro[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68 };
+        if (memcmp(reinterpret_cast<void*>(0x00A15E30), pro, sizeof(pro)) == 0 &&
+            MH_CreateHook(reinterpret_cast<void*>(0x00A15E30), reinterpret_cast<void*>(&HookedSaveLevel), reinterpret_cast<void**>(&g_origSaveLevel)) == MH_OK &&
+            MH_EnableHook(reinterpret_cast<void*>(0x00A15E30)) == MH_OK) { ++g_houndHooks; Log("Doggy!: level save hooked (hounds never saved)"); }
+        else Log("WARNING: could not hook the level save - Doggy! stays off");
+    }
     Log("UGameEngine::Tick hooked (settings fixed, no hotkeys)");
     return 0;
 }

@@ -5,10 +5,11 @@ Source code for **CorvoBody** on Nexus Mods: https://www.nexusmods.com/dishonore
 See your own body in first person in Dishonored (2012), like Dishonored 2 - and, since 3.0, its real-time shadow
 from the sun and from lamps, following every pose, weapon and item in your hands. The **Body Swap** add-on lets you
 play as Corvo, Daud or Daud's High Overseer disguise (body, arms, blade, powers and crossbow), switchable from the
-pause menu through [Dishonored Mod Loader](https://www.nexusmods.com/dishonored/mods/383).
+pause menu through [Dishonored Mod Loader](https://www.nexusmods.com/dishonored/mods/383). Since 3.1 it can also
+choose who Summon Assassin brings: the regular assassin, masked Corvo, Daud or an Overseer hound.
 
 This repository contains code only. The mod uses the models and animations already installed with the game's DLC.
-The Nexus download for 3.0 also includes, none of which is in this repository: high-detail upscales of the player
+The Nexus download (3.0 and later) also includes, none of which is in this repository: high-detail upscales of the player
 body textures (`CorvoBody\hd\*.dds`), the game's main menu package with a "CorvoBody Version 3" subtitle added
 under the logo (`Dishonored_MainMenu.upk`), and Dishonored Mod Loader by Crimsab.
 
@@ -41,8 +42,11 @@ into `external\` and compiles the SDK (about a minute). Output:
 
 `-Install` copies both into the Steam install (`-Game <Binaries\Win32 folder>` to change it).
 
-The release DLLs for version 3.0 were built from this source with these steps. A clean build is identical to them
-apart from the link timestamp and the build ID, which change on every build.
+The release DLLs were built with these steps from the matching tag (`v3.0`, `v3.1`). A clean build is identical to
+them apart from the link timestamp and the build ID, which change on every build. Version 3.1:
+
+- `dinput8.dll` SHA-256 `D51A29F83B6A2345A956F9BAA6C0EAD7DCC07F282729A1F0114F2D7B6E7CE307`
+- `BodySwap.dll` SHA-256 `369DF861594EC8789772515D766335390FD96163C3EC72D9DF44D7883C3F8893`
 
 ## Supported game version
 
