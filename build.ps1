@@ -42,11 +42,15 @@ if (-not (Test-Path "$ext\sdk")) {
     Write-Host 'Applying patches\codered-sdk.patch ...'
     # In a git clone of this repository 'git apply' takes the patch's paths as relative to the repository root and
     # skips them without an error ("Skipped patch"), so repository discovery is stopped above external\ while it runs.
+    # The SDK is checked out with LF line ends (core.autocrlf=false above); the patch is applied from an LF copy, since
+    # Git for Windows' default core.autocrlf=true checks patches\codered-sdk.patch out with CRLF.
+    $lfPatch = Join-Path $ext 'codered-sdk.lf.patch'
+    [IO.File]::WriteAllText($lfPatch, ([IO.File]::ReadAllText((Join-Path $root 'patches\codered-sdk.patch')) -replace "`r`n", "`n"))
     $ceiling = $env:GIT_CEILING_DIRECTORIES
     $env:GIT_CEILING_DIRECTORIES = $root
     Push-Location $ext
-    try { Invoke-Checked 'git apply' { git apply -p1 (Join-Path $root 'patches\codered-sdk.patch') } }
-    finally { Pop-Location; $env:GIT_CEILING_DIRECTORIES = $ceiling }
+    try { Invoke-Checked 'git apply' { git apply -p1 $lfPatch } }
+    finally { Pop-Location; $env:GIT_CEILING_DIRECTORIES = $ceiling; Remove-Item $lfPatch -ErrorAction SilentlyContinue }
     if (-not (Select-String -Path "$ext\sdk\include\defs.hpp" -Pattern 'patched for clang' -SimpleMatch -Quiet)) {
         Remove-Item "$ext\sdk" -Recurse -Force
         throw 'patches\codered-sdk.patch was not applied to external\sdk'
