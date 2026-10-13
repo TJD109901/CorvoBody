@@ -48,6 +48,17 @@ them apart from the link timestamp and the build ID, which change on every build
 - `dinput8.dll` SHA-256 `D51A29F83B6A2345A956F9BAA6C0EAD7DCC07F282729A1F0114F2D7B6E7CE307`
 - `BodySwap.dll` SHA-256 `369DF861594EC8789772515D766335390FD96163C3EC72D9DF44D7883C3F8893`
 
+**Building an older version (2.0, 3.0, 3.1):** the `build.ps1` in those commits skips its SDK patch when it runs
+inside a git clone (`git apply` takes the patch's paths as relative to the repository root and skips them without an
+error), so a fresh build of them stops with a compile error in `defs.hpp`. Use the fixed script from `main`, which
+changes only how the patch is applied:
+
+```powershell
+git checkout v3.0            # or v3.1, or e006d9f for 2.0
+git checkout main -- build.ps1
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
 ## Supported game version
 
 The Steam release of `Dishonored.exe` (32-bit), SHA-256

@@ -40,8 +40,17 @@ if (-not (Test-Path "$ext\sdk")) {
     Get-Repo $DismodRepo $DismodCommit "$ext\dismod"
     Copy-Item "$ext\dismod\external\sdk" "$ext\sdk" -Recurse
     Write-Host 'Applying patches\codered-sdk.patch ...'
+    # In a git clone of this repository 'git apply' takes the patch's paths as relative to the repository root and
+    # skips them without an error ("Skipped patch"), so repository discovery is stopped above external\ while it runs.
+    $ceiling = $env:GIT_CEILING_DIRECTORIES
+    $env:GIT_CEILING_DIRECTORIES = $root
     Push-Location $ext
-    try { Invoke-Checked 'git apply' { git apply -p1 (Join-Path $root 'patches\codered-sdk.patch') } } finally { Pop-Location }
+    try { Invoke-Checked 'git apply' { git apply -p1 (Join-Path $root 'patches\codered-sdk.patch') } }
+    finally { Pop-Location; $env:GIT_CEILING_DIRECTORIES = $ceiling }
+    if (-not (Select-String -Path "$ext\sdk\include\defs.hpp" -Pattern 'patched for clang' -SimpleMatch -Quiet)) {
+        Remove-Item "$ext\sdk" -Recurse -Force
+        throw 'patches\codered-sdk.patch was not applied to external\sdk'
+    }
 }
 
 # ---- Compile ----
