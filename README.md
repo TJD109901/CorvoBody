@@ -20,15 +20,19 @@ under the logo (`Dishonored_MainMenu.upk`), and Dishonored Mod Loader by Crimsab
 | `src/main.cpp` | CorvoBody: a `dinput8.dll` proxy that hooks the game with MinHook, builds the visible body from the DLC models, animates it, keeps it out of the camera and casts the player's shadow. It also swaps the player body's textures for the high-detail ones through a Direct3D 9 `SetTexture` hook, and keeps the `Dishonored_MainMenu.upk` size entry in `DishonoredGame\PCConsoleTOC*.txt` in step with the installed title-screen package |
 | `src/baked_settings.h` | the tuned settings (the mod has no ini or hotkeys) |
 | `src/dinput8.def` | exports: `DirectInput8Create` (forwarded to the system `dinput8.dll` or a chain-loaded mod), `BlinkBootstrap_Register` (forwarded for mods that expect it from `dinput8.dll`) and the Body Swap API |
-| `bodyswap/` | `BodySwap.dll`, a Dishonored Mod Loader plugin that adds the Body Swap menu and passes the choices to CorvoBody |
+| `src/dinput8.rc` | version information for `dinput8.dll` (3.2) |
+| `bodyswap/` | `BodySwap.dll`, a Dishonored Mod Loader plugin that adds the Body Swap menu and passes the choices to CorvoBody; `BodySwap.rc` is its version information (3.2) |
+| `tools/harden_pe.py` | finishing step for the zig-linked `dinput8.dll`: drops the debug sections and symbol table and sets the PE checksum, without changing a code or data byte (3.2) |
 | `patches/codered-sdk.patch` | three small fixes applied to the CodeRed SDK after it is fetched |
 | `shim/xlocale` | a one-line header shim so the SDK compiles with clang |
 | `build.ps1` | fetches the third-party code and builds both DLLs |
 
 ## Building
 
-Requirements: Windows, [Git](https://git-scm.com/), and [Zig 0.17.0](https://ziglang.org/download/)
-(used as the C/C++ compiler; `winget install zig.zig`).
+Requirements: Windows, [Git](https://git-scm.com/), [Zig 0.17.0](https://ziglang.org/download/) (the compiler for
+`dinput8.dll`; `winget install zig.zig`), Visual Studio 2022 or its free Build Tools with "Desktop development with
+C++" (the compiler for `BodySwap.dll`, since 3.2), and Python 3 with `pefile` (`pip install pefile`, for
+`tools/harden_pe.py`).
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
@@ -42,8 +46,20 @@ into `external\` and compiles the SDK (about a minute). Output:
 
 `-Install` copies both into the Steam install (`-Game <Binaries\Win32 folder>` to change it).
 
-The release DLLs were built with these steps from the matching tag (`v3.0`, `v3.1`). A clean build is identical to
-them apart from the link timestamp and the build ID, which change on every build. Version 3.1:
+The release DLLs were built with these steps from the matching tag (`v3.0`, `v3.1`, `v3.2`).
+
+Version 3.2 is the 3.1 code (`src/` and `bodyswap/` unchanged apart from the two version-info files), rebuilt so that
+antivirus engines no longer flag it: 3.0's `BodySwap.dll` was flagged by 23 of 71 engines on VirusTotal (generic and
+machine-learning detections such as "Gen:Variant.Babar") because of how it was compiled - a small zig/mingw DLL with
+no version information, an appended symbol table and no checksum. In 3.2 `BodySwap.dll` is built with MSVC and both
+DLLs carry version information and a valid checksum. VirusTotal: `BodySwap.dll` 0/71, `dinput8.dll` 0/70.
+
+- `dinput8.dll` SHA-256 `0E9E4014F94200DCE376F5AB868100CD21EADCF4D3748D9B7FD9002BFAC044E4` - a clean build has the same
+  bytes in every section; only the link timestamp in the header (and so the checksum) changes from build to build
+- `BodySwap.dll` SHA-256 `4030BAB227D537C60F655A199AB7192E26E09042282BFFAEE252DF3B3C0DD821` - byte-identical when
+  rebuilt with the same MSVC version (VS 2022 17.14, compiler 19.44; `/Brepro` makes it deterministic)
+
+Version 3.1 (a clean build is identical apart from the link timestamp and the build ID):
 
 - `dinput8.dll` SHA-256 `D51A29F83B6A2345A956F9BAA6C0EAD7DCC07F282729A1F0114F2D7B6E7CE307`
 - `BodySwap.dll` SHA-256 `369DF861594EC8789772515D766335390FD96163C3EC72D9DF44D7883C3F8893`
@@ -52,7 +68,8 @@ them apart from the link timestamp and the build ID, which change on every build
 fresh git clone (`git apply` takes the patch's paths as relative to the repository root and skips them without an
 error, and with Git for Windows' default `core.autocrlf=true` the patch's line ends don't match the SDK's), so a
 fresh build of them stops with a compile error in `defs.hpp`. Use the fixed script from `main`, which changes only
-how the patch is applied:
+how the patch is applied (for these versions - they have no `.rc` files - it builds both DLLs with zig exactly as
+they were released):
 
 ```powershell
 git checkout v3.0            # or v3.1, or e006d9f for 2.0

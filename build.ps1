@@ -1,8 +1,14 @@
-# Builds CorvoBody (dinput8.dll) and the Body Swap add-on (BodySwap.dll) for Dishonored (32-bit) with Zig.
+# Builds CorvoBody (dinput8.dll, with Zig) and the Body Swap add-on (BodySwap.dll, with Visual Studio) for Dishonored
+# (32-bit).
 #
 # Usage:   powershell -ExecutionPolicy Bypass -File build.ps1 [-Zig path\to\zig.exe] [-Install] [-Game folder]
-# Needs:   Git and Zig 0.17.0 (https://ziglang.org/download/ - or: winget install zig.zig).
+# Needs:   Git; Zig 0.17.0 (https://ziglang.org/download/ - or: winget install zig.zig); Visual Studio 2022 or its Build
+#          Tools with the C++ x86 tools ("Desktop development with C++"); Python 3 with pefile (pip install pefile).
 # Output:  build\dinput8.dll and build\BodySwap.dll
+#
+# Since 3.2 both DLLs carry version information and a valid PE checksum, and dinput8.dll ships without its debug
+# sections (tools\harden_pe.py): 3.0's files were flagged by antivirus ML/generic detections for missing exactly that.
+# BodySwap.dll is built with MSVC (static CRT, deterministic /Brepro), which reads as an ordinary Windows plugin.
 #
 # Third-party code is not stored in this repository; it is fetched at fixed commits into external\:
 #   MinHook (BSD 2-Clause)            https://github.com/TsudaKageyu/minhook
@@ -92,13 +98,51 @@ $modObj = foreach ($f in Get-ChildItem "$root\src" -Filter *.cpp) {
     $o
 }
 $sdkObj = @("$out\sdk\defs.o") + ($sdkUnits | ForEach-Object { "$out\sdk\$_.o" })
+# 3.2 and later have src\dinput8.rc; for an older version (this script checked out over tag v3.1, v3.0 or 2.0) the DLL
+# is linked exactly as it was released, without version info and finishing step.
+$v32 = Test-Path "$root\src\dinput8.rc"
+$resObj = @()
+if ($v32) {
+    Invoke-Zig @('rc', '/:output-format', 'coff', '/:target', 'x86', "$root\src\dinput8.rc", "$out\dinput8_version.o")
+    $resObj = @("$out\dinput8_version.o")
+}
 Invoke-Zig (@('c++', '-target', 'x86-windows-gnu', '-shared', '-o', "$out\dinput8.dll",
-              "$root\src\dinput8.def") + $modObj + $sdkObj + $mhObj + @('-lkernel32', '-luser32'))
+              "$root\src\dinput8.def") + $modObj + $sdkObj + $mhObj + $resObj + @('-lkernel32', '-luser32'))
+if ($v32) {
+    # Finishing step: no debug sections / symbol table, a valid checksum (see tools\harden_pe.py).
+    Invoke-Checked 'tools\harden_pe.py' { python -I -B (Join-Path $root 'tools\harden_pe.py') "$out\dinput8.dll" }
+}
 Write-Host "Built $out\dinput8.dll"
 
-# Body Swap add-on: a Dishonored Mod Loader plugin.
-Invoke-Zig @('c++', '-target', 'x86-windows-gnu', '-std=c++20', '-O2', '-shared', '-o', "$out\BodySwap.dll",
-              "$root\bodyswap\bodyswap.cpp", "$root\bodyswap\BodySwap.def", '-lkernel32')
+# Body Swap add-on: a Dishonored Mod Loader plugin. Older versions: zig, as released.
+if (-not (Test-Path "$root\bodyswap\BodySwap.rc")) {
+    Invoke-Zig @('c++', '-target', 'x86-windows-gnu', '-std=c++20', '-O2', '-shared', '-o', "$out\BodySwap.dll",
+                  "$root\bodyswap\bodyswap.cpp", "$root\bodyswap\BodySwap.def", '-lkernel32')
+    Write-Host "Built $out\BodySwap.dll (older version: zig)"
+    if ($Install) {
+        Copy-Item "$out\dinput8.dll" "$Game\dinput8.dll" -Force
+        New-Item -ItemType Directory -Force "$Game\Mods\plugins" | Out-Null
+        Copy-Item "$out\BodySwap.dll" "$Game\Mods\plugins\BodySwap.dll" -Force
+        Write-Host "Installed to $Game (the game must be closed)"
+    }
+    return
+}
+# 3.2 and later: MSVC (x86, static CRT, deterministic).
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vs = if (Test-Path $vswhere) { & $vswhere -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath }
+$vcvars = if ($vs) { Join-Path $vs 'VC\Auxiliary\Build\vcvarsall.bat' }
+if (-not $vcvars -or -not (Test-Path $vcvars)) {
+    throw 'BodySwap.dll needs Visual Studio 2022 or its Build Tools with "Desktop development with C++" (MSVC x86 tools).'
+}
+New-Item -ItemType Directory -Force "$out\bodyswap" | Out-Null
+$msvc = @(
+    "@call `"$vcvars`" x86 >nul 2>&1 || exit /b 1",
+    "cd /d `"$root\bodyswap`"",
+    "rc /nologo /fo `"$out\bodyswap\BodySwap.res`" BodySwap.rc || exit /b 1",
+    "cl /nologo /O2 /GS /MT /utf-8 /D_CRT_SECURE_NO_WARNINGS /Brepro /LD /Fo`"$out\bodyswap\\`" bodyswap.cpp `"$out\bodyswap\BodySwap.res`" /link /DEF:BodySwap.def /RELEASE /DYNAMICBASE /NXCOMPAT /Brepro /OUT:`"$out\BodySwap.dll`" /IMPLIB:`"$out\bodyswap\BodySwap.lib`" || exit /b 1"
+)
+Set-Content -Path "$out\bodyswap\build_msvc.cmd" -Value $msvc -Encoding ascii
+Invoke-Checked 'MSVC BodySwap.dll' { cmd /c "`"$out\bodyswap\build_msvc.cmd`"" }
 Write-Host "Built $out\BodySwap.dll"
 
 if ($Install) {
