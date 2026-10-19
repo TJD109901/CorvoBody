@@ -24,7 +24,7 @@ under the logo (`Dishonored_MainMenu.upk`), and Dishonored Mod Loader by Crimsab
 | `src/main.cpp` | CorvoBody: a `dinput8.dll` proxy that hooks the game with MinHook, builds the visible body from the DLC models, animates it, keeps it out of the camera and casts the player's shadow. It also swaps the player body's textures for the high-detail ones through a Direct3D 9 `SetTexture` hook, and keeps the `Dishonored_MainMenu.upk` size entry in `DishonoredGame\PCConsoleTOC*.txt` in step with the installed title-screen package |
 | `src/baked_settings.h` | the tuned settings (the mod has no ini; its one hotkey is the third-person toggle) |
 | `src/dinput8.def` | exports: `DirectInput8Create` (forwarded to the system `dinput8.dll` or a chain-loaded mod), `BlinkBootstrap_Register` (forwarded for mods that expect it from `dinput8.dll`) and the Body Swap API |
-| `src/dinput8.rc` | version information for `dinput8.dll` (4.0) |
+| `src/dinput8.rc` | version information for `dinput8.dll` (4.0.1) |
 | `bodyswap/` | `BodySwap.dll`, a Dishonored Mod Loader plugin that adds the Body Swap menu and passes the choices to CorvoBody; `BodySwap.rc` is its version information (4.0) |
 | `tools/harden_pe.py` | finishing step for the zig-linked `dinput8.dll`: drops the debug sections and symbol table and sets the PE checksum, without changing a code or data byte (3.2) |
 | `patches/codered-sdk.patch` | three small fixes applied to the CodeRed SDK after it is fetched |
@@ -50,7 +50,17 @@ into `external\` and compiles the SDK (about a minute). Output:
 
 `-Install` copies both into the Steam install (`-Game <Binaries\Win32 folder>` to change it).
 
-The release DLLs were built with these steps from the matching tag (`v3.0`, `v3.1`, `v3.2`, `v4.0`).
+The release DLLs were built with these steps from the matching tag (`v3.0`, `v3.1`, `v3.2`, `v4.0`, `v4.0.1`).
+
+Version 4.0.1 (tag `v4.0.1`) fixes the sword staying invisible after leaving third person while it was being
+holstered or swapped, and shows Blink in third person as someone watching would see it. The camera holds a moment
+where you stood, then glides after you. Daud's assassins' black flakes burst where you vanish and where you land
+(the game's own NPC teleport effects, spawned on the body's bones). Blink's first-person lens burst is kept out of
+the third-person view. Only `src/main.cpp` and `src/dinput8.rc` changed; `BodySwap.dll` is the 4.0 file (same hash).
+
+- `dinput8.dll` SHA-256 `313701D88E6DC200E5BBA5BF05D8F803FF1331E89D98BB3BDA68F220D47959CB` - a clean build has the
+  same bytes in every section; only the link timestamp in the header (and so the checksum) changes
+- `BodySwap.dll` SHA-256 `4BAA264644DD2238869BC206CDB40719685634B017AC5CC70DDBA3A9A57D93F8` (as in 4.0)
 
 Version 4.0 (tag `v4.0`) adds the third-person mode and Daud's Pull, and includes the 3.3 fix below (3.3 was released on
 Nexus but not tagged here; its changes are part of the 4.0 commit). Pull on campaign NPCs works by giving the game's

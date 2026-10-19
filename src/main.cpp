@@ -855,6 +855,12 @@ static USkeletalMeshComponent* g_shadowArms = nullptr;   // hidden full body tha
 // Third-person mode (4.0, UpdateThirdPerson / ThirdPersonViewPoint)
 static bool g_tpOn = false;       // the player's choice (V / L3 + R3)
 static float g_tpBlend = 0.0f;    // camera swing 0 = eyes .. 1 = behind the shoulder
+static bool g_tpBlinkHidden = false;   // (4.0.1) the third-person body is gone for a blink (UpdateTpBlinkFx)
+// (4.0.1) Blink seen from where you stood: the third-person camera holds at its take-off spot, then glides after you.
+static FVector g_tpLastCam = { 0, 0, 0 };      // ThirdPersonViewPoint: last third-person camera location
+static FVector g_tpBlinkCamFrom = { 0, 0, 0 }; // ...where it was when the blink moved the player
+static float g_tpBlinkCamLeft = 0.0f;          // seconds of hold + glide left
+constexpr float kTpBlinkCamHold = 0.3f, kTpBlinkCamGlide = 0.35f;
 static bool g_tpShown = false;    // the casting body is drawn and the first-person meshes are hidden from the view
 static float g_tpFrac = 1.0f;     // share of the camera distance free of walls (eased back out)
 static float g_tpYawOffDeg = 0.0f;   // free orbit: the bodies' yaw against the pawn's (deg, + = right of the camera's heading)
@@ -5071,9 +5077,12 @@ static bool IsOurComponent(UActorComponent* c) {
 static void UpdateThirdPerson(ADishonoredPlayerPawn* pawn) {
     static LONGLONG qpc = 0;
     float dt = QpcDt(qpc);
-    // The 1P meshes we took out of the view: restored by pointer, and only while still on the arms (a weapon swap
-    // destroys the old item component - a stale pointer is never touched).
+    // The 1P meshes we took out of the view: restored by pointer, each checked against the object list first (a weapon
+    // swap destroys the old item component - a stale pointer is never touched). 4.0.1: no longer only those still on
+    // the arms or in a hand - a sword holstered during the swing back stayed out of the view for good (video 16-24-13:
+    // "1 of 2 1P meshes back", and every later switch skipped it as already hidden).
     static UPrimitiveComponent* hiddenByUs[48];
+    static int32_t hiddenIndex[48];
     static int hiddenCount = 0;
     static USkeletalMeshComponent* armsHidden = nullptr;
     auto* pc = pawn ? static_cast<APlayerController*>(pawn->Controller) : nullptr;
@@ -5110,9 +5119,11 @@ static void UpdateThirdPerson(ADishonoredPlayerPawn* pawn) {
         if (!g_body->HiddenGame) g_body->SetHidden(true);
         g_body->bUpdateSkelWhenNotRendered = 1;
         if (g_armSkin && !g_armSkin->HiddenGame) g_armSkin->SetHidden(true);
-        if (g_shadowArms->HiddenGame) g_shadowArms->SetHidden(false);
-        if (g_head && g_head->HiddenGame) g_head->SetHidden(false);
-        for (int h = 0; h < 2; ++h) if (g_itemShadow[h] && g_itemShadow[h]->HiddenGame) g_itemShadow[h]->SetHidden(false);
+        if (!g_tpBlinkHidden) {   // (gone during a blink)
+            if (g_shadowArms->HiddenGame) g_shadowArms->SetHidden(false);
+            if (g_head && g_head->HiddenGame) g_head->SetHidden(false);
+            for (int h = 0; h < 2; ++h) if (g_itemShadow[h] && g_itemShadow[h]->HiddenGame) g_itemShadow[h]->SetHidden(false);
+        }
         USkeletalMeshComponent* arms = pawn->Mesh;
         arms->bUpdateSkelWhenNotRendered = 1;   // the casting arms and the camera ride its bones
         arms->bIgnoreControllersWhenNotRendered = 0;
@@ -5121,7 +5132,7 @@ static void UpdateThirdPerson(ADishonoredPlayerPawn* pawn) {
             if (c->bOwnerNoSee) return;
             if (c->IsA(USkeletalMeshComponent::StaticClass())) static_cast<USkeletalMeshComponent*>(c)->bUpdateSkelWhenNotRendered = 1;
             c->SetOwnerNoSee(true);
-            if (hiddenCount < 48) hiddenByUs[hiddenCount++] = c;
+            if (hiddenCount < 48) { hiddenIndex[hiddenCount] = c->ObjectInternalInteger; hiddenByUs[hiddenCount++] = c; }
             Log("third person: 1P %s %s out of the view", c->Class ? c->Class->GetName().c_str() : "?", c->GetName().c_str());
         });
     } else if (g_tpShown) {
@@ -5133,9 +5144,14 @@ static void UpdateThirdPerson(ADishonoredPlayerPawn* pawn) {
         if (pawn && pawn->Mesh && armsHidden == pawn->Mesh) pawn->Mesh->SetOwnerNoSee(false);
         armsHidden = nullptr;
         int back = 0;
-        attachments([&](UPrimitiveComponent* c) {
-            for (int i = 0; i < hiddenCount; ++i) if (hiddenByUs[i] == c) { if (c->bOwnerNoSee) { c->SetOwnerNoSee(false); ++back; } break; }
-        });
+        auto* objects = UObject::GObjObjects();
+        for (int i = 0; i < hiddenCount; ++i) {
+            UPrimitiveComponent* c = hiddenByUs[i];
+            int32_t idx = hiddenIndex[i];
+            bool alive = idx >= 0 && idx < objects->size() && objects->at(idx) == c &&
+                         !(*reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(c) + 0x08) & 0x0000000200000000ULL);   // not RF_Unreachable
+            if (alive && c->bOwnerNoSee) { c->SetOwnerNoSee(false); ++back; }
+        }
         Log("third person: off (%d of %d 1P meshes back in the view)", back, hiddenCount);
         hiddenCount = 0;
     }
@@ -11237,6 +11253,265 @@ static void LogSummonLimbs() {
     Log("save: %d severed limbs, %d wear Corvo/Daud meshes (summoned NPC look)", limbs, ours);
 }
 
+// ---- Blink as others see it (4.0.1, third person). The user: Daud and his assassins blink out and in with black,
+// gritty flakes - the summoned assassin breaking up into black ash as he goes (clip 16-41-44) - show that on Corvo
+// in third person. The assassins' teleport is the NPC teleport spell; its settings (DisTweaks_NPCTeleportSpell, here
+// the summoned assassins' from Daud's package) give flake effects per bone for vanishing and for reappearing, a sound
+// for each, and the "fiery" dissolve - the material parameter F_Firy_Amount, 0 -> 1 over 0.45 s going and 1 -> 0
+// over 0.3 s coming back (the game sets it on every material of the NPC: DisSetScalarParameterToAllMatsOnNPC
+// @0xBC82E0). Corvo's Blink has no wind-up, so the moment a Blink power starts moving him (m_bActive and m_BlinkMode
+// +0xC9 == EBM_BlinkMove; any Blink-class power in the list, Corvo's or Daud's Transversal):
+//  - the vanishing flakes burst where he stood (TpDepartFlakes) and the third-person camera stays there a moment,
+//    then glides after him (ThirdPersonViewPoint) - the blink as someone watching would see it;
+//  - the real casting body is hidden for the move, and on arrival the reappearing flakes ride its bones (and it fades
+//    back in where a material has the parameter - Corvo's body materials do not);
+//  - Blink's own end-of-blink lens burst is kept out of the third-person view (HookedLensUpdateLocation).
+static UObject* g_tpTeleportTweaks = nullptr;   // DisTweaks_NPCTeleportSpell
+static UParticleSystemComponent* SpawnEmitterAt(UObject* ps, const FVector& loc, const FRotator& rot) {
+    using Fn = UParticleSystemComponent*(__cdecl*)(UObject*, const FVector*, const FRotator*, int, int);
+    return ps ? reinterpret_cast<Fn>(0x00BCF970)(ps, &loc, &rot, 0, 0) : nullptr;   // DishonoredSpawnEmitter
+}
+static UParticleSystemComponent* SpawnEmitterOnBone(UObject* ps, USkeletalMeshComponent* mesh, const FName& bone) {
+    using Fn = UParticleSystemComponent*(__cdecl*)(UObject*, USkeletalMeshComponent*, int32_t, int32_t, int, const FVector*, const FRotator*);
+    static const FVector zeroV = {};
+    static const FRotator zeroR = {};
+    return ps && mesh ? reinterpret_cast<Fn>(0x00BCF9F0)(ps, mesh, bone.FNameEntryId, bone.InstanceNumber, 0, &zeroV, &zeroR) : nullptr;
+}
+
+static UObject* TpTeleportTweaks() {
+    static bool searched = false;
+    if (g_tpTeleportTweaks || searched || g_daudLoadState != LoadState::Loaded) return g_tpTeleportTweaks;
+    searched = true;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->Class || AwaitingPurge(o) || o->Class->GetName() != "DisTweaks_NPCTeleportSpell") continue;
+        auto* bones = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(o) + 0xC8);   // m_BoneSpecificDisappearanceFXs
+        if (!bones->Data || bones->Num <= 0) continue;
+        g_tpTeleportTweaks = o;
+        if (o->GetFullName().find("SumAssHand") != std::string::npos) break;   // the summoned assassins' (Daud's power)
+    }
+    KeepAlive(g_tpTeleportTweaks);
+    if (auto* t = reinterpret_cast<uint8_t*>(g_tpTeleportTweaks)) {
+        auto* d = reinterpret_cast<RawArray*>(t + 0xC8);
+        auto* r = reinterpret_cast<RawArray*>(t + 0xD8);
+        Log("third person blink: assassin teleport settings %s (%d vanishing / %d reappearing bone effects, fade %.2f / %.2f s)",
+            ObjName(g_tpTeleportTweaks).c_str(), d->Num, r->Num, *reinterpret_cast<float*>(t + 0xF4), *reinterpret_cast<float*>(t + 0xF8));
+        for (int i = 0; d->Data && i < d->Num && i < 12; ++i) {
+            auto& e = static_cast<FDisTeleportSpellFX*>(d->Data)[i];
+            Log("   vanishing: %s on %s", ObjName(e.m_pParticles).c_str(), e.m_BoneName.ToString().c_str());
+        }
+    } else {
+        Log("third person blink: WARNING - no assassin teleport settings found");
+    }
+    return g_tpTeleportTweaks;
+}
+
+// A fade of F_Firy_Amount on every material of some components that has it, through temporary material instances.
+struct TpFadeMat { UMeshComponent* comp; int index; UMaterialInterface* orig; UMaterialInstanceConstant* mic; };
+struct TpFade { std::vector<TpFadeMat> mats; float time = 0.3f, left = 0.0f; float from = 1.0f, to = 0.0f; bool restore = true; };
+static void TpFadeEnd(TpFade& f) {
+    for (auto& m : f.mats) { if (m.comp && f.restore) m.comp->SetMaterial(m.index, m.orig); LetGo(m.mic); }
+    f.mats.clear();
+    f.left = 0.0f;
+}
+static int TpFadeStart(TpFade& f, UMeshComponent* const* comps, int n, float time, float from, float to, bool restore) {
+    TpFadeEnd(f);
+    static FName param("F_Firy_Amount");
+    UClass* micClass = UMaterialInstanceConstant::StaticClass();
+    for (int c = 0; c < n; ++c) {
+        UMeshComponent* comp = comps[c];
+        if (!comp) continue;
+        auto* overrides = reinterpret_cast<RawArray*>(&comp->Materials);
+        int count = comp->GetNumElements();
+        for (int i = 0; i < count && i < 16; ++i) {
+            UMaterialInterface* parent = comp->GetMaterial(i);
+            float probe = 0.0f;
+            if (!parent || !parent->GetScalarParameterValue(param, probe)) continue;   // no fiery dissolve in this material
+            auto* mic = static_cast<UMaterialInstanceConstant*>(StaticConstructObject(micClass, TransientPackage(), 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
+            if (!mic) continue;
+            KeepAlive(mic);
+            mic->SetParent(parent);
+            mic->SetScalarParameterValue(param, from);
+            UMaterialInterface* orig = (overrides->Data && i < overrides->Num) ? static_cast<UMaterialInterface**>(overrides->Data)[i] : nullptr;
+            comp->SetMaterial(i, mic);
+            f.mats.push_back({ comp, i, orig, mic });
+        }
+    }
+    f.time = time > 0.05f ? time : 0.3f;
+    f.left = f.mats.empty() ? 0.0f : f.time;
+    f.from = from; f.to = to; f.restore = restore;
+    return static_cast<int>(f.mats.size());
+}
+static void TpFadeTick(TpFade& f, float dt) {
+    if (f.left <= 0.0f) return;
+    f.left -= dt;
+    float a = f.left > 0.0f ? 1.0f - f.left / f.time : 1.0f;
+    static FName param("F_Firy_Amount");
+    for (auto& m : f.mats) if (m.mic) m.mic->SetScalarParameterValue(param, f.from + (f.to - f.from) * a);
+    if (f.left <= 0.0f && f.restore) TpFadeEnd(f);
+}
+
+static TpFade g_tpArriveFade;
+// Take-off flakes where he stood (4.0.1, 17:1x): each vanishing effect is spawned free (not attached) at its bone's
+// world position and orientation on the casting body, moved back to the take-off spot (the Blink's
+// m_OriginalActorLocation +0xB0 - the pawn may already have moved this frame). The effects are bone-aligned bursts
+// (Assassins_Disap_Spine_01 / _LegArm_01), so they need no mesh to come off. (A frozen copy of the body to carry them,
+// builds 4d344490-cb179bcf, never drew - placed ~45 m off with no pose - and is gone.)
+// More pronounced than the assassins' own (user 17:17, clip 17-17-32: hardly seen behind Blink's motion blur): every
+// effect of the list three times at 1.6x, plus the head, chest, hands and feet (the list's spine effect on the head
+// and chest, its limb effect on the hands and feet).
+constexpr int kFlakeCopies = 3;
+constexpr float kFlakeScale = 1.6f;
+struct TpFlakePoint { FName bone; UObject* ps; };
+static int TpFlakePoints(RawArray* fx, TpFlakePoint* out, int cap) {
+    int n = 0;
+    UObject* spine = nullptr, * limb = nullptr;
+    for (int i = 0; fx && fx->Data && i < fx->Num && n < cap; ++i) {
+        auto& e = static_cast<FDisTeleportSpellFX*>(fx->Data)[i];
+        if (!e.m_pParticles) continue;
+        out[n++] = { e.m_BoneName, e.m_pParticles };
+        if (e.m_BoneName.ToString().find("spine") != std::string::npos) spine = e.m_pParticles;
+        else limb = e.m_pParticles;
+    }
+    static const char* const kExtra[] = { "head_jnt", "spine_2_jnt", "hand_L_jnt", "hand_R_jnt", "foot_L_jnt", "foot_R_jnt" };
+    for (int i = 0; i < 6 && n < cap; ++i) {
+        UObject* ps = i < 2 ? (spine ? spine : limb) : (limb ? limb : spine);
+        if (ps) out[n++] = { FName(kExtra[i]), ps };
+    }
+    return n;
+}
+static void TpScaleEmitter(UParticleSystemComponent* c) { if (c) c->SetScale(kFlakeScale); }
+
+// Take-off flakes where he stood (4.0.1, 17:1x): each vanishing effect is spawned free (not attached) at its bone's
+// world position and orientation on the casting body, moved back to the take-off spot (the Blink's
+// m_OriginalActorLocation +0xB0 - the pawn may already have moved this frame). The effects are bone-aligned bursts
+// (Assassins_Disap_Spine_01 / _LegArm_01), so they need no mesh to come off. (A frozen copy of the body to carry them,
+// builds 4d344490-cb179bcf, never drew - placed ~45 m off with no pose - and is gone.)
+static void TpDepartFlakes(APawn* pawn, uint8_t* blink, uint8_t* tweaks) {
+    USkeletalMeshComponent* body = g_shadowArms;
+    if (!tweaks || !body || !pawn) return;
+    FVector from = *reinterpret_cast<FVector*>(blink + 0xB0);   // m_OriginalActorLocation
+    FVector shift = { from.X - pawn->Location.X, from.Y - pawn->Location.Y, from.Z - pawn->Location.Z };
+    TpFlakePoint pts[24];
+    int n = TpFlakePoints(reinterpret_cast<RawArray*>(tweaks + 0xC8), pts, 24);   // m_BoneSpecificDisappearanceFXs
+    int spawned = 0;
+    for (int i = 0; i < n; ++i) {
+        // BoneXf (SpaceBases x LocalToWorld), not GetBoneMatrix: its FMatrix return through ProcessEvent overruns the
+        // stack (build 83; crash 17:13:32 with build 9b895362).
+        Xf x;
+        if (!BoneXf(body, pts[i].bone.ToString().c_str(), x)) continue;
+        FVector at;
+        FRotator rot;
+        float scale;
+        XfDecompose(x, at, rot, scale);
+        at.X += shift.X; at.Y += shift.Y; at.Z += shift.Z;
+        for (int k = 0; k < kFlakeCopies; ++k)
+            if (auto* c = SpawnEmitterAt(pts[i].ps, at, rot)) { TpScaleEmitter(c); ++spawned; }
+    }
+    SpawnEmitterAt(*reinterpret_cast<UObject**>(tweaks + 0xC4), from, pawn->Rotation);   // m_pDisappearanceFX
+    static int logged = 0;
+    if (logged++ < 10) Log("third person blink: %d take-off flake effect(s) at (%.0f %.0f %.0f), pawn moved %.0f uu already", spawned,
+                           from.X, from.Y, from.Z, sqrtf(shift.X * shift.X + shift.Y * shift.Y + shift.Z * shift.Z));
+}
+
+// Arrival flakes: the reappearing effects attached to the body's bones, as pronounced as the take-off ones.
+static int TpArriveFlakes(uint8_t* tweaks) {
+    USkeletalMeshComponent* body = g_shadowArms;
+    if (!tweaks || !body) return 0;
+    TpFlakePoint pts[24];
+    int n = TpFlakePoints(reinterpret_cast<RawArray*>(tweaks + 0xD8), pts, 24);   // m_BoneSpecificReappearanceFXs
+    int spawned = 0;
+    for (int i = 0; i < n; ++i) {
+        if (body->MatchRefBone(pts[i].bone) < 0) continue;
+        for (int k = 0; k < kFlakeCopies; ++k)
+            if (auto* c = SpawnEmitterOnBone(pts[i].ps, body, pts[i].bone)) { TpScaleEmitter(c); ++spawned; }
+    }
+    return spawned;
+}
+
+static UDishonoredActivePowerComponent_Blink* TpMovingBlink(ADishonoredPlayerPawn* pawn) {
+    if (!pawn) return nullptr;
+    auto* arr = reinterpret_cast<RawArray*>(&pawn->m_ActivePowers);
+    UClass* blinkClass = UDishonoredActivePowerComponent_Blink::StaticClass();
+    for (int i = 0; arr->Data && i < arr->Num && i < 16; ++i) {
+        auto* c = static_cast<UObject**>(arr->Data)[i];
+        if (!c || !c->IsA(blinkClass)) continue;
+        auto* b = reinterpret_cast<uint8_t*>(c);
+        if ((*reinterpret_cast<uint32_t*>(b + 0xA0) & 1) && b[0xC9] == 1) return static_cast<UDishonoredActivePowerComponent_Blink*>(c);
+    }
+    return nullptr;
+}
+
+// Camera lens effects (Blink's end-of-blink burst, the arrival cloud - DisTweaks_Blink m_pCooldownEffect, and the like)
+// are emitters the game places in front of its own first-person view each frame (AEmitterCameraLensEffectBase::
+// UpdateLocation @0x89D5D0). In third person that is Corvo's head, so the burst showed around him (clip 17-00-46; the
+// user: gone in third person, kept in first person). While third person is shown they are placed far below the world.
+using LensUpdateLocation_t = void(__thiscall*)(void*, const FVector*, const FRotator*, float);
+static LensUpdateLocation_t g_origLensUpdateLocation = nullptr;
+static void __fastcall HookedLensUpdateLocation(void* self, void*, const FVector* loc, const FRotator* rot, float fov) {
+    if (g_tpShown && loc) {
+        FVector away = { loc->X, loc->Y, loc->Z - 100000.0f };
+        g_origLensUpdateLocation(self, &away, rot, fov);
+        return;
+    }
+    g_origLensUpdateLocation(self, loc, rot, fov);
+}
+static void HookLensEffects() {
+    const uint8_t expect[] = { 0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0 };
+    if (memcmp(reinterpret_cast<void*>(0x0089D5D0), expect, sizeof(expect)) == 0 &&
+        MH_CreateHook(reinterpret_cast<void*>(0x0089D5D0), reinterpret_cast<void*>(&HookedLensUpdateLocation),
+                      reinterpret_cast<void**>(&g_origLensUpdateLocation)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(0x0089D5D0)) == MH_OK) Log("camera lens effects hooked (out of the view in third person)");
+    else Log("WARNING: could not hook the camera lens effects");
+}
+
+static void UpdateTpBlinkFx(ADishonoredPlayerPawn* pawn, float dt) {
+    static bool wasMoving = false;
+    TpFadeTick(g_tpArriveFade, dt);
+    if (g_tpBlinkCamLeft > 0.0f) g_tpBlinkCamLeft = g_tpShown ? g_tpBlinkCamLeft - dt : 0.0f;
+    UDishonoredActivePowerComponent_Blink* blink = TpMovingBlink(pawn);
+    bool moving = blink != nullptr;
+    if (moving != wasMoving) {
+        static int logged = 0;
+        if (logged++ < 40) Log("third person blink: %s %s (third person %s)", moving ? "move starts" : "move ends",
+                               moving ? blink->Class->GetName().c_str() : "", g_tpShown ? "shown" : "not shown");
+    }
+    if (!g_tpShown) {
+        if (g_tpBlinkHidden) g_tpBlinkHidden = false;
+        if (!g_tpArriveFade.mats.empty()) TpFadeEnd(g_tpArriveFade);
+        wasMoving = moving;
+        return;
+    }
+    if (moving == wasMoving) return;
+    wasMoving = moving;
+    auto* t = reinterpret_cast<uint8_t*>(TpTeleportTweaks());
+    USkeletalMeshComponent* parts[] = { g_shadowArms, g_head, g_itemShadow[0], g_itemShadow[1] };
+    if (moving) {   // vanish: a dissolving copy stays where he stood; the body is gone for the move
+        TpFadeEnd(g_tpArriveFade);
+        g_tpBlinkCamFrom = g_tpLastCam;   // the camera stays here a moment, then follows
+        g_tpBlinkCamLeft = kTpBlinkCamHold + kTpBlinkCamGlide;
+        TpDepartFlakes(pawn, reinterpret_cast<uint8_t*>(blink), t);
+        if (t) if (auto* snd = *reinterpret_cast<UAkEvent**>(t + 0xE4)) pawn->PostAkEvent(snd);
+        g_tpBlinkHidden = true;
+        for (auto* p : parts) if (p && !p->HiddenGame) p->SetHidden(true);
+    } else {        // reappear: the black flakes on the body (the fade-in only where a material has the parameter)
+        g_tpBlinkHidden = false;
+        for (auto* p : parts) if (p && p->HiddenGame) p->SetHidden(false);
+        float fadeIn = 0.3f;
+        int arrived = 0;
+        if (t && g_shadowArms) {   // the assassins' black flakes (the smoke the user meant was Blink's own lens burst)
+            arrived = TpArriveFlakes(t);
+            if (auto* snd = *reinterpret_cast<UAkEvent**>(t + 0xE8)) pawn->PostAkEvent(snd);
+            fadeIn = *reinterpret_cast<float*>(t + 0xF8);   // m_fReappearanceFadeInTime
+        }
+        UMeshComponent* comps[] = { g_shadowArms, g_head, g_itemShadow[0], g_itemShadow[1] };
+        int mats = TpFadeStart(g_tpArriveFade, comps, 4, fadeIn, 1.0f, 0.0f, true);
+        static int logged = 0;
+        if (logged++ < 10) Log("third person blink: reappeared, %d arrival flake effect(s), %d material(s) fading in (settings %s)", arrived, mats, t ? "found" : "missing");
+    }
+}
+
 static void OnPlayerTick() {
     // (Build 201: the F6-F11 development keys - body on/off, arm hiding, attach mode, ini reload, leg axis, debug
     // dump - are gone: they clashed with players' bindings and nothing is meant to be adjusted in game.)
@@ -11396,6 +11671,7 @@ static void OnPlayerTick() {
     UpdateVisibility(pawn);
     PhysProbe("UpdateVisibility");
     UpdateThirdPerson(pawn);
+    { static LONGLONG blinkQpc = 0; UpdateTpBlinkFx(pawn, QpcDt(blinkQpc)); }
     PhysProbe("UpdateThirdPerson");
     DiagHeadShadow();
     PhysProbe("DiagHeadShadow");
@@ -12329,6 +12605,16 @@ static void ThirdPersonViewPoint(APlayerController* pc, FVector* loc, FRotator* 
     loc->X = pivot.X + off.X * s;
     loc->Y = pivot.Y + off.Y * s;
     loc->Z = pivot.Z + off.Z * s;
+    if (g_tpBlinkCamLeft > 0.0f) {   // a blink: watch from where you stood, then follow (UpdateTpBlinkFx)
+        float gone = kTpBlinkCamHold + kTpBlinkCamGlide - g_tpBlinkCamLeft;
+        float a = Clamp((gone - kTpBlinkCamHold) / kTpBlinkCamGlide, 0.0f, 1.0f);
+        a = a * a * (3.0f - 2.0f * a);
+        loc->X = g_tpBlinkCamFrom.X + (loc->X - g_tpBlinkCamFrom.X) * a;
+        loc->Y = g_tpBlinkCamFrom.Y + (loc->Y - g_tpBlinkCamFrom.Y) * a;
+        loc->Z = g_tpBlinkCamFrom.Z + (loc->Z - g_tpBlinkCamFrom.Z) * a;
+    } else {
+        g_tpLastCam = *loc;
+    }
     static DWORD lastLog = 0;
     if (GetTickCount() - lastLog > 5000 && g_tpBlend >= 1.0f) {
         lastLog = GetTickCount();
@@ -12626,6 +12912,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     HookPowerText();
     PatchPullFieldLoads();   // 3.4: Daud's Pull again (Windblast slot)
     InstallPullPeople();
+    HookLensEffects();
     HookSummonSpawn();
     {
         const uint8_t pro[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68 };
