@@ -60,12 +60,15 @@ const wchar_t* const kChars3It[] = { L"Corvo", L"Daud", L"Supervisore" };
 // Summoned NPC (Summon Assassin power, 3.1): the regular whaler, Corvo's / Daud's player model, or an Overseer hound ("Doggy!").
 const wchar_t* const kSummonEn[] = { L"Assassin", L"Corvo", L"Daud", L"Doggy!" };
 const wchar_t* const kSummonIt[] = { L"Assassino", L"Corvo", L"Daud", L"Cagnolino!" };
+// Windblast slot (3.4): Corvo's Windblast or Daud's Pull (Brigmore Witches), with either power set.
+const wchar_t* const kWindEn[] = { L"Windblast", L"Pull" };
+const wchar_t* const kWindIt[] = { L"Raffica di vento", L"Attrazione" };
 const wchar_t* const kGroupsEn[] = { L"Character" };
 const wchar_t* const kGroupsIt[] = { L"Personaggio" };
 
-PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body (with its arms) and blade, Corvo's or Daud's powers, crossbow and jump, and who Summon Assassin brings (needs CorvoBody)", L"Choose Body", 1 };
+PluginInfo g_info = { L"Body Swap", L"Choose Corvo's, Daud's or the Overseer disguise's body (with its arms) and blade, Corvo's or Daud's powers, crossbow and jump, who Summon Assassin brings, and Windblast or Daud's Pull (needs CorvoBody)", L"Choose Body", 1 };
 
-MenuItem g_items[7] = {
+MenuItem g_items[8] = {
     { 2, L"Status", 2, kStatusEn, 0, 0, 1, 0, -1 },
     { 1, L"Body",   3, kChars3En, 0, 0, 1, 0,  0 },
     { 1, L"Blade",  3, kChars3En, 0, 0, 1, 0,  0 },
@@ -73,14 +76,15 @@ MenuItem g_items[7] = {
     { 1, L"Crossbow", 2, kChars,  0, 0, 1, 0,  0 },
     { 1, L"Jump", 2, kChars,      0, 0, 1, 0,  0 },   // Agility: Corvo's double jump / Daud's one continuous jump
     { 1, L"Summoned NPC", 4, kSummonEn, 0, 0, 1, 0, 0 },   // Summon Assassin: who comes (assassin / Corvo / Daud / an Overseer hound)
+    { 1, L"Windblast", 2, kWindEn, 0, 0, 1, 0, 0 },        // the Windblast slot: Windblast / Daud's Pull
 };
 
 // Menu rows: [1] body, [2] blade, [3] power set, [4] crossbow, [5] jump (0 Corvo, 1 Daud, 2 Overseer for 1-2),
-// [6] summoned NPC (0 assassin, 1 Corvo, 2 Daud, 3 Overseer hound).
-// CorvoBody parts: 0 body, 1 arms (= body), 2 blade, 3 powers, 4 crossbow, 5 jump, 6 summoned assassins.
-volatile LONG g_value[7] = { 0, 0, 0, 0, 0, 0, 0 };
-const int kPartOfRow[7] = { -1, 0, 2, 3, 4, 5, 6 };
-const int kRows = 7;
+// [6] summoned NPC (0 assassin, 1 Corvo, 2 Daud, 3 Overseer hound), [7] Windblast slot (0 Windblast, 1 Daud's Pull).
+// CorvoBody parts: 0 body, 1 arms (= body), 2 blade, 3 powers, 4 crossbow, 5 jump, 6 summoned assassins, 7 Windblast slot.
+volatile LONG g_value[8] = { 0, 0, 0, 0, 0, 0, 0, 1 };
+const int kPartOfRow[8] = { -1, 0, 2, 3, 4, 5, 6, 7 };
+const int kRows = 8;
 
 int MaxValue(int idx) { return idx == 6 ? 3 : (idx >= 1 && idx <= 2) ? 2 : 1; }
 volatile LONG g_enabled = 1;
@@ -117,6 +121,7 @@ void Push() {
     g_set(4, on ? g_value[4] : 0);
     g_set(5, on ? g_value[5] : 0);
     g_set(6, on ? g_value[6] : 0);   // (an older CorvoBody ignores part 6)
+    g_set(7, on ? g_value[7] : 0);   // disabled: Windblast
 }
 
 int __cdecl GetValue(int idx) {
@@ -141,7 +146,7 @@ extern "C" {
 __declspec(dllexport) void __cdecl Plg_Init(const char* lang) {
     g_italian = lang && lang[0] == 'I' && lang[1] == 'T' && lang[2] == 'A';
     if (g_italian) {
-        g_info.description = L"Scegli corpo (con le sue braccia) e lama di Corvo, di Daud o del travestimento da Supervisore, poteri, balestra e salto di Corvo o di Daud, e chi arriva con Evoca assassino (richiede CorvoBody)";
+        g_info.description = L"Scegli corpo (con le sue braccia) e lama di Corvo, di Daud o del travestimento da Supervisore, poteri, balestra e salto di Corvo o di Daud, chi arriva con Evoca assassino, e Raffica di vento o Attrazione di Daud (richiede CorvoBody)";
         g_info.title = L"Scegli corpo";
         g_items[0].label = L"Stato";
         g_items[0].choices = kStatusIt;
@@ -152,6 +157,8 @@ __declspec(dllexport) void __cdecl Plg_Init(const char* lang) {
         g_items[5].label = L"Salto";
         g_items[6].label = L"PNG evocati";
         g_items[6].choices = kSummonIt;
+        g_items[7].label = L"Raffica di vento";
+        g_items[7].choices = kWindIt;
         for (int i = 1; i <= 2; ++i) g_items[i].choices = kChars3It;
         g_menu.groupNames = kGroupsIt;
     }

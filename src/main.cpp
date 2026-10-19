@@ -245,7 +245,7 @@ struct Settings {
     float climbReachTime = 0.32f;    // ...seconds for a reach to the next grip (shorter when climbing fast)
     float climbHandSpread = 2.0f;    // ...each hand this far to its side of the chain
     float climbArmNearScale = 0.3f;  // ...the arm skin's near-camera guard limits scaled by this while climbing (the hands are at the face by design)
-    bool preloadDaudForSaves = true; // (2026-10-13 08:51 crash) a save with Daud's wristbow bolts lying around crashed on load (assert Array.h:596): load Daud's package before a level is restored, when a Daud choice is on and the bolt objects aren't in memory
+    bool preloadDaudForSaves = true; // (2026-10-13 08:51 crash) a save with Daud's wristbow bolts lying around crashed on load (assert Array.h:596): load Daud's package before a level is restored when the bolt objects aren't in memory (3.3: whatever the Body Swap choices are)
     bool fixTimerResolution = true;  // (2026-10-13, 23:36 clip: the turn skipped 4 times a second, the game time moving in 15.6 ms ticks) the game asks Windows for a 1 ms timer once at start-up; make Windows honour it (opt out of power throttling of timer requests) and ask again
     bool hdNearMissLog = false;      // (off for the 3.1 release) (2026-10-13, exact HD matching) log a texture the OLD similarity test would have taken but whose bytes aren't a player map's (once per picture) - field proof the exact prints hold
     bool frameTimingLog = false;     // (off for the 3.1 release) (2026-10-12 23:4x, user: "stutter when moving the camera left or right") every 5 s: frame pacing, Present, vsync/window mode, timer granularity and CorvoBody's own per-frame cost (log only)
@@ -403,6 +403,18 @@ struct Settings {
     float leanSideSign = 1.0f;      // flip (-1) if the body tilts away from the lean
     float leanPivotHeight = 50.0f;  // uu from the spine pivot up to the shoulders (smaller = more tilt per uu of lean)
     float sprintBodyBack = 12.0f;   // uu the visible body eases back while sprinting (hides the collar/neck)  // re-measure the camera arc during play (off: built-in clean measurement)
+    // Third-person mode (4.0): V on the keyboard, L3 + R3 together on a pad. The casting body (the shadow's, with the
+    // weapon arms, the head and the item copies) is shown; the first-person arms and the visible body are hidden.
+    bool thirdPerson = true;        // the toggle exists at all
+    float tpDistance = 150.0f;      // uu the camera sits behind the eyes
+    float tpSide = 38.0f;           // uu to the right (over the shoulder)
+    float tpUp = 12.0f;             // uu up
+    float tpBlendTime = 0.35f;      // seconds to swing in or out
+    float tpWallPad = 14.0f;        // uu kept between the camera and a wall it was pulled in by
+    bool tpFreeOrbit = true;        // holstered: the camera orbits freely, the body turns to where it walks (4.0)
+    float tpTurnSpeed = 540.0f;     // deg/s the body turns at most (free orbit)
+    float tpAimPitchMin = -20.0f;   // third person: the weapon arms and the body lean follow the view's pitch only this far
+    float tpAimPitchMax = 25.0f;    // (the 1P hands swing with the whole look range; from outside that folded Corvo up)
 };
 static Settings g_cfg;
 static char g_iniPath[MAX_PATH];   // the mod's folder (log, data files); CorvoBody.ini itself is no longer read
@@ -433,6 +445,7 @@ static volatile LONG g_bowChar = 0;     // 1 = Daud's wristbow
 static volatile LONG g_powerChar = 0;   // 1 = Daud's power set
 static volatile LONG g_jumpChar = 0;    // Agility's power jump: 0 Corvo's double jump, 1 Daud's one continuous jump
 static volatile LONG g_summonChar = 0;  // (3.1) Summon Assassin: who comes - 0 the regular assassin, 1 Corvo, 2 Daud, 3 an Overseer hound ("Doggy!")
+static volatile LONG g_pullChar = 1;    // (3.4) Windblast slot: 0 Corvo's Windblast, 1 Daud's Pull (with either power set)
 static volatile LONG g_charsSet = 0;   // 1 once the ini or the plugin has set them (the plugin may run first)
 
 static void LoadSettings() {
@@ -446,6 +459,7 @@ static void LoadSettings() {
         g_powerChar = SettingInt("PowerCharacter", 0) == 1 ? 1 : 0;
         g_jumpChar = SettingInt("JumpCharacter", 0) == 1 ? 1 : 0;
         { int v = SettingInt("SummonCharacter", 0); g_summonChar = (v >= 0 && v <= 3) ? v : 0; }
+        g_pullChar = SettingInt("WindblastPull", 1) == 1 ? 1 : 0;
     }
     auto readBool = [](const char* key, bool def) {
         return SettingInt(key, def ? 1 : 0) != 0;
@@ -678,6 +692,17 @@ static void LoadSettings() {
         SettingString("CrouchHideBone", "spine_3_jnt", bone, sizeof(bone));
         strncpy(g_cfg.crouchHideBone, bone, sizeof(g_cfg.crouchHideBone) - 1);
     }
+    auto clampf = [](float v, float lo, float hi) { return std::min(std::max(v, lo), hi); };
+    g_cfg.thirdPerson = readBool("ThirdPerson", g_cfg.thirdPerson);
+    g_cfg.tpDistance = clampf(readFloat("ThirdPersonCameraDistance", g_cfg.tpDistance), 40.0f, 400.0f);
+    g_cfg.tpSide = clampf(readFloat("ThirdPersonCameraSide", g_cfg.tpSide), -120.0f, 120.0f);
+    g_cfg.tpUp = clampf(readFloat("ThirdPersonCameraUp", g_cfg.tpUp), -60.0f, 120.0f);
+    g_cfg.tpBlendTime = clampf(readFloat("ThirdPersonBlendTime", g_cfg.tpBlendTime), 0.05f, 2.0f);
+    g_cfg.tpWallPad = clampf(readFloat("ThirdPersonWallPad", g_cfg.tpWallPad), 0.0f, 60.0f);
+    g_cfg.tpFreeOrbit = readBool("ThirdPersonFreeOrbit", g_cfg.tpFreeOrbit);
+    g_cfg.tpTurnSpeed = clampf(readFloat("ThirdPersonTurnSpeed", g_cfg.tpTurnSpeed), 90.0f, 2000.0f);
+    g_cfg.tpAimPitchMin = clampf(readFloat("ThirdPersonAimPitchMin", g_cfg.tpAimPitchMin), -90.0f, 0.0f);
+    g_cfg.tpAimPitchMax = clampf(readFloat("ThirdPersonAimPitchMax", g_cfg.tpAimPitchMax), 0.0f, 90.0f);
     Log("animation: RunBlend %.0f..%.0f WalkAnimRate=%.2f RunAnimRate=%.2f", g_cfg.runBlendStart, g_cfg.runBlendEnd, g_cfg.walkAnimRate, g_cfg.runAnimRate);
     Log("settings: Enabled=%d HideBodyArms=%d AttachMode=%d Offset=(%.1f %.1f %.1f)", g_cfg.enabled,
         g_cfg.hideArms, g_cfg.attachMode, g_cfg.offsetX, g_cfg.offsetY, g_cfg.offsetZ);
@@ -827,6 +852,12 @@ static USkeletalMeshComponent* g_shadowBody = nullptr;   // hidden full body (co
 static USkeletalMeshComponent* ShadowCasterComp();
 static USkeletalMeshComponent* g_holsterCast = nullptr;   // hidden, shadow-only body that stays in the HOLSTERED pose with weapons out; its forearms and hands are folded away, so it adds only the holstered shoulders + upper arms to the shadow (user 17:38: "keep the shoulder shadows from the holstered arm shadows always on")
 static USkeletalMeshComponent* g_shadowArms = nullptr;   // hidden full body that is the SOLE shadow caster: same pose, but a weapon-side arm is posed to hold the weapon instead of shrunk (UpdateArmSkin shrinks g_shadowBody's so the visible skin arm hides)
+// Third-person mode (4.0, UpdateThirdPerson / ThirdPersonViewPoint)
+static bool g_tpOn = false;       // the player's choice (V / L3 + R3)
+static float g_tpBlend = 0.0f;    // camera swing 0 = eyes .. 1 = behind the shoulder
+static bool g_tpShown = false;    // the casting body is drawn and the first-person meshes are hidden from the view
+static float g_tpFrac = 1.0f;     // share of the camera distance free of walls (eased back out)
+static float g_tpYawOffDeg = 0.0f;   // free orbit: the bodies' yaw against the pawn's (deg, + = right of the camera's heading)
 
 static thread_local int g_inHook = 0;
 
@@ -1504,7 +1535,11 @@ static void UpdateLean(ADishonoredPlayerPawn* pawn) {
     g_viewPitchDeg = deg;
     // No lean while the legs own a special pose or the body is airborne/climbing.
     bool allowed = !g_isSliding && !g_isClimbing;
-    float lean = deg > 0.0f ? deg * g_cfg.leanUp : deg * g_cfg.leanDown;
+    float leanDeg = deg;
+    // Third person (clip 14-16-22: looking down Corvo folded over his knees): holstered no look lean at all - in free orbit
+    // the body may face the camera - and with a weapon out only the aim range (ThirdPersonAimPitchMin/Max).
+    if (g_tpShown) leanDeg = (g_leftHandBusy || g_rightHandBusy) ? Clamp(deg, g_cfg.tpAimPitchMin, g_cfg.tpAimPitchMax) : 0.0f;
+    float lean = leanDeg > 0.0f ? leanDeg * g_cfg.leanUp : leanDeg * g_cfg.leanDown;
     lean = allowed ? Clamp(lean, -g_cfg.leanMax, g_cfg.leanMax) : 0.0f;
     if (g_slideAmount > 0.0f && !g_isClimbing) lean = g_slideAmount * g_cfg.slideRecline;   // slide: recline (back)
     static float smoothed = 0.0f;
@@ -1570,7 +1605,7 @@ static ArmPose ShadowArmPose(int hand) {
 
 // 0..1 how far a free hand's arm floats up in front while jumping/falling (eased with the jump pose).
 static float JumpArmAmount(int hand) {
-    if (!g_cfg.jumpArms) return 0.0f;
+    if (!g_cfg.jumpArms || g_tpShown) return 0.0f;   // (third person: the view-held jump hands raised the arms in front of the face)
     bool busy = hand == 0 ? g_leftHandBusy : g_rightHandBusy;
     return busy ? 0.0f : g_jumpAmount;
 }
@@ -3116,7 +3151,7 @@ static void UpdateCoat() {
             // Standing and looking down: the hanging arms sat just below the bottom of the view (user, video
             // 14-55-18; they only showed when the sprint swing brought them forward). Swing them forward from the
             // shoulder as the view tilts down, visible body only.
-            float down = Clamp(-g_viewPitchDeg / 45.0f, 0.0f, 1.0f) * (1.0f - crouchAmount);
+            float down = g_tpShown ? 0.0f : Clamp(-g_viewPitchDeg / 45.0f, 0.0f, 1.0f) * (1.0f - crouchAmount);   // (third person: no reason to)
             // (the arm skin copies the shadow body's pose - it needs the swing too, or looking down the arms stayed out
             // of view, 17:10)
             bool forward = !hide && (!isShadow || g_armSkinOn) && g_cfg.armForwardDeg != 0.0f && down > 0.01f;
@@ -4248,6 +4283,26 @@ static void UpdateCastingArmReach(ADishonoredPlayerPawn* pawn) {
             continue;
         }
         Xf w1 = drawn(XfMul(a1, L1));
+        // Third person (clip 14-16-22): the 1P hands swing with the view's whole pitch, so looking down the sword arm (and
+        // the sword copy riding this hand) reached for the feet and the body folded after it. Turn the target about the
+        // eyes, round the heading's left axis, back to the pitch clamped to ThirdPersonAimPitchMin/Max.
+        if (g_tpShown) {
+            float a = (Clamp(g_viewPitchDeg, g_cfg.tpAimPitchMin, g_cfg.tpAimPitchMax) - g_viewPitchDeg) * 0.0174533f;
+            if (fabsf(a) > 1e-4f) {
+                float hy = pawn->Rotation.Yaw * (6.2831853f / 65536.0f);
+                const float ax[3] = { sinf(hy), -cosf(hy), 0.0f };   // + a about this raises the aim (left x forward = up)
+                float ca = cosf(a), sa = sinf(a);
+                auto turn = [&](float* v) {   // Rodrigues
+                    float d = ax[0] * v[0] + ax[1] * v[1] + ax[2] * v[2];
+                    float c[3] = { ax[1] * v[2] - ax[2] * v[1], ax[2] * v[0] - ax[0] * v[2], ax[0] * v[1] - ax[1] * v[0] };
+                    for (int i = 0; i < 3; ++i) v[i] = v[i] * ca + c[i] * sa + ax[i] * d * (1.0f - ca);
+                };
+                for (int i = 0; i < 3; ++i) turn(w1.m[i]);
+                float rel[3] = { w1.t[0] - g_viewLoc.X, w1.t[1] - g_viewLoc.Y, w1.t[2] - g_viewLoc.Z };
+                turn(rel);
+                w1.t[0] = g_viewLoc.X + rel[0]; w1.t[1] = g_viewLoc.Y + rel[1]; w1.t[2] = g_viewLoc.Z + rel[2];
+            }
+        }
         // Keep an elbow: pull a target beyond CastReachMax of the arm's length back toward the shoulder (this body's
         // upper arm + forearm, measured off its own bones; constant now that nothing stretches them).
         if (g_cfg.castReachMax > 0.0f && g_cfg.castReachMax < 1.0f) {
@@ -4915,14 +4970,14 @@ static void UpdateVisibility(ADishonoredPlayerPawn* pawn) {
         lastPhys = phys;
         if (airFrames > 0) {
             --airFrames;
-            if (firstPerson && g_cfg.takeoffHide) { firstPerson = false; why = "take-off"; }
+            if (firstPerson && g_cfg.takeoffHide && !g_tpShown) { firstPerson = false; why = "take-off"; }   // (third person: the camera is well clear)
         }
     }
     UpdateViewGuard(pawn, firstPerson);
     // Clip guard: if the camera gets inside the body (hips/thighs/knees near the view point), first push the visible
     // body back/down away from the camera (SyncTransform applies g_clipPush) so the legs stay in view; only if that
     // is not enough, hide it (held 0.15 s). Hiding alone made the legs vanish out of a slide (user).
-    if (firstPerson && g_cfg.clipGuardDist > 0.0f && GetTickCount() - g_viewLocTick < 500) {
+    if (firstPerson && !g_tpShown && g_cfg.clipGuardDist > 0.0f && GetTickCount() - g_viewLocTick < 500) {
         static const char* kGuard[7] = { "spine_0_jnt", "spine_1_jnt", "upper_leg_L_jnt", "upper_leg_R_jnt", "lower_leg_L_jnt", "lower_leg_R_jnt", "Root_jnt" };
         static DWORD clipUntil = 0, lastT = 0;
         DWORD nowG = GetTickCount();
@@ -4993,6 +5048,98 @@ static void UpdateVisibility(ADishonoredPlayerPawn* pawn) {
         Log("body %s%s%s", firstPerson ? "shown" : "hidden (", why, firstPerson ? "" : ")");
     g_lastHideWhy = firstPerson ? nullptr : why;
     shown = want;
+}
+
+// Third-person mode (4.0). The casting body already is a whole Corvo/Daud/Overseer - coat, legs, a head, arms that
+// reach for the first-person hands and copies of the held items - drawn only into the shadow (bCastHiddenShadow). In
+// third person it is drawn for real; the visible first-person body and arm skin are hidden, and the game's 1P arms and
+// everything attached to them are kept out of the player's own view with bOwnerNoSee (not HiddenGame: the game and
+// UpdateSlideOnePArms use that, and the arms must keep animating - the casting arms and the camera follow them).
+// g_holsterCast, the shoulder blobs and g_shadowBody stay shadow-only. The camera is ThirdPersonViewPoint.
+static void SetOwnerNoSeeIf(UPrimitiveComponent* c, bool v) {
+    if (c && (c->bOwnerNoSee != 0) != v) c->SetOwnerNoSee(v);
+}
+
+static bool IsOurComponent(UActorComponent* c) {
+    if (!c) return false;
+    UActorComponent* ours[] = { g_body, g_armSkin, g_shadowBody, g_shadowArms, g_holsterCast, g_head, g_itemShadow[0], g_itemShadow[1],
+                                g_armsShadow, g_shoulderBlob[0], g_shoulderBlob[1] };
+    for (UActorComponent* o : ours) if (o && o == c) return true;
+    return false;
+}
+
+static void UpdateThirdPerson(ADishonoredPlayerPawn* pawn) {
+    static LONGLONG qpc = 0;
+    float dt = QpcDt(qpc);
+    // The 1P meshes we took out of the view: restored by pointer, and only while still on the arms (a weapon swap
+    // destroys the old item component - a stale pointer is never touched).
+    static UPrimitiveComponent* hiddenByUs[48];
+    static int hiddenCount = 0;
+    static USkeletalMeshComponent* armsHidden = nullptr;
+    auto* pc = pawn ? static_cast<APlayerController*>(pawn->Controller) : nullptr;
+    bool can = g_cfg.thirdPerson && pawn && pc && pawn == g_bodyPawn && g_body && g_bodyVisible && g_shadowArms && pawn->Mesh &&
+               !pc->bCinematicMode;
+    bool want = g_tpOn && can;
+    if (!can) g_tpBlend = 0.0f;   // cutscenes, loading, no casting body: straight back to the eyes
+    else g_tpBlend = Clamp(g_tpBlend + (want ? dt : -dt) / g_cfg.tpBlendTime, 0.0f, 1.0f);
+    // Swinging out the body appears at once; swinging back in the 1P view returns only near the eyes.
+    bool show = can && (want ? g_tpBlend > 0.0f : g_tpBlend > 0.15f);
+
+    auto attachments = [&](auto&& fn) {
+        struct RawAttachment { UActorComponent* Component; int32_t boneIndex, boneNumber; FVector RelLoc; FRotator RelRot; FVector RelScale; };
+        static_assert(sizeof(RawAttachment) == 0x30, "FAttachment is 0x30 bytes");
+        if (!pawn || !pawn->Mesh) return;
+        auto* att = reinterpret_cast<RawArray*>(&pawn->Mesh->Attachments);
+        for (int i = 0; att->Data && i < att->Num; ++i) {
+            UActorComponent* c = (static_cast<const RawAttachment*>(att->Data) + i)->Component;
+            if (c && !IsOurComponent(c) && c->IsA(UPrimitiveComponent::StaticClass())) fn(static_cast<UPrimitiveComponent*>(c));
+        }
+        for (int h = 0; h < 2; ++h) {
+            auto* item = static_cast<UDishonoredInventoryItem*>(g_handItem[h]);
+            if (item && item->m_pPlayerMesh && !IsOurComponent(item->m_pPlayerMesh)) fn(item->m_pPlayerMesh);
+        }
+    };
+
+    if (show) {
+        if (!g_tpShown) {
+            Log("third person: on (arms bOnlyOwnerSee %d bOwnerNoSee %d hidden %d | casting body %p head %p items %p %p)",
+                pawn->Mesh->bOnlyOwnerSee ? 1 : 0, pawn->Mesh->bOwnerNoSee ? 1 : 0, pawn->Mesh->HiddenGame ? 1 : 0,
+                g_shadowArms, g_head, g_itemShadow[0], g_itemShadow[1]);
+            hiddenCount = 0;
+        }
+        if (!g_body->HiddenGame) g_body->SetHidden(true);
+        g_body->bUpdateSkelWhenNotRendered = 1;
+        if (g_armSkin && !g_armSkin->HiddenGame) g_armSkin->SetHidden(true);
+        if (g_shadowArms->HiddenGame) g_shadowArms->SetHidden(false);
+        if (g_head && g_head->HiddenGame) g_head->SetHidden(false);
+        for (int h = 0; h < 2; ++h) if (g_itemShadow[h] && g_itemShadow[h]->HiddenGame) g_itemShadow[h]->SetHidden(false);
+        USkeletalMeshComponent* arms = pawn->Mesh;
+        arms->bUpdateSkelWhenNotRendered = 1;   // the casting arms and the camera ride its bones
+        arms->bIgnoreControllersWhenNotRendered = 0;
+        if (!arms->bOwnerNoSee) { arms->SetOwnerNoSee(true); armsHidden = arms; }
+        attachments([&](UPrimitiveComponent* c) {
+            if (c->bOwnerNoSee) return;
+            if (c->IsA(USkeletalMeshComponent::StaticClass())) static_cast<USkeletalMeshComponent*>(c)->bUpdateSkelWhenNotRendered = 1;
+            c->SetOwnerNoSee(true);
+            if (hiddenCount < 48) hiddenByUs[hiddenCount++] = c;
+            Log("third person: 1P %s %s out of the view", c->Class ? c->Class->GetName().c_str() : "?", c->GetName().c_str());
+        });
+    } else if (g_tpShown) {
+        if (g_body) g_body->SetHidden(!g_bodyVisible);
+        if (g_armSkin && g_armSkinOn && g_bodyVisible) g_armSkin->SetHidden(false);
+        if (g_shadowArms) g_shadowArms->SetHidden(true);
+        if (g_head) g_head->SetHidden(true);
+        for (int h = 0; h < 2; ++h) if (g_itemShadow[h]) g_itemShadow[h]->SetHidden(true);
+        if (pawn && pawn->Mesh && armsHidden == pawn->Mesh) pawn->Mesh->SetOwnerNoSee(false);
+        armsHidden = nullptr;
+        int back = 0;
+        attachments([&](UPrimitiveComponent* c) {
+            for (int i = 0; i < hiddenCount; ++i) if (hiddenByUs[i] == c) { if (c->bOwnerNoSee) { c->SetOwnerNoSee(false); ++back; } break; }
+        });
+        Log("third person: off (%d of %d 1P meshes back in the view)", back, hiddenCount);
+        hiddenCount = 0;
+    }
+    g_tpShown = show;
 }
 
 // Per frame: lift both feet by the crouch sink (standing cylinder - current), eased.
@@ -5830,6 +5977,8 @@ static void UpdateLocomotionBlend(ADishonoredPlayerPawn* pawn) {
         if (fabsf(alpha - loco->Child2WeightTarget) > 0.01f) loco->SetBlendTarget(alpha, 0.1f);
         for (int d = 0; d < 2; ++d) {
             UAnimNode* dir = ChildAnim(loco, d);
+            if (dir && dir->IsA(UAnimNodeBlendDirectional::StaticClass()))   // free orbit: directions against the body's facing
+                static_cast<UAnimNodeBlendDirectional*>(dir)->RotationOffset.Yaw = static_cast<int>(g_tpYawOffDeg * 65536.0f / 360.0f);
             for (int i = 0; i < 4; ++i)
                 if (auto* seq = static_cast<UAnimNodeSequence*>(ChildAnim(dir, i)))
                     seq->Rate = (d == 0 ? walkRate : runRate) * g_footRate[d][i] *
@@ -5841,6 +5990,44 @@ static void UpdateLocomotionBlend(ADishonoredPlayerPawn* pawn) {
 // Turning on the spot: measure the yaw rate; while standing still and turning faster than TurnStepThreshold, play
 // the guard's 45-degree turn step (left/right) at a rate proportional to the turn speed. Held for 0.25 s after the
 // turn stops so stick jitter doesn't flicker it. Instanced tree: Animations -> posture [0] -> BlendBySpeed [0].
+// Free orbit (4.0, user: "move the camera around the player freely whilst weapons are holstered"). The pawn - and so
+// the controller, the camera and WASD - keeps the game's own heading; only the drawn bodies turn. Holstered in third
+// person, they face where Corvo walks (velocity) and hold that facing when he stops, so the mouse/stick swings the camera
+// round him. A weapon or power in hand, a lean, a slide, a climb or a mantle turns them back to the camera's heading
+// (aiming stays as before). SyncTransform turns every body by g_tpYawOffDeg about the pawn's centre, the head with
+// them, and the walk/run directional blends get it as RotationOffset so the stride stays forward.
+static void UpdateFreeOrbit(ADishonoredPlayerPawn* pawn) {
+    static LONGLONG qpc = 0;
+    static float faceYaw = 0.0f;
+    float dt = QpcDt(qpc);
+    if (!pawn) return;
+    auto wrap = [](float a) { while (a > 180.0f) a -= 360.0f; while (a < -180.0f) a += 360.0f; return a; };
+    float pawnYaw = static_cast<int16_t>(pawn->Rotation.Yaw & 0xFFFF) * (360.0f / 65536.0f);
+    if (!g_tpShown || !g_cfg.tpFreeOrbit) {   // first person: in step with the pawn, nothing changes
+        faceYaw = pawnYaw;
+        g_tpYawOffDeg = 0.0f;
+        return;
+    }
+    int phys = static_cast<int>(pawn->Physics);
+    bool busy = g_leftHandBusy || g_rightHandBusy;
+    bool free = g_tpOn && !busy && !g_isSliding && g_slideAmount <= 0.0f && !g_isClimbing && phys != 9 && !g_mantleWant &&
+                fabsf(g_cornerLeanRight) < 8.0f;
+    float target = faceYaw;
+    if (!free) target = pawnYaw;
+    else {
+        FVector v = pawn->Velocity;
+        if (v.X * v.X + v.Y * v.Y > 30.0f * 30.0f) target = atan2f(v.Y, v.X) * (180.0f / 3.14159265f);
+    }
+    float d = wrap(target - faceYaw);
+    float maxStep = dt * g_cfg.tpTurnSpeed * (busy ? 1.6f : 1.0f);   // (drawing a weapon: round to the aim quicker)
+    float step = d * Clamp(dt * 10.0f, 0.0f, 1.0f);
+    faceYaw = wrap(faceYaw + Clamp(step, -maxStep, maxStep));
+    float off = wrap(faceYaw - pawnYaw);
+    static bool wasFree = false;
+    if (free != wasFree) { Log("free orbit: %s (body %.0f deg off the camera)", free ? "free" : "facing the camera", off); wasFree = free; }
+    g_tpYawOffDeg = off;
+}
+
 static void UpdateTurnInPlace(ADishonoredPlayerPawn* pawn) {
     static DWORD last = 0, lastTurning = 0;
     static int lastYaw = 0, activeChild = 0;
@@ -5849,7 +6036,7 @@ static void UpdateTurnInPlace(ADishonoredPlayerPawn* pawn) {
     DWORD now = GetTickCount();
     float dt = last ? (now - last) / 1000.0f : 0.0f;
     last = now;
-    int yaw = pawn->Rotation.Yaw & 0xFFFF;
+    int yaw = (pawn->Rotation.Yaw + static_cast<int>(g_tpYawOffDeg * 65536.0f / 360.0f)) & 0xFFFF;   // (free orbit: the body's turning, not the camera's)
     int dyaw = haveYaw ? yaw - lastYaw : 0;
     if (dyaw > 32768) dyaw -= 65536; else if (dyaw < -32768) dyaw += 65536;
     lastYaw = yaw;
@@ -6863,8 +7050,12 @@ struct PowerSwap {
 static PowerSwap g_powerSwaps[] = {
     { "Blink",          "DisDLC06ActivePowerComponent_Transversal",    "Transversal",    0, 2, 20 },
     { "DevouringSwarm", "DisDLC06ActivePowerComponent_SummonAssassin", "SummonAssassin", 2, 7, 21 },
+    { "Windblast",      "DisDLC07ActivePowerComponent_Pull",           "Pull",           3, 4, 27 },   // 3.4: its own menu row
 };
+constexpr int kPullSwap = 2;
 constexpr int kPowerSwapCount = sizeof(g_powerSwaps) / sizeof(g_powerSwaps[0]);
+// Daud's Blink and Summon Assassin come with his power set; Pull has its own Body Swap row (Windblast slot, 3.4).
+static bool PowerSwapWanted(int si) { return si == kPullSwap ? g_pullChar == 1 : g_powerChar == 1; }
 static ADishonoredPlayerPawn* g_powerPawn = nullptr;
 static UDisDLC07Tweaks_PlayerPawn* g_daudPawnTweaks = nullptr;
 
@@ -6963,6 +7154,7 @@ static void RetargetPowerPointers(ADishonoredPlayerPawn* pawn, UDishonoredActive
 
 static void ForgetCorvoArmsMaterials();
 static void SetPullTarget(void* pawn, void* pull);
+static void UpdatePullPeople();
 static void ForgetBowItems();
 
 static bool BetterPowersBlinkLoaded();
@@ -7417,14 +7609,17 @@ static const wchar_t* kDaudUiPackages[] = { L"UI_EquipmentIcons_DLC06_SF", L"UI_
 // FGFxTexture::InitTextureFromFile (0x985210 -> StaticLoadObject). With Daud's set on, three of those paths are sent
 // to Daud's own images instead (build 160). The DLC07 journal's grid icons share Corvo's names, so their real
 // path is found once their package has loaded.
-struct IconRemap { const char* corvoPkg; const char* corvoName; const char* daudPath; const char* findDlc07JournalTex; };
-static const IconRemap kIconRemaps[] = {
-    { "UI_Journal",        "Journal_I86",      nullptr, "Journal_I84" },   // Blink -> Daud's Blink (Transversal)
-    { "UI_Journal",        "Journal_I84",      nullptr, "Journal_I86" },   // Devouring Swarm -> Summon Assassin
-    { "UI_Powers_Large",   "BlinkBig",         "UI_Powers_Large_DLC06.j_pow_ic_a_DLC06TransversalBig" },
-    { "UI_Powers_Large",   "RatSwarmBig",      "UI_Powers_Large_DLC06.j_pow_ic_a_DLC06SummonAssassinBig" },
-    { "UI_EquipmentIcons", "ic_pow_Blink",     "UI_EquipmentIcons_DLC06.ic_pow_DLC06_transversal" },
-    { "UI_EquipmentIcons", "ic_pow_ratSwarm",  "UI_EquipmentIcons_DLC06.ic_pow_DLC06_summonAssassin" },
+struct IconRemap { const char* corvoPkg; const char* corvoName; const char* daudPath; const char* findDlc07JournalTex; int swap; };
+static const IconRemap kIconRemaps[] = {   // the first three are the journal grid icons (g_dlc07JournalPath)
+    { "UI_Journal",        "Journal_I86",      nullptr, "Journal_I84", 0 },   // Blink -> Daud's Blink (Transversal)
+    { "UI_Journal",        "Journal_I84",      nullptr, "Journal_I86", 1 },   // Devouring Swarm -> Summon Assassin
+    { "UI_Journal",        "Journal_I82",      nullptr, "Journal_I88", kPullSwap },   // Windblast -> Pull (3.4)
+    { "UI_Powers_Large",   "BlinkBig",         "UI_Powers_Large_DLC06.j_pow_ic_a_DLC06TransversalBig", nullptr, 0 },
+    { "UI_Powers_Large",   "RatSwarmBig",      "UI_Powers_Large_DLC06.j_pow_ic_a_DLC06SummonAssassinBig", nullptr, 1 },
+    { "UI_Powers_Large",   "WindblastBig",     "UI_Powers_Large_DLC07.DLC07PullBig", nullptr, kPullSwap },
+    { "UI_EquipmentIcons", "ic_pow_Blink",     "UI_EquipmentIcons_DLC06.ic_pow_DLC06_transversal", nullptr, 0 },
+    { "UI_EquipmentIcons", "ic_pow_ratSwarm",  "UI_EquipmentIcons_DLC06.ic_pow_DLC06_summonAssassin", nullptr, 1 },
+    { "UI_EquipmentIcons", "ic_pow_windBlast", "UI_EquipmentIcons_DLC07.ic_pow_DLC07_pull", nullptr, kPullSwap },
 };
 static std::string g_dlc07JournalPath[3];   // resolved paths of the DLC07 journal's grid icons (remaps 0-2)
 
@@ -7455,7 +7650,7 @@ static bool __fastcall HookedInitTextureFromFile(void* self, void*, const char* 
         std::string p(path);
         if (std::find(seen.begin(), seen.end(), p) == seen.end()) { seen.push_back(p); ++logged; Log("gfx image: %s", path); }
     }
-    if (path && g_powerChar == 1) {
+    if (path && (g_powerChar == 1 || g_pullChar == 1)) {
         const char* dot = strrchr(path, '.');
         const char* first = strchr(path, '.');
         if (dot && first) {
@@ -7463,6 +7658,7 @@ static bool __fastcall HookedInitTextureFromFile(void* self, void*, const char* 
             for (int r = 0; r < static_cast<int>(sizeof(kIconRemaps) / sizeof(kIconRemaps[0])); ++r) {
                 const IconRemap& m = kIconRemaps[r];
                 if (_stricmp(pkg.c_str(), m.corvoPkg) != 0 || _stricmp(name.c_str(), m.corvoName) != 0) continue;
+                if (!PowerSwapWanted(m.swap)) break;
                 const char* to = m.daudPath ? m.daudPath : (r < 3 && m.findDlc07JournalTex && !g_dlc07JournalPath[r].empty() ? g_dlc07JournalPath[r].c_str() : nullptr);
                 if (!to) break;
                 if (g_origInitTextureFromFile(self, to)) { Log("icons: %s -> %s", path, to); return true; }
@@ -7530,11 +7726,12 @@ static UDishonoredActivePowerComponent* MakeDaudPower(ADishonoredPlayerPawn* paw
         StaticConstructObject(cls, TransientPackage() ? TransientPackage() : pawn, 0, 0, 0, nullptr, nullptr, nullptr, nullptr));
     if (!nc) { Log("Power set: could not construct %s", s.daudClass); return nullptr; }
     // Name and wheel slot are the class defaults (Transversal/20, Pull/27, SummonAssassin/21). Level: from the save
-    // if it had one; a new Daud's Blink starts at Corvo's Blink level (so you can still blink); the others unbought.
+    // if it had one; a new Daud's Blink starts at Corvo's Blink level (so you can still blink) and a new Pull at the
+    // Windblast level it replaces (3.4: upgraded Windblast = upgraded Pull, which lifts people); Summon unbought.
     bool fromSave = s.pendingPc && s.pendingPc == pawn->m_pPowersComponent;
     nc->m_eUISelection = static_cast<EeDisUISelectionType>(s.corvoUi);   // Corvo's journal/wheel look powers up by these slot types (build 160)
     if (fromSave) nc->m_CurrentLevel = s.pendingLevel;
-    else if (si == 0 && corvo) nc->m_CurrentLevel = corvo->m_CurrentLevel;
+    else if ((si == 0 || si == kPullSwap) && corvo) nc->m_CurrentLevel = corvo->m_CurrentLevel;
     s.pendingPc = nullptr;
     s.daudPc = pawn->m_pPowersComponent;
     KeepAlive(nc);
@@ -7830,10 +8027,11 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
     if (!arr->Data || arr->Num <= 0 || arr->Num > 16) return;
     FixLegacyPowerComponents(pawn, arr);
     bool wantDaud = g_powerChar == 1;
+    bool wantAny = wantDaud || g_pullChar == 1;
     if (wantDaud || !BetterPowersBlinkLoaded()) RestoreModBlink(pawn);   // before Daud's swap reads the slot
     if (g_daudLoadState == LoadState::Loaded) LoadDaudUi();
     static int lastWait = -1;
-    int wait = !wantDaud ? 0 : g_daudLoadState != LoadState::Loaded ? 1 : !DaudPowerTweaks(0) ? 2 : 0;
+    int wait = !wantAny ? 0 : g_daudLoadState != LoadState::Loaded ? 1 : !DaudPowerTweaks(wantDaud ? 0 : 3) ? 2 : 0;
     if (wait != lastWait) {
         lastWait = wait;
         if (wait) Log("Power set: waiting for %s", wait == 1 ? "Daud's package" : "Daud's power tweaks (not found)");
@@ -7852,9 +8050,10 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
             }
         }
     }
-    if (wantDaud && !wait) EnsureDaudPowerAnims(pawn);
+    if (wantAny && !wait) EnsureDaudPowerAnims(pawn);
     for (int si = 0; si < kPowerSwapCount; ++si) {
         PowerSwap& s = g_powerSwaps[si];
+        bool want = PowerSwapWanted(si);
         Protect(s.orig);
         Protect(s.daud);
         int idx = -1;
@@ -7870,9 +8069,9 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
         UDishonoredActivePowerComponent* cur = slot;
         // Daud's component exists whenever his set is on, or a save gave it a level (kept so saves keep it).
         bool pending = s.pendingPc && s.pendingPc == pawn->m_pPowersComponent;
-        if (!s.daud && ((wantDaud && !wait) || pending)) s.daud = MakeDaudPower(pawn, s, si, cur != s.daud ? cur : nullptr);
+        if (!s.daud && ((want && !wait) || pending)) s.daud = MakeDaudPower(pawn, s, si, cur != s.daud ? cur : nullptr);
         if (!s.daud) continue;
-        if (wantDaud) {
+        if (want) {
             if (wait || cur == s.daud) continue;
             if (UDisTweaks_ActivePowerBase* t = DaudPowerTweaks(s.tweak)) s.daud->m_pPowerTweaks = t;
             Log("Power set: %s (level %d) -> %s (level %d) in slot %d", s.corvoName, cur->m_CurrentLevel, s.daudName,
@@ -7903,6 +8102,13 @@ static void ApplyPowerSet(ADishonoredPlayerPawn* pawn) {
     }
     if (!wantDaud && BetterPowersBlinkLoaded()) InstallCorvoBlink(pawn);   // after Daud's Blink went back out
     if (BetterPowersBlinkLoaded()) SyncBlinkSettings(pawn, wantDaud);
+    // 3.4: Daud's Pull in the Windblast slot is the pawn's Pull (m_pPullPower) - objects, and people (UpdatePullPeople)
+    PowerSwap& pull = g_powerSwaps[kPullSwap];
+    bool pullIn = pull.daud && InPowerList(pawn, pull.daud);
+    static UObject* lastPull = nullptr;
+    if ((pullIn ? pull.daud : nullptr) != lastPull) { lastPull = pullIn ? pull.daud : nullptr; Log("Pull: %s", pullIn ? "in the Windblast slot" : "out"); }
+    SetPullTarget(pullIn ? pawn : nullptr, pullIn ? pull.daud : nullptr);
+    UpdatePullPeople();
 }
 
 // ---- Diagnostic (build 161): why Pull / Summon Assassin do nothing on Corvo, and how Daud's sword draw differs.
@@ -8031,7 +8237,7 @@ static void __fastcall HookedAddPower(UDishonoredPowersComponent* pc, void*, int
     g_origAddPower(pc, nameIdx, nameNum, level, flag);
     if (nameNum != 0) return;
     for (auto& s : g_powerSwaps) {
-        static int ids[kPowerSwapCount] = { -2, -2 };
+        static int ids[kPowerSwapCount] = { -2, -2, -2 };
         int si = static_cast<int>(&s - g_powerSwaps);
         if (ids[si] == -2) ids[si] = FName(s.daudName).FNameEntryId;
         if (nameIdx != ids[si]) continue;
@@ -8204,10 +8410,356 @@ static void HookPawnSaveLoad() {
 // pawn that is past the end of the object (crash 13:29: Pull notify sub_CFE170 -> sub_CFD200 on garbage). Every
 // load of [reg+0x126C] in Daud's DLC code is patched to call a generated stub: if the base register is Corvo's pawn
 // it yields our Pull component, otherwise it does the original load (so Daud's own DLC is untouched).
+// ---- Pull on people (3.4). Daud's Pull lifts, holds and yanks only the DLC's own NPCs. A campaign NPC
+// (ADishonoredNPCPawn, 0xDF4 bytes) lacks the DLC07 part that makes one a pull target - ADisDLC07NPCPawn's
+// IDisDLC07PullTargetInterface at +0xDF4 and its fields up to +0xE10 - and Corvo's pawn (0x124C bytes) lacks
+// ADisDLC07PlayerPawn's IDisDLC07PullerInterface (+0x1268) that a pulled NPC flies toward, and m_pPullPower (+0x126C).
+// So both are given that room when the engine makes them: StaticAllocateObject's appMalloc call (0x49D174) goes
+// through AllocWithPullRoom, which allocates campaign NPCs and Corvo's pawns with the DLC07 layout's extra bytes
+// (zeroed, with the interface table in place and a tag + self pointer after it). The DLC's own code then runs on them:
+//  - UObject::GetInterfaceAddress (0x47B7C0) answers the pull target interface for a campaign NPC with +0xDF4 (a copy
+//    of ADisDLC07NPCPawn's table 0x11CAE00) and the puller interface for Corvo with +0x1268 (Daud's table 0x11CD928) -
+//    only while Corvo has our Pull, and not for living wolfhounds (the DLC has no pulled hound);
+//  - the NPC's master state machine gets the DLC's Pulled / Dead_Pulled states, and its transition rules get the DLC07
+//    NPC rules that mention them (read from Default__DisDLC07NPCPawn's own table);
+//  - three spots that read the DLC07 NPC settings (pull force, grab bone, edge-throw settings) from the NPC's settings
+//    get DLC07_Pwn_Eaten (a DLC07 guard's settings, in Daud's package) for a campaign NPC, whose settings lack them;
+//  - the Pulled state's anim chain (129: Generic_Pulled_*) comes from the DLC07 NPC anim definitions, and the target's
+//    body gets DLC07_Npc_EliteGuard_Gen (the guards' pulled animations, Daud's package) while it is being pulled.
 static void* volatile g_pullPawn = nullptr;   // Corvo's pawn while our Pull component exists
 static void* volatile g_pullComp = nullptr;   // our Pull component
 
-static void SetPullTarget(void* pawn, void* pull) { g_pullComp = pull; g_pullPawn = pull ? pawn : nullptr; }
+constexpr uint32_t kNpcPawnSize = 0xDF4, kNpcPullTag = 0xE10;         // tag + self pointer after the DLC07 NPC part
+constexpr uint32_t kPlayerPawnSize = 0x124C, kPlayerPullTag = 0x1280;
+constexpr uint32_t kPullTagMagic = 0x54504243;                         // "CBPT"
+constexpr uintptr_t kClsPullTarget = 0x0147222C, kClsPuller = 0x01472248, kClsDlc07NpcTweaks = 0x014722DC;
+static void* g_npcPullVt[13];                 // ADisDLC07NPCPawn's pull target table (0x11CAE00), our destructor
+static volatile LONG g_pullRoomCount[2];      // campaign NPCs, Corvo's pawns given the room
+
+static UClass* ClassGlobal(uintptr_t global, uintptr_t staticClassFn) {
+    auto** g = reinterpret_cast<UClass**>(global);
+    if (!*g && staticClassFn) reinterpret_cast<UClass*(__cdecl*)()>(staticClassFn)();
+    return *g;
+}
+static bool ClassIsChildOf(UClass* c, UClass* want) {
+    if (!want) return false;
+    for (UClass* k = c; k; k = *reinterpret_cast<UClass**>(reinterpret_cast<uint8_t*>(k) + 0x44)) if (k == want) return true;
+    return false;
+}
+// 1 a campaign NPC, 2 Corvo's pawn, 0 anything else (the DLC's own pawns are bigger and have the part already)
+static int PullRoomKind(UClass* c) {
+    if (!c) return 0;
+    uint32_t size = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(c) + 0x4C);   // PropertiesSize
+    if (size == kNpcPawnSize) return ClassIsChildOf(c, *reinterpret_cast<UClass**>(0x0146672C)) ? 1 : 0;     // ADishonoredNPCPawn
+    if (size == kPlayerPawnSize) return ClassIsChildOf(c, *reinterpret_cast<UClass**>(0x0145F620)) ? 2 : 0;  // ADishonoredPlayerPawn
+    return 0;
+}
+static bool HasPullRoom(const void* o, uint32_t tag) {
+    auto* p = static_cast<const uint8_t*>(o);
+    return p && *reinterpret_cast<const uint32_t*>(p + tag) == kPullTagMagic && *reinterpret_cast<void* const*>(p + tag + 4) == o;
+}
+static void* __fastcall PullTargetNoDestructor(void* self, void*, unsigned) { return self; }
+
+static void* __cdecl AllocWithPullRoom(DWORD size, DWORD align, UClass* cls) {
+    using appMalloc_t = void*(__cdecl*)(DWORD, DWORD);
+    auto appMalloc = reinterpret_cast<appMalloc_t>(0x00404280);
+    int kind = PullRoomKind(cls);
+    if (!kind) return appMalloc(size, align);
+    uint32_t base = kind == 1 ? kNpcPawnSize : kPlayerPawnSize, tag = kind == 1 ? kNpcPullTag : kPlayerPullTag;
+    DWORD total = (tag + 8 + 15) & ~15u;
+    if (total < size) total = size;
+    auto* p = static_cast<uint8_t*>(appMalloc(total, align));
+    if (!p) return p;
+    memset(p + base, 0, total - base);
+    if (kind == 1) *reinterpret_cast<void**>(p + kNpcPawnSize) = g_npcPullVt;
+    else *reinterpret_cast<void**>(p + 0x1268) = reinterpret_cast<void*>(0x011CD928);   // Daud's puller table
+    *reinterpret_cast<uint32_t*>(p + tag) = kPullTagMagic;
+    *reinterpret_cast<void**>(p + tag + 4) = p;
+    LONG n = InterlockedIncrement(&g_pullRoomCount[kind - 1]);
+    if (kind == 2 || n == 1 || n % 200 == 0)
+        Log("Pull: room for the DLC07 part given to %s #%ld (%lu -> %lu bytes)", kind == 1 ? "a campaign NPC" : "Corvo's pawn", n, size, total);
+    return p;
+}
+
+static void SetPullTarget(void* pawn, void* pull) {
+    g_pullComp = pull;
+    g_pullPawn = pull ? pawn : nullptr;
+    if (pawn && HasPullRoom(pawn, kPlayerPullTag)) *reinterpret_cast<void**>(static_cast<uint8_t*>(pawn) + 0x126C) = pull;   // m_pPullPower
+}
+
+// The DLC07 pulled states and the transition rules that mention them.
+static UClass* PulledStateClass(bool dead) { return dead ? ClassGlobal(0x0147223C, 0x00CEC750) : ClassGlobal(0x01472240, 0x00CEC7B0); }
+
+static std::vector<FStateTransitionLogic> g_pulledRules;
+static void ReadPulledRules(UClass* pulled, UClass* deadPulled) {
+    if (!g_pulledRules.empty()) return;
+    static int tries = 0;
+    if (tries++ > 3) return;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->Class || !o->Outer || !o->Outer->Outer || o->Class->GetName() != "DisNativeStateTransitionLogic") continue;
+        if (o->GetName() != "pMasterFSMTransitionLogic" || o->Outer->GetName() != "MasterFSM" || o->Outer->Outer->GetName() != "Default__DisDLC07NPCPawn") continue;
+        auto* rules = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(o) + 0x38);   // m_Transitions
+        for (int r = 0; rules->Data && r < rules->Num; ++r) {
+            auto& t = static_cast<FStateTransitionLogic*>(rules->Data)[r];
+            if (t.m_pFromClass == pulled || t.m_pFromClass == deadPulled || t.m_pToClass == pulled || t.m_pToClass == deadPulled) g_pulledRules.push_back(t);
+        }
+        Log("Pull: %d of the DLC07 NPC transition rules mention the pulled states", static_cast<int>(g_pulledRules.size()));
+        return;
+    }
+    Log("Pull: WARNING - the DLC07 NPC transition rules were not found");
+}
+
+static void AddPulledRules(UObject* logic, UClass* pulled, UClass* deadPulled) {
+    if (!logic) return;
+    ReadPulledRules(pulled, deadPulled);
+    if (g_pulledRules.empty()) return;
+    auto* rules = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(logic) + 0x38);
+    for (int r = 0; rules->Data && r < rules->Num; ++r) {   // shared by many NPCs: once
+        auto& t = static_cast<FStateTransitionLogic*>(rules->Data)[r];
+        if (t.m_pFromClass == pulled || t.m_pToClass == pulled) return;
+    }
+    int n = static_cast<int>(g_pulledRules.size());
+    if (!GrowArray(rules, sizeof(FStateTransitionLogic), rules->Num + n)) return;
+    memcpy(static_cast<FStateTransitionLogic*>(rules->Data) + rules->Num, g_pulledRules.data(), n * sizeof(FStateTransitionLogic));
+    rules->Num += n;
+    *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(logic) + 0x80) &= ~1u;   // m_bInitialized: resolve again
+    Log("Pull: %d pulled-state transition rules added to %s", n, ObjName(logic).c_str());
+}
+
+static bool EnsurePulledStates(uint8_t* npc) {
+    auto* fsm = *reinterpret_cast<uint8_t**>(npc + 0xCEC);   // m_pNPCMasterFSM
+    if (!fsm || (*reinterpret_cast<uint32_t*>(fsm + 0xA4) & 2)) return false;   // none, or m_bDestroyFSMCalled
+    UClass* cls[2] = { PulledStateClass(false), PulledStateClass(true) };
+    if (!cls[0] || !cls[1]) return false;
+    auto* states = reinterpret_cast<RawArray*>(fsm + 0x94);   // m_NativeStates
+    bool has[2] = {};
+    for (int i = 0; states->Data && i < states->Num; ++i)
+        if (auto* st = static_cast<UObject**>(states->Data)[i]) for (int k = 0; k < 2; ++k) has[k] |= st->Class == cls[k];
+    if (has[0] && has[1]) return true;
+    UObject* made[2] = {};
+    for (int k = 0; k < 2; ++k) {
+        if (has[k]) continue;
+        made[k] = StaticConstructObject(cls[k], reinterpret_cast<UObject*>(fsm), 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
+        if (!made[k]) { Log("Pull: could not make %s", cls[k]->GetName().c_str()); return false; }
+    }
+    if (!GrowArray(states, 4, states->Num + 2)) return false;
+    for (auto* m : made) if (m) static_cast<UObject**>(states->Data)[states->Num++] = m;
+    AddPulledRules(*reinterpret_cast<UObject**>(fsm + 0xA8), cls[0], cls[1]);
+    reinterpret_cast<void(__thiscall*)(void*)>(0x00A7A8F0)(fsm);   // BuildNativeStateMap: state map, links, transition rules
+    static int logged = 0;
+    if (logged++ < 20) Log("Pull: pulled states added to %s", ObjName(reinterpret_cast<UObject*>(npc)).c_str());
+    return true;
+}
+
+// Living wolfhounds stay out (the DLC has no pulled hound animation); their bodies can be pulled.
+static bool PullTargetAllowed(uint8_t* npc) {
+    if (*reinterpret_cast<int32_t*>(npc + 0x344) <= 0) return true;   // Pawn.Health: dead
+    auto* tweaks = *reinterpret_cast<UObject**>(npc + 0x748);         // m_pPawnTweaks
+    static UObject* lastTweaks = nullptr;
+    static bool lastHound = false;
+    if (tweaks != lastTweaks) { lastTweaks = tweaks; lastHound = tweaks && tweaks->GetName().rfind("Pwn_WolfHound", 0) == 0; }
+    return !lastHound;
+}
+
+using GetIfaceAddr_t = void*(__thiscall*)(UObject*, UClass*);
+static GetIfaceAddr_t g_origGetIfaceAddr = nullptr;
+static void* __fastcall HookedGetIfaceAddr(UObject* obj, void*, UClass* iface) {
+    void* r = g_origGetIfaceAddr(obj, iface);
+    if (r || !iface || !obj || !g_pullComp) return r;
+    auto* p = reinterpret_cast<uint8_t*>(obj);
+    if (iface == *reinterpret_cast<UClass**>(kClsPullTarget)) {
+        if (PullRoomKind(obj->Class) == 1 && HasPullRoom(p, kNpcPullTag) && PullTargetAllowed(p) && EnsurePulledStates(p)) return p + kNpcPawnSize;
+    } else if (iface == *reinterpret_cast<UClass**>(kClsPuller)) {
+        if (obj == g_pullPawn && HasPullRoom(p, kPlayerPullTag)) return p + 0x1268;
+    }
+    return r;
+}
+
+// DLC07 NPC settings for the spots that read them (patched GetTweaks calls): a campaign NPC's own settings object has
+// none of the DLC07 fields, so it gets DLC07_Pwn_Eaten's (null: the DLC07 class defaults, as the game falls back to).
+static UObject* g_pullNpcTweaks = nullptr;      // DisDLC07Tweaks_NPCPawn DLC07_Pwn_Eaten
+static UObject* g_pullAnimDefs = nullptr;       // Default__DisDLC07NPCAnimDefinitions_SummonedAssassin (138 chains)
+static UObject* g_pulledAnimSet = nullptr;      // AnimSet DLC07_Npc_EliteGuard_Gen
+static UObject* __fastcall PullSettingsFor(void* tweaksIface) {
+    using GetTweaks_t = UObject*(__thiscall*)(void*);
+    UObject* t = reinterpret_cast<GetTweaks_t>((*reinterpret_cast<void***>(tweaksIface))[0x10 / 4])(tweaksIface);
+    UClass* dlc = ClassGlobal(kClsDlc07NpcTweaks, 0x00CF2620);
+    if (!t || !dlc || ClassIsChildOf(t->Class, dlc)) return t;
+    return g_pullNpcTweaks;
+}
+
+static bool PatchTweaksCall(uintptr_t va, const uint8_t* expect, int len, const uint8_t* keep, int keepLen) {
+    auto* p = reinterpret_cast<uint8_t*>(va);
+    if (memcmp(p, expect, len) != 0) { Log("WARNING: Pull settings patch: unexpected bytes at %08X", static_cast<unsigned>(va)); return false; }
+    DWORD old;
+    if (!VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(p, keep, keepLen);                                                   // ecx = the settings interface (+ push edi)
+    p[keepLen] = 0xE8;                                                          // call PullSettingsFor
+    *reinterpret_cast<int32_t*>(p + keepLen + 1) = static_cast<int32_t>(reinterpret_cast<uint8_t*>(&PullSettingsFor) - (p + keepLen + 5));
+    memset(p + keepLen + 5, 0x90, len - keepLen - 5);
+    VirtualProtect(p, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, len);
+    return true;
+}
+
+// The Pulled state plays anim chain 129 (Generic_Pulled_*), past the end of the campaign NPC anim definitions (114).
+constexpr unsigned kPulledAnimChain = 129;
+using FindAnimChain_t = void*(__thiscall*)(void*, unsigned);
+static FindAnimChain_t g_origFindAnimChain = nullptr;
+static void* __fastcall HookedFindAnimChain(void* defs, void*, unsigned id) {
+    void* r = g_origFindAnimChain(defs, id);
+    if (r || (id & 0xFF) != kPulledAnimChain || !g_pullComp || !g_pullAnimDefs || defs == g_pullAnimDefs) return r;
+    auto* chains = reinterpret_cast<RawArray*>(reinterpret_cast<uint8_t*>(g_pullAnimDefs) + 0x38);   // m_Animations
+    if (!chains->Data || chains->Num <= static_cast<int>(kPulledAnimChain)) return r;
+    static int logged = 0;
+    if (logged++ < 10) Log("Pull: pulled anim chain for %s from the DLC07 NPC definitions", ObjName(static_cast<UObject*>(defs)).c_str());
+    return static_cast<uint8_t*>(chains->Data) + kPulledAnimChain * 0x14;
+}
+
+// Daud's package: grab (and root) the DLC07 assets the above use.
+static void GrabPullPeopleAssets() {
+    static bool done = false;
+    if (done || g_daudLoadState != LoadState::Loaded) return;
+    done = true;
+    UObject* throwCfg = nullptr;
+    auto* objects = UObject::GObjObjects();
+    for (int i = 0; i < objects->size(); ++i) {
+        UObject* o = objects->at(i);
+        if (!o || !o->Class || AwaitingPurge(o)) continue;
+        std::string n = o->GetName();
+        if (n == "DLC07_Pwn_Eaten" && o->Class->GetName() == "DisDLC07Tweaks_NPCPawn") g_pullNpcTweaks = o;
+        else if (n == "Default__DisDLC07NPCAnimDefinitions_SummonedAssassin") g_pullAnimDefs = o;
+        else if (n == "DLC07_Npc_EliteGuard_Gen" && o->Class->GetName() == "AnimSet") g_pulledAnimSet = o;
+        else if (n == "DLC07_Component_ThrowHitReaction_Pull") throwCfg = o;
+    }
+    KeepAlive(g_pullNpcTweaks);
+    KeepAlive(g_pullAnimDefs);
+    KeepAlive(g_pulledAnimSet);
+    KeepAlive(throwCfg);
+    if (g_pullNpcTweaks && throwCfg) {   // m_pPullThrowConfig: the edge / breakable throw at the end of a pull
+        auto*& cfg = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(g_pullNpcTweaks) + 0x3DC);
+        if (!cfg) cfg = throwCfg;
+    }
+    Log("Pull on people: settings %s, anim definitions %s, pulled animations %s, throw settings %s",
+        ObjName(g_pullNpcTweaks).c_str(), ObjName(g_pullAnimDefs).c_str(), ObjName(g_pulledAnimSet).c_str(), ObjName(throwCfg).c_str());
+}
+
+// The pulled animations go on a living target's body and come off once it is out of the pulled state.
+struct PulledBody { APawn* npc; int32_t index; };
+static PulledBody g_pulledBodies[16];
+static int g_pulledBodyCount = 0;
+
+static bool PullObjAlive(UObject* o, int32_t index) {
+    auto* objects = UObject::GObjObjects();
+    return o && index >= 0 && index < objects->size() && objects->at(index) == o && !AwaitingPurge(o);
+}
+static bool SetPulledAnims(APawn* npc, bool on) {
+    if (!g_pulledAnimSet || !npc->Mesh) return false;
+    auto* sets = reinterpret_cast<RawArray*>(&npc->Mesh->AnimSets);
+    for (int i = 0; sets->Data && i < sets->Num; ++i) {
+        if (static_cast<UObject**>(sets->Data)[i] != g_pulledAnimSet) continue;
+        if (on) return true;
+        for (int k = i + 1; k < sets->Num; ++k) static_cast<UObject**>(sets->Data)[k - 1] = static_cast<UObject**>(sets->Data)[k];
+        --sets->Num;
+        npc->Mesh->UpdateAnimations();
+        return true;
+    }
+    if (!on) return true;
+    if (sets->Max < sets->Num + 1 && !GrowArray(sets, 4, sets->Num + 2)) return false;
+    static_cast<UObject**>(sets->Data)[sets->Num++] = g_pulledAnimSet;
+    npc->Mesh->UpdateAnimations();
+    return true;
+}
+static bool InPulledState(APawn* npc) {
+    auto* fsm = *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(npc) + 0xCEC);
+    if (!fsm) return false;
+    UClass* cur = *reinterpret_cast<UClass**>(fsm + 0x84);
+    UClass* pend = *reinterpret_cast<UClass**>(fsm + 0x88);
+    UClass* p = PulledStateClass(false);
+    return p && (cur == p || pend == p);
+}
+
+static void UpdatePullPeople() {
+    GrabPullPeopleAssets();
+    UObject* target = g_pullComp ? *reinterpret_cast<UObject**>(static_cast<uint8_t*>(g_pullComp) + 0x9C) : nullptr;   // m_pTarget
+    static UObject* lastTarget = nullptr;
+    if (target != lastTarget) {
+        lastTarget = target;
+        if (target && PullRoomKind(target->Class) == 1) {
+            auto* npc = static_cast<APawn*>(target);
+            auto* tweaks = *reinterpret_cast<UObject**>(reinterpret_cast<uint8_t*>(npc) + 0x748);
+            Log("Pull: target %s (health %d, settings %s)", ObjName(target).c_str(), npc->Health, ObjName(tweaks).c_str());
+            if (npc->Health > 0 && g_pulledBodyCount < 16 && SetPulledAnims(npc, true)) {
+                bool listed = false;
+                for (int i = 0; i < g_pulledBodyCount; ++i) listed |= g_pulledBodies[i].npc == npc;
+                if (!listed) g_pulledBodies[g_pulledBodyCount++] = { npc, npc->ObjectInternalInteger };
+            }
+        } else if (target) {
+            Log("Pull: target %s", ObjName(target).c_str());
+        }
+    }
+    int k = 0;
+    for (int i = 0; i < g_pulledBodyCount; ++i) {
+        PulledBody b = g_pulledBodies[i];
+        if (!PullObjAlive(b.npc, b.index)) continue;
+        if (b.npc == target || InPulledState(b.npc)) { g_pulledBodies[k++] = b; continue; }
+        SetPulledAnims(b.npc, false);
+    }
+    g_pulledBodyCount = k;
+}
+
+static void InstallPullPeople() {
+    memcpy(g_npcPullVt, reinterpret_cast<void*>(0x011CAE00), sizeof(g_npcPullVt));
+    g_npcPullVt[0] = reinterpret_cast<void*>(&PullTargetNoDestructor);
+    // 1) room for the DLC07 part: StaticAllocateObject's "Obj = appMalloc(AlignedSize, 8)" (the class is in edi)
+    auto* site = reinterpret_cast<uint8_t*>(0x0049D174);
+    auto* stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    const uint8_t siteExpect[] = { 0xE8, 0x07, 0x71, 0xF6, 0xFF, 0x83, 0xC4, 0x08 };
+    if (!stub || memcmp(site, siteExpect, sizeof(siteExpect)) != 0) {
+        Log("WARNING: Pull on people: allocation site not as expected - campaign NPCs stay unpullable");
+        return;
+    }
+    uint8_t* s = stub;
+    const uint8_t head[] = { 0x8B, 0x44, 0x24, 0x04,    // mov eax, [esp+4]   (size)
+                             0x8B, 0x4C, 0x24, 0x08,    // mov ecx, [esp+8]   (alignment)
+                             0x57, 0x51, 0x50 };        // push edi (class), ecx, eax
+    memcpy(s, head, sizeof(head)); s += sizeof(head);
+    *s++ = 0xE8; *reinterpret_cast<int32_t*>(s) = static_cast<int32_t>(reinterpret_cast<uint8_t*>(&AllocWithPullRoom) - (s + 4)); s += 4;
+    *s++ = 0x83; *s++ = 0xC4; *s++ = 0x0C;               // add esp, 12
+    *s++ = 0xC3;                                         // ret
+    DWORD old;
+    if (!VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old)) return;
+    *reinterpret_cast<int32_t*>(site + 1) = static_cast<int32_t>(stub - (site + 5));
+    VirtualProtect(site, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), site, 5);
+    Log("Pull on people: object allocation hooked");
+    // 2) the interface answers
+    const uint8_t gia[] = { 0x55, 0x8B, 0xEC, 0x8B, 0x45, 0x08, 0x56, 0x8B, 0xF1 };
+    if (memcmp(reinterpret_cast<void*>(0x0047B7C0), gia, sizeof(gia)) == 0 &&
+        MH_CreateHook(reinterpret_cast<void*>(0x0047B7C0), reinterpret_cast<void*>(&HookedGetIfaceAddr), reinterpret_cast<void**>(&g_origGetIfaceAddr)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(0x0047B7C0)) == MH_OK) Log("Pull on people: interface lookup hooked");
+    else Log("WARNING: Pull on people: could not hook GetInterfaceAddress");
+    // 3) DLC07 NPC settings at the pulled-state edge throw, the dead-body pull, and the grab point
+    const uint8_t throwSite[] = { 0x8B, 0x81, 0xBC, 0x04, 0x00, 0x00, 0x8B, 0x50, 0x10, 0x81, 0xC1, 0xBC, 0x04, 0x00, 0x00, 0x57, 0xFF, 0xD2 };
+    const uint8_t throwKeep[] = { 0x81, 0xC1, 0xBC, 0x04, 0x00, 0x00, 0x57 };
+    const uint8_t bodySite[] = { 0x8B, 0x96, 0xBC, 0x04, 0x00, 0x00, 0x8B, 0x42, 0x10, 0x8D, 0x8E, 0xBC, 0x04, 0x00, 0x00, 0xFF, 0xD0 };
+    const uint8_t bodyKeep[] = { 0x8D, 0x8E, 0xBC, 0x04, 0x00, 0x00 };
+    const uint8_t grabSite[] = { 0x8B, 0x86, 0xC8, 0xF6, 0xFF, 0xFF, 0x8B, 0x50, 0x10, 0x8D, 0x8E, 0xC8, 0xF6, 0xFF, 0xFF, 0x57, 0xFF, 0xD2 };
+    const uint8_t grabKeep[] = { 0x8D, 0x8E, 0xC8, 0xF6, 0xFF, 0xFF, 0x57 };
+    int settings = PatchTweaksCall(0x00CFE40D, throwSite, sizeof(throwSite), throwKeep, sizeof(throwKeep)) +
+                   PatchTweaksCall(0x00D0540B, bodySite, sizeof(bodySite), bodyKeep, sizeof(bodyKeep)) +
+                   PatchTweaksCall(0x00CFF1CC, grabSite, sizeof(grabSite), grabKeep, sizeof(grabKeep));
+    Log("Pull on people: %d of 3 DLC07 NPC settings reads patched", settings);
+    // 4) the pulled anim chain
+    const uint8_t fac[] = { 0x55, 0x8B, 0xEC, 0x56, 0x0F, 0xB6, 0x75, 0x08 };
+    if (memcmp(reinterpret_cast<void*>(0x00C48870), fac, sizeof(fac)) == 0 &&
+        MH_CreateHook(reinterpret_cast<void*>(0x00C48870), reinterpret_cast<void*>(&HookedFindAnimChain), reinterpret_cast<void**>(&g_origFindAnimChain)) == MH_OK &&
+        MH_EnableHook(reinterpret_cast<void*>(0x00C48870)) == MH_OK) Log("Pull on people: anim chain lookup hooked");
+    else Log("WARNING: Pull on people: could not hook FindAnimationChain");
+}
+
 
 static void PatchPullFieldLoads() {
     static const uint32_t kSites[] = { 0xCE8000, 0xCF0B33, 0xCF0B4B, 0xCF0B70, 0xCF0CEE, 0xCF0E07, 0xCF6359,
@@ -8254,7 +8806,7 @@ using GetPowerText_t = void(__cdecl*)(unsigned char, void*, void*, void*);
 static GetPowerText_t g_origGetPowerText = nullptr;
 static void __cdecl HookedGetPowerText(unsigned char ui, void* a, void* b, void* c) {
     unsigned char asked = ui;
-    if (g_powerChar == 1)
+    if (g_powerChar == 1 || g_pullChar == 1)
         for (auto& s : g_powerSwaps) if (ui == s.corvoUi && s.daud && g_powerPawn && InPowerList(g_powerPawn, s.daud)) { ui = s.daudUi; break; }
     g_origGetPowerText(ui, a, b, c);
     auto str = [](void* f) { auto* r = static_cast<RawArray*>(f); return (r && r->Data) ? Narrow(static_cast<wchar_t*>(r->Data)).substr(0, 40) : std::string(); };
@@ -8266,7 +8818,7 @@ static void __cdecl HookedGetPowerText(unsigned char ui, void* a, void* b, void*
 using GetPowerName_t = void(__cdecl*)(unsigned char, void*);
 static GetPowerName_t g_origGetPowerName = nullptr;
 static void __cdecl HookedGetPowerName(unsigned char ui, void* out) {
-    if (g_powerChar == 1)
+    if (g_powerChar == 1 || g_pullChar == 1)
         for (auto& s : g_powerSwaps) if (ui == s.corvoUi && s.daud && g_powerPawn && InPowerList(g_powerPawn, s.daud)) { ui = s.daudUi; break; }
     g_origGetPowerName(ui, out);
 }
@@ -8737,7 +9289,7 @@ static void HookPlayerSave() {
 static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !pawn->Mesh) return;
     if (!g_bodyBuiltTick && g_body) g_bodyBuiltTick = GetTickCount();
     bool needPackage = (g_armsChar == 1 && !g_daudArmsMesh) || (g_bodyChar == 1 && g_cfg.fpArmSkin && !g_daudArmsMesh) || (g_bladeChar == 1 && !g_daudSwordMesh) || (g_bowChar == 1 && !g_daudBowMesh) ||
-                       (g_powerChar == 1 && g_daudLoadState != LoadState::Loaded);
+                       ((g_powerChar == 1 || g_pullChar == 1) && g_daudLoadState != LoadState::Loaded);
     if (needPackage) {
         // Load only once our body has been in use a while: a second package load before that tore down the
         // first package's mesh data (tests 12-15).
@@ -8791,7 +9343,7 @@ static void ApplyArmsCharacter(ADishonoredPlayerPawn* pawn) {    if (!pawn || !p
     {
         struct SwapSig { void* pawn; void* arms; void* sword; int armsChar, bladeChar, bowChar, powerChar, bodyChar, daud, ovs; };
         static SwapSig applied = {};
-        SwapSig now = { pawn, pawn->Mesh, FindSwordMesh(pawn), g_armsChar, g_bladeChar, g_bowChar, g_powerChar, g_bodyChar,
+        SwapSig now = { pawn, pawn->Mesh, FindSwordMesh(pawn), g_armsChar, g_bladeChar, g_bowChar, g_powerChar | (g_pullChar << 1), g_bodyChar,
                         static_cast<int>(g_daudLoadState), static_cast<int>(g_ovsLoadState) };
         if (memcmp(&now, &applied, sizeof(SwapSig)) != 0) {
             DWORD t = GetTickCount();
@@ -9006,6 +9558,13 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
     }
     FRotator bodyRot = arms->Rotation;
     bodyRot.Yaw += static_cast<int>(g_slideYawOffDeg * 65536.0f / 360.0f);
+    if (g_tpYawOffDeg != 0.0f) {   // free orbit: every body turned about the pawn's centre
+        bodyRot.Yaw += static_cast<int>(g_tpYawOffDeg * 65536.0f / 360.0f);
+        float a = g_tpYawOffDeg * (3.14159265f / 180.0f), ca = cosf(a), sa = sinf(a);
+        float x = t.X, y = t.Y;
+        t.X = x * ca - y * sa;
+        t.Y = x * sa + y * ca;
+    }
     // Camera bob/lean/mantle moves the view up to ~75 uu from the eyes (logged); the body stayed put and the camera
     // ended up inside the collar. Shift the visible body (not the shadow) with the camera's horizontal offset, in
     // player space, and hide the upper body when the camera dips below the eyes or the player is airborne.
@@ -9242,7 +9801,9 @@ static void SyncTransform(ADishonoredPlayerPawn* pawn) {
         }
         t.X += headFix.X; t.Y += headFix.Y; t.Z += headFix.Z;
         g_head->SetTranslation(t);
-        g_head->SetRotation(arms->Rotation);
+        FRotator headRot = arms->Rotation;
+        headRot.Yaw += static_cast<int>(g_tpYawOffDeg * 65536.0f / 360.0f);
+        g_head->SetRotation(headRot);
         g_head->SetScale(arms->Scale);
     }
 }
@@ -10775,6 +11336,7 @@ static void OnPlayerTick() {
     PhysProbe("frame start");
     UpdatePosture(pawn);
     PhysProbe("UpdatePosture");
+    UpdateFreeOrbit(pawn);
     SyncTransform(pawn);
     PhysProbe("SyncTransform");
     TraceBones(pawn);
@@ -10833,6 +11395,8 @@ static void OnPlayerTick() {
     PhysProbe("UpdateItemShadows");
     UpdateVisibility(pawn);
     PhysProbe("UpdateVisibility");
+    UpdateThirdPerson(pawn);
+    PhysProbe("UpdateThirdPerson");
     DiagHeadShadow();
     PhysProbe("DiagHeadShadow");
     DiagSlide(pawn);
@@ -10889,6 +11453,38 @@ static bool PadR3Down() {
     return false;
 }
 
+static bool PadL3Down() {
+    if (!g_xGetState) return false;
+    for (DWORD i = 0; i < 4; ++i) {
+        XPadState st{};
+        if (g_xGetState(i, &st) == 0 && (st.buttons & 0x0040)) return true;   // XINPUT_GAMEPAD_LEFT_THUMB
+    }
+    return false;
+}
+
+// Third-person toggle (4.0): V, or L3 + R3 pressed together on a pad (R3 alone stays the Ultimate Back Turn / zoom;
+// QuickTurnTick drops a press that L3 joins). Not while paused or with the game window in the background.
+static void ThirdPersonInputTick(ADishonoredPlayerPawn* pawn) {
+    if (!g_cfg.thirdPerson) return;
+    FindXInput();
+    static float lastTime = -1.0f;
+    static bool wasDown = false;
+    AWorldInfo* wi = pawn ? pawn->WorldInfo : nullptr;
+    bool paused = !wi || wi->TimeSeconds == lastTime;
+    if (wi) lastTime = wi->TimeSeconds;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    bool focused = pid == GetCurrentProcessId();
+    bool key = focused && (GetAsyncKeyState('V') & 0x8000) != 0;
+    bool pad = PadL3Down() && PadR3Down();
+    bool down = key || pad;
+    if (down && !wasDown && focused && !paused) {
+        g_tpOn = !g_tpOn;
+        Log("third person: toggled %s (%s)", g_tpOn ? "ON" : "off", key ? "V" : "L3 + R3");
+    }
+    wasDown = down;
+}
+
 static bool BackTurnButtonDown() {
     return g_cfg.quickTurn && ((GetAsyncKeyState(VK_LMENU) & 0x8000) || PadR3Down());
 }
@@ -10934,6 +11530,7 @@ static void QuickTurnTick(ADishonoredPlayerPawn* pawn) {
     }
     if (down) {
         if (alt && ((GetAsyncKeyState(VK_TAB) & 0x8000) || (GetAsyncKeyState(VK_F4) & 0x8000))) spoiled = true;
+        if (g_cfg.thirdPerson && PadL3Down()) spoiled = true;   // L3 + R3 is the third-person toggle
         if (!spoiled && !zoomed && nowMs - pressMs >= static_cast<ULONGLONG>(g_cfg.zoomHoldTime * 1000.0f)) {
             CallZoom(pc);
             zoomed = true; zoomMs = nowMs;
@@ -11158,6 +11755,7 @@ static void GameTickWork() {
 
     RestoreNpcs(GetPlayerPawn(), false);   // NPCs block again 1.5 s after the last Blink aim
     QuickTurnTick(GetPlayerPawn());
+    ThirdPersonInputTick(GetPlayerPawn());
     CrossbowInstantReload();
     ApplyJumpStyle();
     SummonAssassinUnlimited();
@@ -11241,11 +11839,14 @@ static void __cdecl HookedCollectGarbage(uint64_t keepFlags, uint32_t fullPurge)
 // for an object index and the table check asserts (Array.h:596 at 0xA137A3: index 0x1AFA = the low half of a bolt's X).
 // Body Swap's Daud wristbow (Crossbow = Daud) leaves bolts - in flight, stuck in walls and bodies, as pickups - whose
 // settings object DLC06_Pckp_Ammo.DLC06_Pckp_Ammo_Bolt_Single lives only in DLC packages; ours, DLC07_Twk_Player_Daud_SF,
-// loads ~3 s into the level - too late for the save. So before a level is restored: if a Daud choice is on (only then
-// can the save hold his bolts - and his package is loaded a few seconds later anyway), the bolt object isn't in memory and
+// loads ~3 s into the level - too late for the save. So before a level is restored: if the bolt object isn't in memory and
 // none of our own async loads is running (two loads at once once tore a package's mesh data apart, tests 12-15), load his
 // package synchronously - UObject::LoadPackage @0x4A9F60 (cdecl: outer, file name, flags); the level loader itself loads
 // packages at this very point. The saved bolts then resolve and respawn, and the stream stays in step.
+// 3.3 (2026-10-19, crashed 4 times in a row): 3.1/3.2 did this only while a Body Swap Daud choice was on, but the bolts stay
+// in the save after Crossbow goes back to Corvo - with every choice on Corvo the preload was skipped and the save asserted.
+// Now it runs whatever the choices are (~200 ms per restored level). A package the engine's file cache can't find (DLC not
+// installed or not mounted) isn't loaded: logged once, and the level loads as it would without CorvoBody.
 using LoadLevel_t = void(__fastcall*)(void* gameState, void* edx, void* level);
 static LoadLevel_t g_origLoadLevel = nullptr;
 using LoadPackageSync_t = UObject*(__cdecl*)(UObject* outer, const wchar_t* fileName, uint32_t flags);
@@ -11262,12 +11863,19 @@ static bool ObjectNamedInMemory(const char* name) {
 }
 
 static void __fastcall HookedLoadLevel(void* gameState, void* edx, void* level) {
-    bool daud = g_bowChar == 1 || g_powerChar == 1 || g_bodyChar == 1 || g_armsChar == 1 || g_bladeChar == 1;
-    if (g_cfg.preloadDaudForSaves && daud && !ObjectNamedInMemory("DLC06_Pckp_Ammo_Bolt_Single")) {
+    static bool missingLogged = false;
+    if (g_cfg.preloadDaudForSaves && !ObjectNamedInMemory("DLC06_Pckp_Ammo_Bolt_Single")) {
         if (g_daudLoadState == LoadState::Loading || g_ovsLoadState == LoadState::Loading ||
             g_loadState == LoadState::Loading || g_animLoadState == LoadState::Loading) {
             Log("save load: Daud's bolt objects aren't loaded, but one of our package loads is still running - not loading %s now",
                 Narrow(kDaudPackage).c_str());
+        } else if (!PackageAvailable(kDaudPackage)) {
+            if (!missingLogged) {
+                missingLogged = true;
+                Log("save load: package %s not found by the engine - not preloading it (DLC not installed or not mounted? "
+                    "start Dishonored through Steam); a save holding Daud's wristbow bolts can't load without it",
+                    Narrow(kDaudPackage).c_str());
+            }
         } else {
             DWORD t0 = GetTickCount();
             UObject* pkg = reinterpret_cast<LoadPackageSync_t>(0x004A9F60)(nullptr, kDaudPackage, 0);
@@ -11359,8 +11967,7 @@ static void LearnPitchCurve(PitchCurve& c, float deg, float f, float r, float u,
     }
 }
 
-static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx, FVector* loc, FRotator* rot) {
-    g_origGetPlayerViewPoint(pc, edx, loc, rot);
+static void RigidCameraViewPoint(APlayerController* pc, FVector* loc, FRotator* rot) {
     if (pc && pc->PlayerCamera && pc->PlayerCamera->IsA(ADishonoredPlayerCamera::StaticClass()))
         g_armsFov = reinterpret_cast<ADishonoredPlayerCamera*>(pc->PlayerCamera)->m_fCurFOV_Arms;
     auto off = []() { g_camCorrection = { 0, 0, 0 }; g_camTarget = { 0, 0, 0 }; g_bodyFollowTarget = { 0, 0, 0 }; g_cornerLeanRight = g_cornerLeanFwd = g_stairDz = 0.0f; };
@@ -11642,6 +12249,103 @@ static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx
     g_viewFov = pc->PlayerCamera && pc->PlayerCamera->CameraCache.POV.FOV > 1.0f ? pc->PlayerCamera->CameraCache.POV.FOV : 90.0f;
 }
 
+// Who asks for the view point (4.0 diagnostic): the renderer, audio, aiming, use and Blink traces all come through
+// here. Third person moves the view for every caller for now; the log names them (exe offsets) so the gameplay ones can
+// be given the eyes back if aiming or using things from behind the shoulder feels wrong.
+static void LogViewCaller(void* caller) {
+    struct Entry { uintptr_t at; unsigned n; };
+    static Entry seen[16];
+    static DWORD lastLog = 0;
+    static bool loggedTp = false;
+    uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    uintptr_t at = reinterpret_cast<uintptr_t>(caller);
+    for (Entry& e : seen) {
+        if (e.at == at) { ++e.n; break; }
+        if (!e.at) { e.at = at; e.n = 1; break; }
+    }
+    DWORD now = GetTickCount();
+    bool first3p = g_tpShown && !loggedTp;
+    if (!lastLog) lastLog = now;
+    if (now - lastLog < 20000 && !first3p) return;
+    lastLog = now;
+    if (g_tpShown) loggedTp = true;
+    std::string line;
+    char buf[48];
+    for (Entry& e : seen) {
+        if (!e.at) break;
+        snprintf(buf, sizeof(buf), " %s+%X x%u", e.at >= base && e.at < base + 0x2000000 ? "exe" : "?", static_cast<unsigned>(e.at - base), e.n);
+        line += buf;
+        e.n = 0;
+    }
+    Log("view point callers (last 20 s, %s):%s", g_tpShown ? "third person" : "first person", line.c_str());
+}
+
+// Third-person camera: orbit behind and over the right shoulder of the first-person camera (so crouch, lean, climb
+// and the rigid camera's moves carry over), pulled in when a wall is in the way (a world trace from the eyes, eased
+// back out), swung in and out over ThirdPersonBlendTime.
+static void ThirdPersonViewPoint(APlayerController* pc, FVector* loc, FRotator* rot) {
+    if (g_tpBlend <= 0.0f || !pc || !loc || !rot || pc->bCinematicMode) return;
+    auto* pawn = static_cast<ADishonoredPlayerPawn*>(pc->Pawn);
+    if (!pawn || pawn != g_bodyPawn || pawn != GetPlayerPawn()) return;
+    if (pc->PlayerCamera && pc->PlayerCamera->ViewTarget.Target &&
+        pc->PlayerCamera->ViewTarget.Target != pawn && pc->PlayerCamera->ViewTarget.Target != pc) return;
+    const float k = 6.2831853f / 65536.0f;
+    int pRaw = rot->Pitch & 0xFFFF;
+    float pitch = (pRaw > 32768 ? pRaw - 65536 : pRaw) * k, yaw = rot->Yaw * k;
+    float cp = cosf(pitch), sp = sinf(pitch), cy = cosf(yaw), sy = sinf(yaw);
+    FVector F{ cp * cy, cp * sy, sp }, R{ -sy, cy, 0.0f };
+    FVector pivot = *loc;
+    FVector off{ -F.X * g_cfg.tpDistance + R.X * g_cfg.tpSide, -F.Y * g_cfg.tpDistance + R.Y * g_cfg.tpSide,
+                 -F.Z * g_cfg.tpDistance + g_cfg.tpUp };
+    float full = sqrtf(off.X * off.X + off.Y * off.Y + off.Z * off.Z);
+    // One trace per frame (several callers a frame): reused while the pivot and the aim are the same.
+    static FVector lastPivot{ 0, 0, 0 };
+    static int lastPitch = 0, lastYaw = 0;
+    static float wallFrac = 1.0f;
+    static LONGLONG qpc = 0;
+    static DWORD lastTraceAt = 0;
+    bool same = GetTickCount() - lastTraceAt < 30 && fabsf(pivot.X - lastPivot.X) < 0.01f && fabsf(pivot.Y - lastPivot.Y) < 0.01f && fabsf(pivot.Z - lastPivot.Z) < 0.01f &&
+                lastPitch == rot->Pitch && lastYaw == rot->Yaw;
+    if (!same && full > 1.0f && !g_inHook) {
+        ++g_inHook;
+        FVector end{ pivot.X + off.X, pivot.Y + off.Y, pivot.Z + off.Z }, hitLoc{ 0, 0, 0 }, hitN{ 0, 0, 0 };
+        FTraceHitInfo hi{};
+        AActor* hit = pawn->Trace(end, pivot, false, FVector{ 0, 0, 0 }, 0, hitLoc, hitN, hi);
+        --g_inHook;
+        if (hit) {
+            float dx = hitLoc.X - pivot.X, dy = hitLoc.Y - pivot.Y, dz = hitLoc.Z - pivot.Z;
+            wallFrac = Clamp((sqrtf(dx * dx + dy * dy + dz * dz) - g_cfg.tpWallPad) / full, 0.0f, 1.0f);
+        } else {
+            wallFrac = 1.0f;
+        }
+        lastPivot = pivot; lastPitch = rot->Pitch; lastYaw = rot->Yaw; lastTraceAt = GetTickCount();
+        // In at once (never through the wall), out at ~2.5 x the distance a second.
+        float dt = QpcDt(qpc);
+        if (wallFrac < g_tpFrac) g_tpFrac = wallFrac;
+        else g_tpFrac = Clamp(g_tpFrac + dt * 2.5f, 0.0f, wallFrac);
+    }
+    float b = g_tpBlend * g_tpBlend * (3.0f - 2.0f * g_tpBlend);   // smoothstep
+    float s = b * g_tpFrac;
+    loc->X = pivot.X + off.X * s;
+    loc->Y = pivot.Y + off.Y * s;
+    loc->Z = pivot.Z + off.Z * s;
+    static DWORD lastLog = 0;
+    if (GetTickCount() - lastLog > 5000 && g_tpBlend >= 1.0f) {
+        lastLog = GetTickCount();
+        FVector cache = pc->PlayerCamera ? pc->PlayerCamera->CameraCache.POV.Location : FVector{ 0, 0, 0 };
+        float cx = cache.X - pawn->Location.X, cyy = cache.Y - pawn->Location.Y, cz = cache.Z - pawn->Location.Z - pawn->EyeHeight;
+        Log("third person camera: %.0f uu out of %.0f (walls %.2f) | the game's own camera %.0f uu from the eyes",
+            full * s, full, g_tpFrac, sqrtf(cx * cx + cyy * cyy + cz * cz));
+    }
+}
+
+static void __fastcall HookedGetPlayerViewPoint(APlayerController* pc, void* edx, FVector* loc, FRotator* rot) {
+    g_origGetPlayerViewPoint(pc, edx, loc, rot);
+    RigidCameraViewPoint(pc, loc, rot);
+    LogViewCaller(__builtin_return_address(0));
+    ThirdPersonViewPoint(pc, loc, rot);
+}
+
 // Per tick: move the 1P arms (pawn->Mesh) by the camera correction so the hands and weapons stay where the
 // game draws them relative to the view. The game may or may not rewrite Translation itself; handle both.
 static void ApplyArmsShift(ADishonoredPlayerPawn* pawn) {
@@ -11749,7 +12453,7 @@ static HMODULE g_chainMods[32];
 static int g_chainModCount = 0;
 
 // Body Swap plugin (Mods\plugins\BodySwap.dll) API. part: 0 body, 1 first-person arms, 2 sword, 3 power set, 4 crossbow,
-// 5 jump (Agility's power jump);
+// 5 jump (Agility's power jump), 6 summoned NPC, 7 Windblast slot (0 Windblast, 1 Daud's Pull);
 // value: 0 Corvo, 1 Daud, 2 Daud's High Overseer disguise (body, arms and sword only).
 extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, int value) {
     int maxValue = part == 6 ? 3 : part <= 2 ? 2 : 1;
@@ -11762,13 +12466,15 @@ extern "C" __declspec(dllexport) void __cdecl CorvoBody_SetCharacter(int part, i
     else if (part == 4) InterlockedExchange(&g_bowChar, value);
     else if (part == 5) InterlockedExchange(&g_jumpChar, value);
     else if (part == 6) InterlockedExchange(&g_summonChar, value);
+    else if (part == 7) InterlockedExchange(&g_pullChar, value);
+    if (part == 7) { Log("Body Swap: Windblast slot -> %s", value ? "Daud's Pull" : "Windblast"); return; }
     if (part == 6) { Log("Body Swap: summoned NPC -> %s", value == 3 ? "an Overseer hound (Doggy!)" : value == 2 ? "Daud" : value ? "Corvo" : "the regular assassin"); return; }   // (applied on the game thread)
     Log("Body Swap: %s -> %s", part == 0 ? "body" : part == 1 ? "arms" : part == 2 ? "blade" : part == 3 ? "powers" : part == 4 ? "crossbow" : "jump",
         value == 2 ? "Overseer" : value ? "Daud" : "Corvo");
 }
 
 extern "C" __declspec(dllexport) int __cdecl CorvoBody_GetCharacter(int part) {
-    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : part == 5 ? static_cast<int>(g_jumpChar) : part == 6 ? static_cast<int>(g_summonChar) : 0;
+    return part == 0 ? static_cast<int>(g_bodyChar) : part == 1 ? static_cast<int>(g_armsChar) : part == 2 ? static_cast<int>(g_bladeChar) : part == 3 ? static_cast<int>(g_powerChar) : part == 4 ? static_cast<int>(g_bowChar) : part == 5 ? static_cast<int>(g_jumpChar) : part == 6 ? static_cast<int>(g_summonChar) : part == 7 ? static_cast<int>(g_pullChar) : 0;
 }
 
 // Extra exports some chained proxies provide, which their plugins look up with GetModuleHandle("dinput8.dll") -
@@ -11918,6 +12624,8 @@ static DWORD WINAPI InitThread(LPVOID) {
     HookPawnSaveLoad();
     HookPlayerSave();
     HookPowerText();
+    PatchPullFieldLoads();   // 3.4: Daud's Pull again (Windblast slot)
+    InstallPullPeople();
     HookSummonSpawn();
     {
         const uint8_t pro[] = { 0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68 };
